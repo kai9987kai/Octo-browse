@@ -248,9 +248,21 @@ class OctoBrowse(QMainWindow):
 
         # Extensions button
         extensions_btn = QAction("🧩", self)
-        extensions_btn.setToolTip("Extensions")
-        extensions_btn.triggered.connect(self.open_extensions_window)
+        extensions_btn.setToolTip("Toggle Extensions")
+        extensions_btn.triggered.connect(self.toggle_extensions)
         self.toolbar.addAction(extensions_btn)
+
+        # Run extension button
+        run_extension_btn = QAction("▶️", self)
+        run_extension_btn.setToolTip("Run Extension")
+        run_extension_btn.triggered.connect(self.run_extension)
+        self.toolbar.addAction(run_extension_btn)
+
+        # Add note button
+        add_note_btn = QAction("📝", self)
+        add_note_btn.setToolTip("Add Note for Current Page")
+        add_note_btn.triggered.connect(self.add_note_for_page)
+        self.toolbar.addAction(add_note_btn)
 
         # Note-taking sidebar
         self.notes_sidebar = QTextEdit()
@@ -683,9 +695,9 @@ class OctoBrowse(QMainWindow):
         self.tabs.addTab(source_tab, "Page Source")
         self.tabs.setCurrentWidget(source_tab)
 
-    def open_extensions_window(self):
-        """Open the extensions window."""
-        self.extension_tab.show()
+    def toggle_extensions(self):
+        """Toggle the visibility of the extensions tab."""
+        self.extension_tab.setVisible(not self.extension_tab.isVisible())
 
     def run_extension(self):
         """Run custom Python code from the extensions tab."""
@@ -694,6 +706,15 @@ class OctoBrowse(QMainWindow):
             exec(code)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to run extension: {e}")
+
+    def add_note_for_page(self):
+        """Add a note for the current page."""
+        current_browser = self.tabs.currentWidget()
+        if current_browser:
+            note, ok = QInputDialog.getText(self, "Add Note", "Enter your note:")
+            if ok and note:
+                self.notes.append((current_browser.url().toString(), note))
+                self.notes_sidebar.append(f"Note for {current_browser.url().toString()}:\n{note}\n")
 
 
 class SettingsDialog(QDialog):
