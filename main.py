@@ -249,7 +249,7 @@ class OctoBrowse(QMainWindow):
         # Extensions button
         extensions_btn = QAction("🧩", self)
         extensions_btn.setToolTip("Extensions")
-        extensions_btn.triggered.connect(self.run_extension)
+        extensions_btn.triggered.connect(self.open_extensions_window)
         self.toolbar.addAction(extensions_btn)
 
         # Note-taking sidebar
@@ -682,6 +682,10 @@ class OctoBrowse(QMainWindow):
         source_tab.setPlainText(html)
         self.tabs.addTab(source_tab, "Page Source")
         self.tabs.setCurrentWidget(source_tab)
+
+    def open_extensions_window(self):
+        """Open the extensions window."""
+        self.extension_tab.show()
 
     def run_extension(self):
         """Run custom Python code from the extensions tab."""
