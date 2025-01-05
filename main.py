@@ -6,6 +6,8 @@ import openai
 import speech_recognition as sr
 from cryptography.fernet import Fernet
 import requests
+import tempfile
+import os
 from PyQt6.QtCore import QUrl, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
@@ -422,15 +424,17 @@ class OctoBrowse(QMainWindow):
         try:
             current_browser = self.tabs.currentWidget()
             if current_browser:
-                # Save the screenshot
-                screenshot_path = "screenshot.png"
-                current_browser.grab().save(screenshot_path)
+                # Save the screenshot to a temporary file
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+                    screenshot_path = temp_file.name
+                    current_browser.grab().save(screenshot_path)
 
                 # Upscale the image
                 img = cv2.imread(screenshot_path)
                 upscaled_img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
-                upscaled_path = "upscaled.png"
-                cv2.imwrite(upscaled_path, upscaled_img)
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+                    upscaled_path = temp_file.name
+                    cv2.imwrite(upscaled_path, upscaled_img)
 
                 # Display the upscaled image in the browser
                 current_browser.setUrl(QUrl.fromLocalFile(upscaled_path))
