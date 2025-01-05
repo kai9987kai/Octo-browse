@@ -29,10 +29,56 @@ from PyQt6.QtWidgets import (
     QDialog,
     QFormLayout,
     QPushButton,
+    QFileDialog,
+    QColorDialog,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtGui import QAction, QIcon, QColor
-from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEngineProfile
+from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEngineProfile, QWebEngineUrlRequestInterceptor
+
+
+# List of known ad-serving domains
+AD_BLOCK_LIST = [
+    "doubleclick.net",
+    "googleadservices.com",
+    "googlesyndication.com",
+    "adservice.google.com",
+    "ads.youtube.com",
+    "ad.doubleclick.net",
+    "adform.net",
+    "adnxs.com",
+    "adsrvr.org",
+    "advertising.com",
+    "amazon-adsystem.com",
+    "scorecardresearch.com",
+    "2mdn.net",
+    "adzerk.net",
+    "taboola.com",
+    "outbrain.com",
+    "pubmatic.com",
+    "rubiconproject.com",
+    "openx.net",
+    "criteo.com",
+    "ads.pubmatic.com",
+    "ads.youtube.com",
+    "ads.linkedin.com",
+    "ads.facebook.com",
+    "ads.twitter.com",
+]
+
+
+class AdBlockerInterceptor(QWebEngineUrlRequestInterceptor):
+    def __init__(self, block_list):
+        super().__init__()
+        self.block_list = set(block_list)  # Use a set for faster lookups
+
+    def interceptRequest(self, info):
+        """Intercept and block requests to ad-serving domains."""
+        url = info.requestUrl().toString()
+        for domain in self.block_list:
+            if domain in url:
+                info.block(True)
+                break
 
 
 class OctoBrowse(QMainWindow):
@@ -43,7 +89,7 @@ class OctoBrowse(QMainWindow):
 
         # Initialize settings
         self.dark_mode = False
-        self.ad_block_enabled = False
+        self.ad_block_enabled = False  # Ad blocker is disabled by default
         self.incognito_mode = False
         self.current_theme = "default"
         self.password_manager = PasswordManager()
@@ -53,6 +99,15 @@ class OctoBrowse(QMainWindow):
         self.notes = []
         self.custom_homepage = "https://www.google.com"
         self.vpn_enabled = False
+        self.default_user_agent = "Octo Browse"
+        self.custom_theme = None
+
+        # Set default user agent
+        profile = QWebEngineProfile.defaultProfile()
+        profile.setHttpUserAgent(self.default_user_agent)
+
+        # Initialize ad blocker
+        self.ad_block_interceptor = AdBlockerInterceptor(AD_BLOCK_LIST)
 
         # Create a tab widget
         self.tabs = QTabWidget()
@@ -70,26 +125,31 @@ class OctoBrowse(QMainWindow):
 
         # New tab button
         new_tab_btn = QAction("➕", self)
+        new_tab_btn.setToolTip("New Tab")
         new_tab_btn.triggered.connect(lambda: self.add_tab(QUrl(self.custom_homepage), "New Tab"))
         self.toolbar.addAction(new_tab_btn)
 
         # Back button
         back_btn = QAction("⬅️", self)
+        back_btn.setToolTip("Back")
         back_btn.triggered.connect(self.navigate_back)
         self.toolbar.addAction(back_btn)
 
         # Forward button
         forward_btn = QAction("➡️", self)
+        forward_btn.setToolTip("Forward")
         forward_btn.triggered.connect(self.navigate_forward)
         self.toolbar.addAction(forward_btn)
 
         # Refresh button
         refresh_btn = QAction("🔄", self)
+        refresh_btn.setToolTip("Refresh")
         refresh_btn.triggered.connect(self.refresh_page)
         self.toolbar.addAction(refresh_btn)
 
         # Address bar
         self.url_bar = QLineEdit()
+        self.url_bar.setPlaceholderText("Enter URL or search term...")
         self.url_bar.returnPressed.connect(self.navigate_to_url)
         self.toolbar.addWidget(self.url_bar)
 
@@ -100,74 +160,95 @@ class OctoBrowse(QMainWindow):
 
         # Dark mode toggle
         dark_mode_btn = QAction("🌙", self)
+        dark_mode_btn.setToolTip("Toggle Dark Mode")
         dark_mode_btn.triggered.connect(self.toggle_dark_mode)
         self.toolbar.addAction(dark_mode_btn)
 
         # Upscale button
         upscale_btn = QAction("🖼️", self)
+        upscale_btn.setToolTip("Upscale Page")
         upscale_btn.triggered.connect(self.upscale_page)
         self.toolbar.addAction(upscale_btn)
 
         # Zoom in/out buttons
         zoom_in_btn = QAction("🔍", self)
+        zoom_in_btn.setToolTip("Zoom In")
         zoom_in_btn.triggered.connect(self.zoom_in)
         self.toolbar.addAction(zoom_in_btn)
 
         zoom_out_btn = QAction("🔎", self)
+        zoom_out_btn.setToolTip("Zoom Out")
         zoom_out_btn.triggered.connect(self.zoom_out)
         self.toolbar.addAction(zoom_out_btn)
 
         # Text-to-speech button
         tts_btn = QAction("🔊", self)
+        tts_btn.setToolTip("Read Aloud")
         tts_btn.triggered.connect(self.read_aloud)
         self.toolbar.addAction(tts_btn)
 
         # Ad-block toggle
         ad_block_btn = QAction("🚫", self)
+        ad_block_btn.setToolTip("Toggle Ad Block")
         ad_block_btn.triggered.connect(self.toggle_ad_block)
         self.toolbar.addAction(ad_block_btn)
 
         # AI Summarization button
         summarize_btn = QAction("📝", self)
+        summarize_btn.setToolTip("Summarize Page")
         summarize_btn.triggered.connect(self.summarize_page)
         self.toolbar.addAction(summarize_btn)
 
         # AI Chatbot button
         chatbot_btn = QAction("🤖", self)
+        chatbot_btn.setToolTip("Open Chatbot")
         chatbot_btn.triggered.connect(self.open_chatbot)
         self.toolbar.addAction(chatbot_btn)
 
         # Voice command button
         voice_btn = QAction("🎙️", self)
+        voice_btn.setToolTip("Voice Command")
         voice_btn.triggered.connect(self.voice_command)
         self.toolbar.addAction(voice_btn)
 
         # Change User Agent button
         user_agent_btn = QAction("🕵️", self)
+        user_agent_btn.setToolTip("Change User Agent")
         user_agent_btn.triggered.connect(self.change_user_agent)
         self.toolbar.addAction(user_agent_btn)
 
         # Theme menu
         theme_menu = QMenu("🎨 Themes", self)
+        theme_menu.setToolTip("Change Theme")
         theme_menu.addAction("Default", lambda: self.set_theme("default"))
         theme_menu.addAction("Dark", lambda: self.set_theme("dark"))
         theme_menu.addAction("Blue", lambda: self.set_theme("blue"))
+        theme_menu.addAction("Custom", lambda: self.set_theme("custom"))
         self.toolbar.addAction(theme_menu.menuAction())
 
         # Incognito mode toggle
         incognito_btn = QAction("🕶️", self)
+        incognito_btn.setToolTip("Toggle Incognito Mode")
         incognito_btn.triggered.connect(self.toggle_incognito_mode)
         self.toolbar.addAction(incognito_btn)
 
         # Full-screen button
         fullscreen_btn = QAction("⛶", self)
+        fullscreen_btn.setToolTip("Toggle Fullscreen")
         fullscreen_btn.triggered.connect(self.toggle_fullscreen)
         self.toolbar.addAction(fullscreen_btn)
 
         # Settings button
         settings_btn = QAction("⚙️", self)
+        settings_btn.setToolTip("Settings")
         settings_btn.triggered.connect(self.open_settings)
         self.toolbar.addAction(settings_btn)
+
+        # Extensions button
+        extensions_btn = QAction("🧩", self)
+        extensions_btn.setToolTip("Extensions")
+        extensions_btn.triggered.connect(self.run_extension)
+        self.toolbar.addAction(extensions_btn)
 
         # Note-taking sidebar
         self.notes_sidebar = QTextEdit()
@@ -189,6 +270,7 @@ class OctoBrowse(QMainWindow):
 
         # Clear history button
         clear_history_btn = QAction("🧹", self)
+        clear_history_btn.setToolTip("Clear History")
         clear_history_btn.triggered.connect(self.clear_history)
         self.toolbar.addAction(clear_history_btn)
 
@@ -202,6 +284,11 @@ class OctoBrowse(QMainWindow):
         self.news_sidebar.hide()
         self.update_news()
 
+        # Extension tab
+        self.extension_tab = QTextEdit()
+        self.extension_tab.setPlaceholderText("Enter Python code here...")
+        self.extension_tab.hide()
+
         # Split view
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.addWidget(self.tabs)
@@ -210,7 +297,12 @@ class OctoBrowse(QMainWindow):
         self.splitter.addWidget(self.todo_sidebar)
         self.splitter.addWidget(self.history_sidebar)
         self.splitter.addWidget(self.news_sidebar)
+        self.splitter.addWidget(self.extension_tab)
         self.setCentralWidget(self.splitter)
+
+        # Context menu for saving pages and viewing source code
+        self.tabs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tabs.customContextMenuRequested.connect(self.show_context_menu)
 
     def add_tab(self, url, title):
         """Add a new tab."""
@@ -330,11 +422,18 @@ class OctoBrowse(QMainWindow):
         try:
             current_browser = self.tabs.currentWidget()
             if current_browser:
-                current_browser.grab().save("screenshot.png")
-                img = cv2.imread("screenshot.png")
+                # Save the screenshot
+                screenshot_path = "screenshot.png"
+                current_browser.grab().save(screenshot_path)
+
+                # Upscale the image
+                img = cv2.imread(screenshot_path)
                 upscaled_img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
-                cv2.imwrite("upscaled.png", upscaled_img)
-                current_browser.setUrl(QUrl.fromLocalFile("upscaled.png"))
+                upscaled_path = "upscaled.png"
+                cv2.imwrite(upscaled_path, upscaled_img)
+
+                # Display the upscaled image in the browser
+                current_browser.setUrl(QUrl.fromLocalFile(upscaled_path))
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to upscale: {e}")
 
@@ -372,9 +471,13 @@ class OctoBrowse(QMainWindow):
     def toggle_ad_block(self):
         """Toggle ad-blocking."""
         self.ad_block_enabled = not self.ad_block_enabled
-        settings = QWebEngineSettings.globalSettings()
-        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, not self.ad_block_enabled)
-        QMessageBox.information(self, "Ad Block", f"Ad Block {'enabled' if self.ad_block_enabled else 'disabled'}.")
+        profile = QWebEngineProfile.defaultProfile()
+        if self.ad_block_enabled:
+            profile.setUrlRequestInterceptor(self.ad_block_interceptor)
+            QMessageBox.information(self, "Ad Block", "Ad Block enabled.")
+        else:
+            profile.setUrlRequestInterceptor(None)
+            QMessageBox.information(self, "Ad Block", "Ad Block disabled.")
 
     def summarize_page(self):
         """Summarize the page content using OpenAI's GPT."""
@@ -412,8 +515,17 @@ class OctoBrowse(QMainWindow):
             self.apply_dark_mode(self.tabs.currentWidget())
         elif theme == "blue":
             self.setStyleSheet("background-color: #e6f3ff;")
+        elif theme == "custom":
+            self.create_custom_theme()
         else:
             self.setStyleSheet("")
+
+    def create_custom_theme(self):
+        """Create a custom theme."""
+        color = QColorDialog.getColor()
+        if color.isValid():
+            self.custom_theme = color.name()
+            self.setStyleSheet(f"background-color: {self.custom_theme};")
 
     def toggle_incognito_mode(self):
         """Toggle incognito mode."""
@@ -530,6 +642,50 @@ class OctoBrowse(QMainWindow):
         dialog.homepage_edit.setText(self.custom_homepage)
         dialog.openai_key_edit.setText(self.openai_api_key or "")
         dialog.exec()
+
+    def show_context_menu(self, position):
+        """Show a context menu for saving pages and viewing source code."""
+        menu = QMenu(self)
+        save_action = QAction("Save Page As...", self)
+        save_action.setToolTip("Save the current page as an HTML file")
+        save_action.triggered.connect(self.save_page)
+        menu.addAction(save_action)
+
+        view_source_action = QAction("View Page Source", self)
+        view_source_action.setToolTip("View the source code of the current page")
+        view_source_action.triggered.connect(self.view_page_source)
+        menu.addAction(view_source_action)
+
+        menu.exec(self.tabs.mapToGlobal(position))
+
+    def save_page(self):
+        """Save the current page as an HTML file."""
+        current_browser = self.tabs.currentWidget()
+        if current_browser:
+            file_path, _ = QFileDialog.getSaveFileName(self, "Save Page As", "", "HTML Files (*.html)")
+            if file_path:
+                current_browser.page().save(file_path, QWebEngineDownloadItem.SavePageFormat.CompleteHtmlSaveFormat)
+
+    def view_page_source(self):
+        """View the source code of the current page."""
+        current_browser = self.tabs.currentWidget()
+        if current_browser:
+            current_browser.page().toHtml(lambda html: self.show_source_code(html))
+
+    def show_source_code(self, html):
+        """Display the page source code in a new tab."""
+        source_tab = QTextEdit()
+        source_tab.setPlainText(html)
+        self.tabs.addTab(source_tab, "Page Source")
+        self.tabs.setCurrentWidget(source_tab)
+
+    def run_extension(self):
+        """Run custom Python code from the extensions tab."""
+        try:
+            code = self.extension_tab.toPlainText()
+            exec(code)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to run extension: {e}")
 
 
 class SettingsDialog(QDialog):
