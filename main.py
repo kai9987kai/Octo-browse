@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QFileDialog,
     QColorDialog,
+    QPlainTextEdit,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtGui import QAction, QIcon, QColor
@@ -689,11 +690,20 @@ class OctoBrowse(QMainWindow):
             current_browser.page().toHtml(lambda html: self.show_source_code(html))
 
     def show_source_code(self, html):
-        """Display the page source code in a new tab."""
-        source_tab = QTextEdit()
-        source_tab.setPlainText(html)
-        self.tabs.addTab(source_tab, "Page Source")
-        self.tabs.setCurrentWidget(source_tab)
+        """Display the page source code in a new window."""
+        source_window = QDialog(self)
+        source_window.setWindowTitle("Page Source")
+        source_window.setModal(True)
+        source_window.resize(800, 600)
+
+        layout = QVBoxLayout()
+        source_edit = QPlainTextEdit()
+        source_edit.setPlainText(html)
+        source_edit.setReadOnly(True)
+        layout.addWidget(source_edit)
+
+        source_window.setLayout(layout)
+        source_window.exec()
 
     def toggle_extensions(self):
         """Toggle the visibility of the extensions tab."""
