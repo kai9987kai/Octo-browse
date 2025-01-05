@@ -26,6 +26,9 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QListWidgetItem,
     QLabel,
+    QDialog,
+    QFormLayout,
+    QPushButton,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtGui import QAction, QIcon, QColor
@@ -155,6 +158,16 @@ class OctoBrowse(QMainWindow):
         incognito_btn = QAction("🕶️", self)
         incognito_btn.triggered.connect(self.toggle_incognito_mode)
         self.toolbar.addAction(incognito_btn)
+
+        # Full-screen button
+        fullscreen_btn = QAction("⛶", self)
+        fullscreen_btn.triggered.connect(self.toggle_fullscreen)
+        self.toolbar.addAction(fullscreen_btn)
+
+        # Settings button
+        settings_btn = QAction("⚙️", self)
+        settings_btn.triggered.connect(self.open_settings)
+        self.toolbar.addAction(settings_btn)
 
         # Note-taking sidebar
         self.notes_sidebar = QTextEdit()
@@ -482,6 +495,72 @@ class OctoBrowse(QMainWindow):
                 self.news_sidebar.addItem(QListWidgetItem(article["title"]))
         except Exception as e:
             self.news_sidebar.addItem(QListWidgetItem("News: Unavailable"))
+
+    def toggle_fullscreen(self):
+        """Toggle full-screen mode."""
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def keyPressEvent(self, event):
+        """Handle keyboard shortcuts."""
+        if event.key() == Qt.Key.Key_F11:
+            self.toggle_fullscreen()
+        elif event.key() == Qt.Key.Key_F5:
+            self.refresh_page()
+        elif event.key() == Qt.Key.Key_Backspace:
+            self.navigate_back()
+        elif event.key() == Qt.Key.Key_L and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.url_bar.setFocus()
+        elif event.key() == Qt.Key.Key_T and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.add_tab(QUrl(self.custom_homepage), "New Tab")
+        elif event.key() == Qt.Key.Key_W and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.close_tab(self.tabs.currentIndex())
+        elif event.key() == Qt.Key.Key_Plus and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.zoom_in()
+        elif event.key() == Qt.Key.Key_Minus and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.zoom_out()
+        else:
+            super().keyPressEvent(event)
+
+    def open_settings(self):
+        """Open the settings dialog."""
+        dialog = SettingsDialog(self)
+        dialog.homepage_edit.setText(self.custom_homepage)
+        dialog.openai_key_edit.setText(self.openai_api_key or "")
+        dialog.exec()
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+
+        layout = QFormLayout(self)
+
+        self.homepage_edit = QLineEdit()
+        layout.addRow("Homepage URL:", self.homepage_edit)
+
+        self.openai_key_edit = QLineEdit()
+        layout.addRow("OpenAI API Key:", self.openai_key_edit)
+
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self.save_settings)
+        layout.addRow(save_btn)
+
+    def save_settings(self):
+        """Save settings and close the dialog."""
+        homepage_url = self.homepage_edit.text()
+        openai_key = self.openai_key_edit.text()
+
+        if homepage_url:
+            self.parent().custom_homepage = homepage_url
+        if openai_key:
+            self.parent().openai_api_key = openai_key
+
+        self.accept()
 
 
 class PasswordManager:
