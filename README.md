@@ -1,140 +1,145 @@
-Octo-browse
+# Octo-browse
 
-Octo-browse is an experimental, Python + PyQt6/QtWebEngine desktop browser prototype that mixes traditional browsing with “power tools” like tabbed browsing, ad-blocking via request interception, incognito mode, page tools (save/page source), and a few “labs” features such as OpenCV page upscaling, AI page summarisation hooks, sidebars, and a built-in Python “extensions” scratchpad.
+Octo-browse is an experimental Python + PyQt6/QtWebEngine desktop browser. It
+combines a normal tabbed browser surface with power tools for notes, history,
+bookmarks, page source, page saving, ad blocking, private tabs, page upscaling,
+text-to-speech, voice commands, AI page summarisation, weather/news side panels,
+a session password scratchpad, and a constrained extension lab.
 
-What’s inside
+## Entry points
 
-This repo is centered around:
+- `main.py` is the maintained application.
+- `alpha.py` is now a compatibility launcher that starts the same maintained
+  app. The previous alpha-only features were merged into `main.py`.
 
-main.py — the primary application entry point (full browser UI).
+## Key features
 
-alpha.py — an earlier/alternate experimental build (kept for iteration/testing).
+- Tabbed browsing with movable/closable tabs and dynamic page titles.
+- Cleaner browser chrome with a compact navigation toolbar, left workspace rail,
+  full menu bar, status badges, a command palette (`Ctrl+K`), and in-page find
+  (`Ctrl+F`).
+- Dashboard tab with recent history, bookmarks, todo counts, weather status,
+  shortcuts, saved-tab counts, downloads, and ad-block stats.
+- Smart address commands: `octo:dashboard`, `octo:identity`, `octo:tabs`,
+  `octo:downloads`, `octo:reading`, plus bang searches like `!yt`, `!gh`,
+  `!w`, `!maps`, `!news`, `!pypi`, and `!mdn`.
+- Standard and private tabs. Private tabs use a separate off-the-record
+  `QWebEngineProfile`.
+- Ad blocking through `QWebEngineUrlRequestInterceptor`, with safer host/domain
+  matching and an in-session privacy report.
+- Persistent settings, bookmarks, history, notes, and todos stored under the
+  platform app-data directory, with migration from the old
+  `octobrowse_settings.json` file if it exists.
+- Session restore for standard tabs from the previous run.
+- Reopen recently closed tabs with `Ctrl+Shift+T`.
+- Download handling with a save prompt, progress state, and downloads panel.
+- Persistent reading list panel for pages to revisit later.
+- Sidebar panels for notes/chat, calendar, todos, history, news, bookmarks, and
+  extension code.
+- Page tools: save page HTML, view source, open current page in a new tab,
+  reader view, page insights, screenshot saving, upscaled screenshot preview,
+  zoom controls,
+  duplicate tab, copy URL, copy Markdown link, tab overview, browser identity,
+  site info, custom user agent, themes, and fullscreen.
+- Octo Browser identity is applied through the HTTP user agent and injected
+  `navigator` values so browser-check pages can see `OctoBrowser`.
+- Optional OpenAI page summarisation and page Q&A through the current OpenAI
+  Responses API.
+- Optional weather and news fetches run off the UI thread, with timeouts.
+- Extension lab executes code in a constrained namespace with `browser`,
+  `current_tab`, and a small safe builtins set instead of full process globals.
+- A separate trusted extension action preserves the original full Python
+  execution behavior behind an explicit warning.
 
-Key features
-Core browsing UI
+## Requirements
 
-Tabbed browsing built on QTabWidget + QWebEngineView.
+- Python 3.10+
+- PyQt6 and PyQt6-WebEngine
+- See `requirements.txt` for the full dependency list.
 
-Split-view layout that can host multiple side panels (tabs + sidebars).
+Optional system/runtime notes:
 
-Privacy / control
+- Voice commands usually require a working microphone and PyAudio support for
+  `SpeechRecognition`.
+- Text-to-speech uses `gTTS` and opens the generated audio file with the OS.
+- Weather needs an OpenWeather API key.
+- News needs a NewsAPI key.
+- AI features need an OpenAI API key.
 
-Incognito mode toggle (UI action wired to toggle_incognito_mode).
+## Install
 
-Ad-block toggle implemented via QWebEngineUrlRequestInterceptor.
+Windows PowerShell:
 
-Ad-blocking implementation (technical)
-
-A hardcoded domain blocklist (e.g., doubleclick.net, googlesyndication.com, etc.).
-
-An interceptor class (AdBlockerInterceptor) checks each request URL and calls info.block(True) when a blocked domain substring matches.
-
-The interceptor is installed/uninstalled on the default profile using profile.setUrlRequestInterceptor(...).
-
-Page tools
-
-Save Page As… (Complete HTML save format).
-
-View Page Source opens a new tab populated via page().toHtml(...).
-
-“Labs” features
-
-Upscale Page: takes a widget screenshot and upscales via OpenCV (cv2.resize) before loading the result.
-
-Read Aloud: UI action for “Read Aloud” (calls read_aloud).
-
-AI Summarise Page: UI action wired to summarize_page, described as using OpenAI GPT.
-
-Built-in “Extensions” scratchpad: a text area where Python code is executed via exec(...). Treat as unsafe if you paste untrusted code.
-
-Themes / appearance
-
-Theme switching includes at least default, blue, and a custom colour picker flow (via QColorDialog).
-
-Requirements
-
-Python: 3.10+ recommended
-
-GUI: PyQt6 + PyQt6-WebEngine (QtWebEngine is required for QWebEngineView)
-
-Computer vision: opencv-python (used for page upscaling)
-
-Optional (depending on your build/use):
-
-OpenAI Python SDK (for summarisation hooks)
-
-Install
-Windows (PowerShell)
+```powershell
 py -m venv .venv
 .\.venv\Scripts\activate
 python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
 
-pip install PyQt6 PyQt6-WebEngine opencv-python
-# Optional (if you want the AI summariser wired up in your environment):
-pip install openai
+macOS/Linux:
 
-macOS / Linux (bash/zsh)
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
 
-pip install PyQt6 PyQt6-WebEngine opencv-python
-# Optional:
-pip install openai
+## Run
 
-Run
+```bash
 python main.py
+```
 
+The compatibility launcher still works:
 
-If you want to run the alternate build:
-
+```bash
 python alpha.py
+```
 
-Configuration notes
-OpenAI summarisation
+## Configuration
 
-The UI includes a “Summarize Page” action calling summarize_page and an OpenAI key field is surfaced through the settings dialog flow.
-Practical options:
+You can configure keys in the Settings dialog, or set environment variables
+before launching:
 
-Set your key inside the app’s settings UI (if enabled in your current build).
+```bash
+OPENAI_API_KEY=...
+OCTOBROWSE_OPENAI_MODEL=gpt-5-mini
+OPENWEATHER_API_KEY=...
+NEWS_API_KEY=...
+```
 
-Or export an environment variable and update the code to read it (if you prefer env-based config).
+Settings entered in the app are stored as local JSON. Do not treat this as a
+secure vault for long-lived secrets.
 
-Ad-block list
+## Security notes
 
-The ad-blocker uses a static list of known ad domains and a substring match strategy.
-This is intentionally simple and fast, but it can:
+- The extension lab is intentionally constrained, but it still exposes the
+  running browser object. Run only code you understand.
+- The trusted extension action runs code with full Python access and should be
+  treated like running a local script.
+- The session password scratchpad is in-memory only. It is not a persistent
+  password manager.
+- Private tabs isolate browser profile storage for new private tabs, but this
+  prototype should not be treated as a hardened privacy browser.
+- The ad blocker uses a small static domain list, not full EasyList/uBlock rule
+  parsing.
 
-overblock if a legitimate URL contains a blocked substring
+## Architecture map
 
-underblock compared to real filter engines (uBlock-style rule parsing isn’t implemented)
+- `OctoBrowse(QMainWindow)`: main window, toolbars, tabs, sidebars, actions.
+- `AdBlockerInterceptor`: request interception, domain blocking, block stats.
+- `SettingsStore`: JSON load/save and legacy settings migration.
+- `ApiFetchWorker`: weather/news requests on a worker thread.
+- `OpenAIWorker`: page summarisation and page Q&A on a worker thread.
+- `CommandPalette`: keyboard-first command discovery and execution.
+- `SettingsDialog`: homepage, model, location, and API-key settings.
 
-Architecture (quick map)
+## Roadmap
 
-OctoBrowse(QMainWindow) — top-level app window, toolbars, tabs, split view, actions.
-
-AdBlockerInterceptor(QWebEngineUrlRequestInterceptor) — request interception + blocking.
-
-SettingsDialog(QDialog) — settings UI surface (theme/OpenAI key hooks/etc.).
-
-Security
-
-If you discover a vulnerability, follow the repository’s SECURITY.md guidance.
-
-License
-
-Licensed under the Apache License 2.0.
-
-Roadmap ideas (if you want to evolve this into a “real” power browser)
-
-Replace substring ad-blocking with real filter parsing (EasyList-style)
-
-Proper per-tab profiles for real incognito isolation
-
-Download manager + permissions UI
-
-Extension sandboxing (avoid raw exec)
-
-Persistent bookmarks/history storage (SQLite)
-
-Per-site settings + content security controls
+- Replace the static ad-domain list with real filter-list parsing.
+- Add per-site permissions and content controls.
+- Move persistent user data to SQLite.
+- Add a download manager.
+- Replace the extension lab with a real permissioned plugin API.
