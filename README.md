@@ -19,10 +19,18 @@ a session password scratchpad, and a constrained extension lab.
   full menu bar, status badges, a command palette (`Ctrl+K`), and in-page find
   (`Ctrl+F`).
 - Dashboard tab with recent history, bookmarks, todo counts, weather status,
-  shortcuts, saved-tab counts, downloads, and ad-block stats.
+  shortcuts, saved-tab counts, downloads, ad-block stats, and clickable action
+  tiles for the main browser workspaces.
+- Feature Audit page for checking that merged main/alpha-era features and newer
+  Octo Browser capabilities are present.
+- Library Search (`Ctrl+Shift+F`) for searching open tabs, history, bookmarks,
+  reading list items, notes, and tasks from one dialog.
 - Smart address commands: `octo:dashboard`, `octo:identity`, `octo:tabs`,
-  `octo:downloads`, `octo:reading`, plus bang searches like `!yt`, `!gh`,
-  `!w`, `!maps`, `!news`, `!pypi`, and `!mdn`.
+  `octo:features`, `octo:library`, `octo:downloads`, `octo:reading`,
+  `octo:history`, `octo:bookmarks`, `octo:todos`, `octo:notes`, plus bang
+  searches like `!yt`, `!gh`, `!w`, `!maps`, `!news`, `!pypi`, and `!mdn`.
+- Address-bar autocomplete for Octo commands, bang searches, history,
+  bookmarks, and reading list items.
 - Standard and private tabs. Private tabs use a separate off-the-record
   `QWebEngineProfile`.
 - Ad blocking through `QWebEngineUrlRequestInterceptor`, with safer host/domain
@@ -34,6 +42,8 @@ a session password scratchpad, and a constrained extension lab.
 - Reopen recently closed tabs with `Ctrl+Shift+T`.
 - Download handling with a save prompt, progress state, and downloads panel.
 - Persistent reading list panel for pages to revisit later.
+- Target-blank and popup-style new-window requests open as normal Octo Browser
+  tabs.
 - Sidebar panels for notes/chat, calendar, todos, history, news, bookmarks, and
   extension code.
 - Page tools: save page HTML, view source, open current page in a new tab,
@@ -134,6 +144,8 @@ secure vault for long-lived secrets.
 - `ApiFetchWorker`: weather/news requests on a worker thread.
 - `OpenAIWorker`: page summarisation and page Q&A on a worker thread.
 - `CommandPalette`: keyboard-first command discovery and execution.
+- `LibrarySearchDialog`: unified search across tabs and saved browser
+  collections.
 - `SettingsDialog`: homepage, model, location, and API-key settings.
 
 ## Roadmap

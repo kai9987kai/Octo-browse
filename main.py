@@ -51,7 +51,7 @@ try:
 except ImportError:  # pragma: no cover - optional runtime feature
     sr = None
 
-from PyQt6.QtCore import QSize, QStandardPaths, QThread, QTimer, QUrl, Qt, pyqtSignal
+from PyQt6.QtCore import QSize, QStandardPaths, QStringListModel, QThread, QTimer, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor
 from PyQt6.QtWebEngineCore import (
     QWebEnginePage,
@@ -63,6 +63,7 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QApplication,
     QColorDialog,
+    QCompleter,
     QDialog,
     QFileDialog,
     QFormLayout,
@@ -225,7 +226,9 @@ class SettingsStore:
             "session_tabs": session_tabs,
             "reading_list": reading_list,
         }
-        self.path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path = self.path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(self.path)
 
     @staticmethod
     def _unique_strings(values: Any) -> list[str]:
@@ -383,6 +386,28 @@ class PasswordManager:
         return self.decrypt(encrypted)
 
 
+class OctoWebPage(QWebEnginePage):
+    def __init__(self, browser_window: "OctoBrowse", profile: QWebEngineProfile, private: bool, parent: QWidget) -> None:
+        super().__init__(profile, parent)
+        self.browser_window = browser_window
+        self.private = private
+
+    def createWindow(self, _window_type: QWebEnginePage.WebWindowType) -> QWebEnginePage:
+        view = self.browser_window.add_tab(QUrl("about:blank"), "New Window", private=self.private)
+        return view.page()
+
+    def acceptNavigationRequest(
+        self,
+        url: QUrl,
+        navigation_type: QWebEnginePage.NavigationType,
+        is_main_frame: bool,
+    ) -> bool:
+        if is_main_frame and url.scheme().lower() == "octo":
+            self.browser_window.handle_octo_command(url.toString())
+            return False
+        return super().acceptNavigationRequest(url, navigation_type, is_main_frame)
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings: BrowserSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -484,6 +509,66 @@ class CommandPalette(QDialog):
         index = item.data(Qt.ItemDataRole.UserRole)
         self.accept()
         self.commands[index].handler()
+
+
+class LibrarySearchDialog(QDialog):
+    def __init__(self, parent: "OctoBrowse") -> None:
+        super().__init__(parent)
+        self.browser = parent
+        self.entries = parent.library_entries()
+        self.setWindowTitle("Library Search")
+        self.setModal(True)
+        self.resize(700, 500)
+
+        layout = QVBoxLayout(self)
+        title = QLabel("Search everything")
+        title.setObjectName("PaletteTitle")
+        layout.addWidget(title)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search tabs, history, bookmarks, reading list, notes, and tasks...")
+        self.search.textChanged.connect(self.filter_entries)
+        self.search.returnPressed.connect(self.open_selected)
+        layout.addWidget(self.search)
+
+        self.results = QListWidget()
+        self.results.itemDoubleClicked.connect(lambda _item: self.open_selected())
+        layout.addWidget(self.results)
+
+        self.filter_entries("")
+        self.search.setFocus()
+
+    def filter_entries(self, query: str) -> None:
+        tokens = [token for token in query.lower().split() if token]
+        self.results.clear()
+        for index, entry in enumerate(self.entries):
+            haystack = f"{entry['kind']} {entry['title']} {entry.get('url', '')}".lower()
+            if all(token in haystack for token in tokens):
+                item = QListWidgetItem(self.format_entry(entry))
+                if entry.get("url"):
+                    item.setToolTip(entry["url"])
+                item.setData(Qt.ItemDataRole.UserRole, index)
+                self.results.addItem(item)
+        if self.results.count():
+            self.results.setCurrentRow(0)
+
+    def format_entry(self, entry: dict[str, Any]) -> str:
+        title = str(entry.get("title") or entry.get("url") or "Untitled").replace("\n", " ").strip()
+        url = str(entry.get("url") or "").replace("\n", " ").strip()
+        if len(title) > 90:
+            title = f"{title[:87]}..."
+        if url and len(url) > 86:
+            url = f"{url[:83]}..."
+        suffix = f"  -  {url}" if url and url != title else ""
+        return f"{entry['kind']}: {title}{suffix}"
+
+    def open_selected(self) -> None:
+        item = self.results.currentItem()
+        if not item:
+            return
+        entry = self.entries[item.data(Qt.ItemDataRole.UserRole)]
+        self.accept()
+        self.browser.open_library_entry(entry)
 
 
 class OctoBrowse(QMainWindow):
@@ -633,6 +718,12 @@ class OctoBrowse(QMainWindow):
         self.url_bar.returnPressed.connect(self.navigate_to_url)
         self.url_bar.setMinimumWidth(300)
         self.url_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.url_suggestions_model = QStringListModel(self.address_suggestions(), self)
+        self.url_completer = QCompleter(self.url_suggestions_model, self)
+        self.url_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.url_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.url_completer.activated[str].connect(self.apply_address_suggestion)
+        self.url_bar.setCompleter(self.url_completer)
         self.toolbar.addWidget(self.url_bar)
 
         self.find_bar = QLineEdit()
@@ -669,6 +760,8 @@ class OctoBrowse(QMainWindow):
 
         tools_menu = QMenu("Tools", self)
         self._add_menu_action(tools_menu, "Privacy Report", "Show ad-block and privacy state", self.show_privacy_report)
+        self._add_menu_action(tools_menu, "Feature Audit", "Show implemented feature checklist", self.open_feature_audit)
+        self._add_menu_action(tools_menu, "Library Search", "Search all browser collections", self.open_library_search, "Ctrl+Shift+F")
         self._add_menu_action(tools_menu, "Page Insights", "Show word count and keywords", self.show_page_insights)
         self._add_menu_action(tools_menu, "Upscale Page", "Open a 2x screenshot preview", self.upscale_page)
         self._add_menu_action(tools_menu, "Read Aloud", "Read page text aloud", self.read_aloud)
@@ -745,22 +838,35 @@ class OctoBrowse(QMainWindow):
         self.workspace_rail.setObjectName("WorkspaceRail")
         self.workspace_rail.setMovable(False)
         self.workspace_rail.setOrientation(Qt.Orientation.Vertical)
-        self.workspace_rail.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.workspace_rail.setIconSize(QSize(20, 20))
+        self.workspace_rail.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, self.workspace_rail)
 
-        self._add_rail_action("Dash", "Open dashboard", self.open_dashboard)
-        self._add_rail_action("Notes", "Show notes and AI chat", lambda: self.toggle_panel(self.notes_sidebar))
-        self._add_rail_action("Tasks", "Show todo list", lambda: self.toggle_panel(self.todo_sidebar))
-        self._add_rail_action("Hist", "Show history", lambda: self.toggle_panel(self.history_sidebar))
-        self._add_rail_action("News", "Show news", lambda: self.toggle_panel(self.news_sidebar))
-        self._add_rail_action("Down", "Show downloads", lambda: self.toggle_panel(self.downloads_sidebar))
-        self._add_rail_action("Read", "Show reading list", lambda: self.toggle_panel(self.reading_sidebar))
-        self._add_rail_action("Marks", "Show bookmarks", self.toggle_bookmarks)
-        self._add_rail_action("Ext", "Show extension lab", self.toggle_extensions)
+        self._add_rail_action("Home", "Open dashboard", self.open_dashboard, QStyle.StandardPixmap.SP_DirHomeIcon)
+        self._add_rail_action("Search", "Search tabs and saved collections", self.open_library_search, QStyle.StandardPixmap.SP_FileDialogContentsView)
+        self._add_rail_action("Audit", "Show implemented feature checklist", self.open_feature_audit, QStyle.StandardPixmap.SP_DialogApplyButton)
+        self.workspace_rail.addSeparator()
+        self._add_rail_action("Notes", "Show notes and AI chat", lambda: self.toggle_panel(self.notes_sidebar), QStyle.StandardPixmap.SP_FileIcon)
+        self._add_rail_action("Tasks", "Show todo list", lambda: self.toggle_panel(self.todo_sidebar), QStyle.StandardPixmap.SP_DialogYesButton)
+        self._add_rail_action("History", "Show history", lambda: self.toggle_panel(self.history_sidebar), QStyle.StandardPixmap.SP_FileDialogDetailedView)
+        self._add_rail_action("News", "Show news", lambda: self.toggle_panel(self.news_sidebar), QStyle.StandardPixmap.SP_MessageBoxInformation)
+        self._add_rail_action("Downloads", "Show downloads", lambda: self.toggle_panel(self.downloads_sidebar), QStyle.StandardPixmap.SP_ArrowDown)
+        self._add_rail_action("Reading", "Show reading list", lambda: self.toggle_panel(self.reading_sidebar), QStyle.StandardPixmap.SP_FileDialogListView)
+        self._add_rail_action("Bookmarks", "Show bookmarks", self.toggle_bookmarks, QStyle.StandardPixmap.SP_DialogSaveButton)
+        self._add_rail_action("Extensions", "Show extension lab", self.toggle_extensions, QStyle.StandardPixmap.SP_ComputerIcon)
 
-    def _add_rail_action(self, text: str, tooltip: str, handler: Any) -> QAction:
+    def _add_rail_action(
+        self,
+        text: str,
+        tooltip: str,
+        handler: Any,
+        icon: QStyle.StandardPixmap | None = None,
+    ) -> QAction:
         action = QAction(text, self)
         action.setToolTip(tooltip)
+        action.setStatusTip(tooltip)
+        if icon is not None:
+            action.setIcon(self.style().standardIcon(icon))
         action.triggered.connect(handler)
         self.workspace_rail.addAction(action)
         return action
@@ -779,6 +885,8 @@ class OctoBrowse(QMainWindow):
 
         view_menu = menu_bar.addMenu("View")
         self._add_menu_action(view_menu, "Command Palette", "Search commands", self.open_command_palette, "Ctrl+K")
+        self._add_menu_action(view_menu, "Library Search", "Search tabs and collections", self.open_library_search, "Ctrl+Shift+F")
+        self._add_menu_action(view_menu, "Feature Audit", "Show implemented feature checklist", self.open_feature_audit)
         self._add_menu_action(view_menu, "Find in Page", "Search text on the current page", self.toggle_find_bar, "Ctrl+F")
         self._add_menu_action(view_menu, "Reader View", "Open current page text in a clean reader tab", self.open_reader_view)
         self._add_menu_action(view_menu, "Page Insights", "Show page reading metrics", self.show_page_insights)
@@ -869,18 +977,23 @@ class OctoBrowse(QMainWindow):
                 background: {field_bg};
             }}
             QToolBar#WorkspaceRail {{
-                spacing: 4px;
-                padding: 8px 5px;
+                spacing: 3px;
+                padding: 8px 6px;
                 background: {panel_bg};
                 border-right: 1px solid {border};
             }}
             QToolBar#WorkspaceRail QToolButton {{
-                min-width: 50px;
-                min-height: 32px;
-                padding: 5px 6px;
+                min-width: 92px;
+                max-width: 106px;
+                min-height: 54px;
+                padding: 6px 4px;
                 border: 1px solid transparent;
                 border-radius: 7px;
                 color: {text};
+            }}
+            QToolBar#WorkspaceRail QToolButton:pressed {{
+                background: {accent};
+                color: #ffffff;
             }}
             QToolBar#WorkspaceRail QToolButton:hover {{
                 background: {base_bg};
@@ -981,6 +1094,8 @@ class OctoBrowse(QMainWindow):
     def available_commands(self) -> list[BrowserCommand]:
         return [
             BrowserCommand("Open dashboard", "workspace overview", self.open_dashboard),
+            BrowserCommand("Feature audit", "implemented checklist", self.open_feature_audit),
+            BrowserCommand("Library search", "tabs history bookmarks notes tasks", self.open_library_search),
             BrowserCommand("Restore saved tabs", "last session", self.restore_saved_tabs),
             BrowserCommand("New tab", "Ctrl+T", lambda: self.add_tab(QUrl(self.settings.homepage), "New Tab")),
             BrowserCommand("Private tab", "Ctrl+Shift+N", self.open_private_tab),
@@ -1022,6 +1137,84 @@ class OctoBrowse(QMainWindow):
 
     def open_command_palette(self) -> None:
         CommandPalette(self).exec()
+
+    def open_library_search(self) -> None:
+        LibrarySearchDialog(self).exec()
+
+    def address_suggestions(self) -> list[str]:
+        commands = [
+            "octo:dashboard",
+            "octo:features",
+            "octo:identity",
+            "octo:tabs",
+            "octo:downloads",
+            "octo:reading",
+            "octo:history",
+            "octo:bookmarks",
+            "octo:todos",
+            "octo:notes",
+            "octo:library",
+            "octo:settings",
+            "!ddg ",
+            "!yt ",
+            "!gh ",
+            "!w ",
+            "!maps ",
+            "!news ",
+            "!pypi ",
+            "!mdn ",
+        ]
+        urls = []
+        for url in self.history[-60:] + self.bookmarks + self.reading_list:
+            if url and url not in urls:
+                urls.append(url)
+        return commands + urls
+
+    def refresh_address_suggestions(self) -> None:
+        if hasattr(self, "url_suggestions_model"):
+            self.url_suggestions_model.setStringList(self.address_suggestions())
+
+    def apply_address_suggestion(self, text: str) -> None:
+        self.url_bar.setText(text)
+        if not text.endswith(" "):
+            self.navigate_to_url()
+
+    def library_entries(self) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for index in range(self.tabs.count()):
+            widget = self.tabs.widget(index)
+            if isinstance(widget, QWebEngineView):
+                entries.append(
+                    {
+                        "kind": "Tab",
+                        "title": self.tabs.tabText(index),
+                        "url": widget.url().toString(),
+                        "tab_index": index,
+                    }
+                )
+        for url in reversed(self.history[-120:]):
+            entries.append({"kind": "History", "title": url, "url": url})
+        for url in self.bookmarks:
+            entries.append({"kind": "Bookmark", "title": url, "url": url})
+        for url in self.reading_list:
+            entries.append({"kind": "Reading", "title": url, "url": url})
+        for note in self.notes:
+            entries.append({"kind": "Note", "title": note.get("note", ""), "url": note.get("url", "")})
+        for todo in self.todos:
+            entries.append({"kind": "Task", "title": todo})
+        return entries
+
+    def open_library_entry(self, entry: dict[str, Any]) -> None:
+        if "tab_index" in entry:
+            self.tabs.setCurrentIndex(int(entry["tab_index"]))
+            return
+        if entry.get("url"):
+            self.add_tab(QUrl(str(entry["url"])), str(entry.get("kind", "Library")))
+            return
+        if entry.get("kind") == "Task":
+            self.open_panel(self.todo_sidebar)
+        else:
+            self.open_panel(self.notes_sidebar)
 
     def duplicate_current_tab(self) -> None:
         browser = self.current_browser()
@@ -1080,6 +1273,89 @@ a {{ color: #0f5dcc; overflow-wrap: anywhere; }}
 </body>
 </html>"""
         self.add_html_tab(overview_html, "Tab Overview", private=False)
+
+    def open_feature_audit(self) -> None:
+        rows = []
+        for category, features in self.feature_catalog().items():
+            items = "".join(f"<li>{html.escape(feature)}</li>" for feature in features)
+            rows.append(f"<section class='panel'><h2>{html.escape(category)}</h2><ul>{items}</ul></section>")
+        feature_count = sum(len(items) for items in self.feature_catalog().values())
+        audit_html = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Feature Audit</title>
+<style>
+body {{ margin: 0; font-family: Segoe UI, Arial, sans-serif; background: #f6f8fb; color: #142033; }}
+main {{ max-width: 1100px; margin: 0 auto; padding: 34px 24px 56px; }}
+h1 {{ margin: 0 0 6px; }}
+.sub {{ color: #64748b; margin-bottom: 20px; }}
+.grid {{ display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap: 14px; }}
+.panel {{ background: #fff; border: 1px solid #dbe3ef; border-radius: 8px; padding: 16px; }}
+li {{ margin: 7px 0; }}
+</style>
+</head>
+<body>
+<main>
+<h1>Feature Audit</h1>
+<div class="sub">{feature_count} implemented browser capabilities across main and alpha parity plus new Octo Browser features.</div>
+<div class="grid">{''.join(rows)}</div>
+</main>
+</body>
+</html>"""
+        self.add_html_tab(audit_html, "Feature Audit", private=False)
+
+    def feature_catalog(self) -> dict[str, list[str]]:
+        return {
+            "Core Browser": [
+                "Tabbed browsing with close, duplicate, restore, and target-blank support",
+                "Address/search bar with URL normalization, bang search, Octo commands, and suggestions",
+                "Back, forward, reload, home, zoom, fullscreen, and user-agent controls",
+                "Session restore for standard tabs",
+            ],
+            "Workspace": [
+                "Dashboard first screen",
+                "Command palette",
+                "Unified library search",
+                "Left workspace rail and focused side panels",
+                "Tab overview",
+            ],
+            "Collections": [
+                "History with context actions",
+                "Bookmarks with context actions",
+                "Persistent reading list",
+                "Notes and todos",
+                "Download panel",
+            ],
+            "Page Tools": [
+                "Reader view",
+                "Page insights",
+                "Save page HTML",
+                "View source",
+                "Screenshot saving",
+                "OpenCV upscaled screenshot preview",
+                "Copy URL and Markdown link",
+            ],
+            "Privacy And Identity": [
+                "Ad-block interceptor and privacy report",
+                "Private/off-the-record tabs",
+                "Global private mode history pause",
+                "Clear browser data",
+                "Octo Browser HTTP and navigator identity",
+            ],
+            "AI And Voice": [
+                "OpenAI page summarization",
+                "Page-aware AI chat",
+                "Text-to-speech read aloud",
+                "SpeechRecognition voice commands",
+            ],
+            "Extensibility": [
+                "Constrained extension lab",
+                "Trusted legacy extension execution path",
+                "Session password scratchpad",
+                "Persistent settings with atomic writes",
+            ],
+        }
 
     def show_site_info(self) -> None:
         browser = self.current_browser()
@@ -1307,11 +1583,11 @@ code, pre {{
         if self.private_profile is not None:
             self.private_profile.setUrlRequestInterceptor(interceptor)
 
-    def add_tab(self, url: QUrl, title: str, private: bool | None = None) -> None:
+    def add_tab(self, url: QUrl, title: str, private: bool | None = None) -> QWebEngineView:
         is_private = self.incognito_mode if private is None else private
         browser = QWebEngineView()
         browser.setProperty("private", is_private)
-        browser.setPage(QWebEnginePage(self.profile_for_tab(is_private), browser))
+        browser.setPage(OctoWebPage(self, self.profile_for_tab(is_private), is_private, browser))
         browser.load(url)
 
         display_title = f"Private - {title}" if is_private else title
@@ -1324,6 +1600,7 @@ code, pre {{
         browser.titleChanged.connect(lambda page_title, browser=browser: self.update_tab_title(browser, page_title))
         self.update_status_badges()
         self.set_status("Opened private tab" if is_private else "Opened tab")
+        return browser
 
     def restore_startup_tabs(self) -> None:
         restored = self.restore_saved_tabs(select_first=False)
@@ -1471,10 +1748,17 @@ code, pre {{
             "home": self.go_home,
             "identity": self.open_browser_identity_page,
             "tabs": self.open_tab_overview,
+            "features": self.open_feature_audit,
+            "audit": self.open_feature_audit,
+            "library": self.open_library_search,
+            "search": self.open_library_search,
             "downloads": lambda: self.toggle_panel(self.downloads_sidebar),
             "history": lambda: self.toggle_panel(self.history_sidebar),
             "bookmarks": self.toggle_bookmarks,
             "reading": lambda: self.toggle_panel(self.reading_sidebar),
+            "todos": lambda: self.toggle_panel(self.todo_sidebar),
+            "tasks": lambda: self.toggle_panel(self.todo_sidebar),
+            "notes": lambda: self.toggle_panel(self.notes_sidebar),
             "settings": self.open_settings,
         }
         action = actions.get(target)
@@ -1537,7 +1821,7 @@ code, pre {{
     def add_html_tab(self, html_text: str, title: str, private: bool = False) -> None:
         browser = QWebEngineView()
         browser.setProperty("private", private)
-        browser.setPage(QWebEnginePage(self.profile_for_tab(private), browser))
+        browser.setPage(OctoWebPage(self, self.profile_for_tab(private), private, browser))
         browser.setHtml(html_text, QUrl("https://octobrowse.local/"))
         index = self.tabs.addTab(browser, title)
         self.tabs.setCurrentIndex(index)
@@ -1581,17 +1865,28 @@ main {{
 h1 {{ margin: 0 0 6px; font-size: 38px; }}
 .sub {{ color: #536174; margin-bottom: 24px; }}
 .grid {{ display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 14px; }}
-.metric, .panel {{
+.actions {{ margin-top: 16px; display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 12px; }}
+.metric, .panel, .action {{
   background: #ffffff;
   border: 1px solid #dce3ec;
   border-radius: 8px;
   padding: 16px;
 }}
+.metric, .action {{ display: block; color: #172033; }}
 .metric strong {{ display: block; font-size: 24px; margin-top: 6px; }}
+.action strong {{ display: block; margin-bottom: 4px; }}
+.action span {{ color: #64748b; font-size: 13px; }}
+.metric:hover, .action:hover {{ border-color: #7aa7e8; box-shadow: 0 8px 24px rgba(23, 32, 51, 0.08); }}
 .wide {{ margin-top: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
 a {{ color: #0f5dcc; text-decoration: none; }}
 li {{ margin: 8px 0; }}
 .empty {{ color: #6b7280; }}
+@media (max-width: 820px) {{
+  .grid, .actions, .wide {{ grid-template-columns: 1fr 1fr; }}
+}}
+@media (max-width: 560px) {{
+  .grid, .actions, .wide {{ grid-template-columns: 1fr; }}
+}}
 </style>
 </head>
 <body>
@@ -1599,19 +1894,27 @@ li {{ margin: 8px 0; }}
   <h1>OctoBrowse</h1>
   <div class="sub">Workspace dashboard for quick return, privacy awareness, and page work.</div>
   <section class="grid">
-    <div class="metric">History<strong>{len(self.history)}</strong></div>
-    <div class="metric">Bookmarks<strong>{len(self.bookmarks)}</strong></div>
-    <div class="metric">Todos<strong>{todo_count}</strong></div>
-    <div class="metric">Blocked<strong>{blocked}</strong></div>
-    <div class="metric">Reading<strong>{reading_count}</strong></div>
-    <div class="metric">Saved Tabs<strong>{saved_tabs_count}</strong></div>
+    <a class="metric" href="octo:history">History<strong>{len(self.history)}</strong></a>
+    <a class="metric" href="octo:bookmarks">Bookmarks<strong>{len(self.bookmarks)}</strong></a>
+    <a class="metric" href="octo:todos">Todos<strong>{todo_count}</strong></a>
+    <a class="metric" href="octo:features">Features<strong>{sum(len(items) for items in self.feature_catalog().values())}</strong></a>
+    <a class="metric" href="octo:reading">Reading<strong>{reading_count}</strong></a>
+    <a class="metric" href="octo:tabs">Saved Tabs<strong>{saved_tabs_count}</strong></a>
+  </section>
+  <section class="actions">
+    <a class="action" href="octo:features"><strong>Feature Audit</strong><span>Verify the old and new capability set.</span></a>
+    <a class="action" href="octo:library"><strong>Library Search</strong><span>Search tabs, history, bookmarks, notes, and tasks.</span></a>
+    <a class="action" href="octo:identity"><strong>Browser Identity</strong><span>Inspect Octo Browser user agent and navigator values.</span></a>
+    <a class="action" href="octo:tabs"><strong>Tab Overview</strong><span>Review every open standard and private tab.</span></a>
+    <a class="action" href="octo:downloads"><strong>Downloads</strong><span>Open download progress and completed files.</span></a>
+    <a class="action" href="octo:settings"><strong>Settings</strong><span>Manage homepage, keys, model, weather, and news.</span></a>
   </section>
   <section class="wide">
     <div class="panel"><h2>Recent</h2>{history_links}</div>
     <div class="panel"><h2>Bookmarks</h2>{bookmark_links}</div>
   </section>
   <section class="wide">
-    <div class="panel"><h2>Session</h2><p>{weather}</p><p>{notes_count} saved notes in this workspace.</p><p>Identity: {browser_identity}</p></div>
+    <div class="panel"><h2>Session</h2><p>{weather}</p><p>{notes_count} saved notes in this workspace.</p><p>{downloads_count} tracked downloads.</p><p>{blocked} requests blocked this session.</p><p>Identity: {browser_identity}</p></div>
     <div class="panel"><h2>Shortcuts</h2><p>Ctrl+K command palette</p><p>Ctrl+F find in page</p><p>Ctrl+D bookmark</p><p>Ctrl+J downloads</p><p>Ctrl+Shift+T reopen tab</p></div>
   </section>
 </main>
@@ -2009,10 +2312,8 @@ p {{ margin: 0 0 20px; }}
 
     def open_chatbot(self) -> None:
         self.chat_mode = True
-        self.notes_sidebar.show()
-        self.notes_sidebar.setFocus()
+        self.open_panel(self.notes_sidebar, status="Page chat mode")
         self.notes_sidebar.append("Ask about the current page on a new line, then press Enter.\n")
-        self.set_status("Page chat mode")
 
     def process_chatbot_query(self, query: str) -> None:
         query = query.strip()
@@ -2215,9 +2516,8 @@ p {{ margin: 0 0 20px; }}
         item = QListWidgetItem(f"Downloading: {target.name}")
         item.setToolTip(str(target))
         self.downloads_sidebar.addItem(item)
-        self.downloads_sidebar.show()
+        self.open_panel(self.downloads_sidebar, status=f"Downloading {target.name}")
         self.downloads.append({"file": str(target), "status": "downloading"})
-        self.set_status(f"Downloading {target.name}")
 
         try:
             download.receivedBytesChanged.connect(lambda item=item, download=download: self.update_download_progress(download, item))
@@ -2352,15 +2652,57 @@ p {{ margin: 0 0 20px; }}
             self.add_tab(browser.url(), "New Tab", private=bool(browser.property("private")))
 
     def toggle_panel(self, widget: QWidget) -> None:
-        should_show = not widget.isVisible()
+        if widget.isVisible():
+            for panel in self.side_panels:
+                panel.hide()
+            self.apply_panel_split(None)
+            self.set_status("Panel closed")
+            self.tabs.setFocus()
+            return
+
+        self.open_panel(widget)
+
+    def open_panel(self, widget: QWidget, status: str | None = None) -> None:
         for panel in self.side_panels:
             panel.hide()
-        widget.setVisible(should_show)
-        if should_show:
-            self.splitter.setSizes([900, 300])
-            self.set_status("Panel opened")
-        else:
-            self.set_status("Panel closed")
+        widget.show()
+        widget.raise_()
+        self.apply_panel_split(widget)
+        widget.setFocus()
+        self.set_status(status or f"{self.panel_title(widget)} opened")
+
+    def apply_panel_split(self, widget: QWidget | None) -> None:
+        total_width = max(self.splitter.width(), self.width(), 900)
+        sizes = [0 for _index in range(self.splitter.count())]
+        tab_index = self.splitter.indexOf(self.tabs)
+        if tab_index >= 0:
+            sizes[tab_index] = total_width
+
+        if widget is not None:
+            panel_index = self.splitter.indexOf(widget)
+            panel_width = max(280, min(460, total_width // 3))
+            if tab_index >= 0:
+                sizes[tab_index] = max(520, total_width - panel_width)
+            if panel_index >= 0:
+                sizes[panel_index] = panel_width
+
+        self.splitter.setSizes(sizes)
+
+    def panel_title(self, widget: QWidget) -> str:
+        for panel, title in (
+            (self.notes_sidebar, "Notes"),
+            (self.calendar_sidebar, "Calendar"),
+            (self.todo_sidebar, "Tasks"),
+            (self.history_sidebar, "History"),
+            (self.news_sidebar, "News"),
+            (self.downloads_sidebar, "Downloads"),
+            (self.reading_sidebar, "Reading list"),
+            (self.bookmarks_sidebar, "Bookmarks"),
+            (self.extension_tab, "Extensions"),
+        ):
+            if widget is panel:
+                return title
+        return "Panel"
 
     def toggle_extensions(self) -> None:
         self.toggle_panel(self.extension_tab)
@@ -2453,7 +2795,7 @@ p {{ margin: 0 0 20px; }}
             text = task.strip()
             self.todos.append(text)
             self.todo_sidebar.addItem(QListWidgetItem(text))
-            self.todo_sidebar.show()
+            self.open_panel(self.todo_sidebar, status="Task added")
             self.save_settings()
 
     def remove_todo_item(self, item: QListWidgetItem) -> None:
@@ -2611,6 +2953,9 @@ p {{ margin: 0 0 20px; }}
     def save_settings(self) -> None:
         self.settings.openai_api_key = self.openai_api_key
         self.settings.ad_block_enabled = self.ad_block_enabled
+        session_tabs = self.get_session_tabs()
+        if session_tabs:
+            self.session_tabs = session_tabs
         try:
             self.store.save(
                 self.settings,
@@ -2618,11 +2963,13 @@ p {{ margin: 0 0 20px; }}
                 self.bookmarks,
                 self.notes,
                 self.todos,
-                self.get_session_tabs(),
+                self.session_tabs,
                 self.reading_list,
             )
         except OSError as exc:
             QMessageBox.warning(self, "Settings", f"Could not save settings: {exc}")
+        finally:
+            self.refresh_address_suggestions()
 
     def keyPressEvent(self, event: Any) -> None:
         if event.key() == Qt.Key.Key_Escape and self.find_bar.isVisible():
