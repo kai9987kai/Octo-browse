@@ -5,3 +5,7 @@ venv/
 octobrowse_settings.json
 octobrowse.*.log
 .env
+build/
+dist/
+release/
+*.spec
