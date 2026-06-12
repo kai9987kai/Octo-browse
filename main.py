@@ -9,11 +9,15 @@ experimental alpha improvements into one maintained entry point.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
+import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import html
 from collections import Counter
 from dataclasses import dataclass, field
@@ -52,17 +56,21 @@ except ImportError:  # pragma: no cover - optional runtime feature
     sr = None
 
 from PyQt6.QtCore import QSize, QStandardPaths, QStringListModel, QThread, QTimer, QUrl, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QColor
+from PyQt6.QtGui import QAction, QColor, QDesktopServices
 from PyQt6.QtWebEngineCore import (
     QWebEnginePage,
     QWebEngineProfile,
     QWebEngineScript,
+    QWebEngineSettings,
+    QWebEngineUrlRequestInfo,
     QWebEngineUrlRequestInterceptor,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QColorDialog,
+    QComboBox,
     QCompleter,
     QDialog,
     QFileDialog,
@@ -79,6 +87,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QStyle,
     QTabWidget,
@@ -115,7 +124,53 @@ AD_BLOCK_LIST = {
     "rubiconproject.com",
     "scorecardresearch.com",
     "taboola.com",
+    # Analytics and session-tracking endpoints commonly blocked by tracker lists.
+    "adcolony.com",
+    "adroll.com",
+    "adsafeprotected.com",
+    "agkn.com",
+    "amplitude.com",
+    "bidswitch.net",
+    "bluekai.com",
+    "casalemedia.com",
+    "chartbeat.com",
+    "clarity.ms",
+    "crwdcntrl.net",
+    "demdex.net",
+    "exelator.com",
+    "fullstory.com",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "googletagservices.com",
+    "hotjar.com",
+    "indexww.com",
+    "krxd.net",
+    "mathtag.com",
+    "media.net",
+    "mgid.com",
+    "mixpanel.com",
+    "moatads.com",
+    "mouseflow.com",
+    "quantserve.com",
+    "revcontent.com",
+    "rlcdn.com",
+    "segment.io",
+    "sharethrough.com",
+    "smartadserver.com",
+    "triplelift.com",
+    "yieldmo.com",
 }
+
+SEARCH_ENGINES = {
+    "google": "https://www.google.com/search?q={query}",
+    "duckduckgo": "https://duckduckgo.com/?q={query}",
+    "bing": "https://www.bing.com/search?q={query}",
+    "brave": "https://search.brave.com/search?q={query}",
+    "startpage": "https://www.startpage.com/sp/search?query={query}",
+}
+DEFAULT_SEARCH_ENGINE = "google"
+
+EASYLIST_URL = "https://easylist.to/easylist/easylist.txt"
 
 DEFAULT_HOMEPAGE = "https://www.google.com"
 DEFAULT_OPENAI_MODEL = os.environ.get("OCTOBROWSE_OPENAI_MODEL", "gpt-5-mini")
@@ -127,6 +182,9 @@ OCTO_BROWSER_USER_AGENT = (
     f"Chrome/126.0.0.0 Safari/537.36"
 )
 MAX_HISTORY_ITEMS = 500
+
+DOWNLOAD_PATH_ROLE = Qt.ItemDataRole.UserRole
+DOWNLOAD_REQUEST_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
 @dataclass
@@ -141,6 +199,11 @@ class BrowserSettings:
     custom_theme: str | None = None
     ad_block_enabled: bool = False
     user_agent: str = OCTO_BROWSER_USER_AGENT
+    search_engine: str = DEFAULT_SEARCH_ENGINE
+    https_only: bool = False
+    gpc_enabled: bool = True
+    tab_hibernation_enabled: bool = True
+    hibernation_minutes: int = 15
 
 
 @dataclass
@@ -164,7 +227,19 @@ class SettingsStore:
 
     def load(
         self,
-    ) -> tuple[BrowserSettings, list[str], list[str], list[dict[str, str]], list[str], list[str], list[str]]:
+    ) -> tuple[
+        BrowserSettings,
+        list[dict[str, Any]],
+        list[str],
+        list[dict[str, str]],
+        list[str],
+        list[str],
+        list[str],
+        dict[str, dict[str, bool]],
+        dict[str, dict[str, bool]],
+        list[dict[str, Any]],
+        dict[str, list[str]],
+    ]:
         data: dict[str, Any] = {}
         source = self.path if self.path.exists() else self.legacy_path
         if source.exists():
@@ -188,24 +263,50 @@ class SettingsStore:
             custom_theme=data.get("custom_theme") or None,
             ad_block_enabled=bool(data.get("ad_block_enabled", False)),
             user_agent=str(data.get("user_agent") or OCTO_BROWSER_USER_AGENT),
+            search_engine=str(data.get("search_engine") or DEFAULT_SEARCH_ENGINE).lower(),
+            https_only=bool(data.get("https_only", False)),
+            gpc_enabled=bool(data.get("gpc_enabled", True)),
+            tab_hibernation_enabled=bool(data.get("tab_hibernation_enabled", True)),
+            hibernation_minutes=max(1, int(data.get("hibernation_minutes") or 15)),
         )
-        history = self._unique_strings(data.get("history", []))[-MAX_HISTORY_ITEMS:]
+        if settings.search_engine not in SEARCH_ENGINES:
+            settings.search_engine = DEFAULT_SEARCH_ENGINE
+        history = self._coerce_history(data.get("history", []))[-MAX_HISTORY_ITEMS:]
         bookmarks = self._unique_strings(data.get("bookmarks", []))
         notes = self._coerce_notes(data.get("notes", []))
         todos = self._unique_strings(data.get("todos", []))
         session_tabs = self._unique_strings(data.get("session_tabs", []))
         reading_list = self._unique_strings(data.get("reading_list", []))
-        return settings, history, bookmarks, notes, todos, session_tabs, reading_list
+        site_permissions = self._coerce_site_permissions(data.get("site_permissions", {}))
+        site_content = self._coerce_site_permissions(data.get("site_content", {}))
+        downloads_history = self._coerce_downloads(data.get("downloads_history", []))
+        plugin_grants = self._coerce_plugin_grants(data.get("plugin_grants", {}))
+        return (
+            settings,
+            history,
+            bookmarks,
+            notes,
+            todos,
+            session_tabs,
+            reading_list,
+            site_permissions,
+            site_content,
+            downloads_history,
+            plugin_grants,
+        )
 
     def save(
         self,
         settings: BrowserSettings,
-        history: list[str],
         bookmarks: list[str],
         notes: list[dict[str, str]],
         todos: list[str],
         session_tabs: list[str],
         reading_list: list[str],
+        site_permissions: dict[str, dict[str, bool]],
+        site_content: dict[str, dict[str, bool]],
+        downloads_history: list[dict[str, Any]],
+        plugin_grants: dict[str, list[str]],
     ) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -219,12 +320,20 @@ class SettingsStore:
             "custom_theme": settings.custom_theme,
             "ad_block_enabled": settings.ad_block_enabled,
             "user_agent": settings.user_agent,
-            "history": history[-MAX_HISTORY_ITEMS:],
+            "search_engine": settings.search_engine,
+            "https_only": settings.https_only,
+            "gpc_enabled": settings.gpc_enabled,
+            "tab_hibernation_enabled": settings.tab_hibernation_enabled,
+            "hibernation_minutes": settings.hibernation_minutes,
             "bookmarks": bookmarks,
             "notes": notes,
             "todos": todos,
             "session_tabs": session_tabs,
             "reading_list": reading_list,
+            "site_permissions": site_permissions,
+            "site_content": site_content,
+            "downloads_history": downloads_history[-100:],
+            "plugin_grants": plugin_grants,
         }
         tmp_path = self.path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -239,6 +348,85 @@ class SettingsStore:
             text = str(value).strip()
             if text and text not in result:
                 result.append(text)
+        return result
+
+    @staticmethod
+    def _coerce_history(values: Any) -> list[dict[str, Any]]:
+        """Accept both the legacy list-of-URL format and rich history entries."""
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        if not isinstance(values, list):
+            return result
+        for item in values:
+            if isinstance(item, dict):
+                url = str(item.get("url", "")).strip()
+                title = str(item.get("title", "")).strip()
+                try:
+                    visits = max(1, int(item.get("visits", 1)))
+                except (TypeError, ValueError):
+                    visits = 1
+                try:
+                    last_visit = float(item.get("last_visit", 0.0))
+                except (TypeError, ValueError):
+                    last_visit = 0.0
+            else:
+                url = str(item).strip()
+                title = ""
+                visits = 1
+                last_visit = 0.0
+            if url and url not in seen:
+                seen.add(url)
+                result.append({"url": url, "title": title, "visits": visits, "last_visit": last_visit})
+        return result
+
+    @staticmethod
+    def _coerce_plugin_grants(values: Any) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        if not isinstance(values, dict):
+            return result
+        for name, permissions in values.items():
+            if not isinstance(permissions, list):
+                continue
+            cleaned = [str(p) for p in permissions if str(p) in PLUGIN_PERMISSIONS]
+            result[str(name)] = cleaned
+        return result
+
+    @staticmethod
+    def _coerce_downloads(values: Any) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        if not isinstance(values, list):
+            return result
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            file_path = str(item.get("file", "")).strip()
+            if not file_path:
+                continue
+            try:
+                finished = float(item.get("time", 0.0))
+            except (TypeError, ValueError):
+                finished = 0.0
+            result.append(
+                {
+                    "file": file_path,
+                    "url": str(item.get("url", "")),
+                    "status": str(item.get("status", "complete")),
+                    "time": finished,
+                }
+            )
+        return result
+
+    @staticmethod
+    def _coerce_site_permissions(values: Any) -> dict[str, dict[str, bool]]:
+        result: dict[str, dict[str, bool]] = {}
+        if not isinstance(values, dict):
+            return result
+        for origin, features in values.items():
+            if not isinstance(features, dict):
+                continue
+            cleaned = {str(name): bool(allowed) for name, allowed in features.items() if str(name).strip()}
+            if cleaned:
+                result[str(origin)] = cleaned
         return result
 
     @staticmethod
@@ -260,23 +448,346 @@ class SettingsStore:
         return result
 
 
+class HistoryDatabase:
+    """SQLite-backed browsing history (Firefox places-style schema).
+
+    Replaces the old rewrite-the-whole-JSON-per-navigation persistence with
+    one upsert per visit.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        self.path = directory / "history.sqlite"
+        self.conn = sqlite3.connect(str(self.path))
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS visits (
+                url TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                visits INTEGER NOT NULL DEFAULT 1,
+                last_visit REAL NOT NULL DEFAULT 0
+            )
+            """
+        )
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_visits_last ON visits(last_visit)")
+        self.conn.commit()
+
+    def load(self, limit: int = MAX_HISTORY_ITEMS) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT url, title, visits, last_visit FROM visits ORDER BY last_visit DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            {"url": url, "title": title, "visits": visits, "last_visit": last_visit}
+            for url, title, visits, last_visit in reversed(rows)
+        ]
+
+    def record_visit(self, url: str, when: float) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO visits(url, last_visit) VALUES(?, ?)
+            ON CONFLICT(url) DO UPDATE SET visits = visits + 1, last_visit = excluded.last_visit
+            """,
+            (url, when),
+        )
+        self.conn.commit()
+
+    def set_title(self, url: str, title: str) -> None:
+        self.conn.execute("UPDATE visits SET title = ? WHERE url = ?", (title, url))
+        self.conn.commit()
+
+    def remove(self, url: str) -> None:
+        self.conn.execute("DELETE FROM visits WHERE url = ?", (url,))
+        self.conn.commit()
+
+    def clear(self) -> None:
+        self.conn.execute("DELETE FROM visits")
+        self.conn.commit()
+
+    def import_entries(self, entries: list[dict[str, Any]]) -> None:
+        self.conn.executemany(
+            """
+            INSERT INTO visits(url, title, visits, last_visit) VALUES(?, ?, ?, ?)
+            ON CONFLICT(url) DO NOTHING
+            """,
+            [
+                (
+                    str(entry.get("url", "")),
+                    str(entry.get("title", "")),
+                    int(entry.get("visits", 1)),
+                    float(entry.get("last_visit", 0.0)),
+                )
+                for entry in entries
+                if entry.get("url")
+            ],
+        )
+        self.conn.commit()
+
+    def prune(self, keep: int = MAX_HISTORY_ITEMS) -> None:
+        self.conn.execute(
+            "DELETE FROM visits WHERE url NOT IN (SELECT url FROM visits ORDER BY last_visit DESC LIMIT ?)",
+            (keep,),
+        )
+        self.conn.commit()
+
+    def close(self) -> None:
+        try:
+            self.prune()
+            self.conn.close()
+        except sqlite3.Error:
+            pass
+
+
+class FilterRuleSet:
+    """Subset of the Adblock Plus filter syntax used by EasyList.
+
+    Supports: `||domain^` network rules, `@@||domain^` exceptions,
+    hosts-file lines, path/substring patterns with `*`, `^`, and `|`, and
+    `##` cosmetic element-hiding rules (generic and per-domain).
+    Pattern rules are indexed by their longest literal token (the same idea
+    uBlock Origin uses) so each request only tests a handful of candidates.
+    Procedural cosmetic rules and rules with unsupported options are skipped.
+    """
+
+    GENERIC_CAP = 100
+    GENERIC_SELECTOR_CAP = 5000
+    _CSS_CHUNK = 100  # selectors per CSS rule, so one bad selector only voids its chunk
+    _TOKEN_RE = re.compile(r"[a-z0-9]{4,}")
+    _HOSTS_RE = re.compile(r"^(?:0\.0\.0\.0|127\.0\.0\.1)\s+([a-z0-9.-]+)$", re.IGNORECASE)
+    _DOMAIN_RULE_RE = re.compile(r"^[a-z0-9.-]+\^?$", re.IGNORECASE)
+    SUPPORTED_OPTIONS = {
+        "third-party", "3p", "script", "image", "stylesheet", "xmlhttprequest",
+        "subdocument", "object", "media", "font", "websocket", "other", "ping", "document",
+    }
+
+    def __init__(self) -> None:
+        self.blocked_domains: set[str] = set()
+        self.exception_domains: set[str] = set()
+        self.token_buckets: dict[str, list[re.Pattern[str]]] = {}
+        self.generic_patterns: list[re.Pattern[str]] = []
+        self.generic_selectors: list[str] = []
+        self.domain_selectors: dict[str, list[str]] = {}
+        self.rule_count = 0
+        self.cosmetic_count = 0
+        self.skipped_count = 0
+        self._generic_css: str | None = None
+
+    def parse_text(self, text: str) -> None:
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(("!", "[")):
+                continue
+            if "#@#" in line or "#?#" in line or "#$#" in line:
+                # Cosmetic exceptions and procedural/style rules are unsupported.
+                self.skipped_count += 1
+                continue
+            if "##" in line:
+                self._parse_cosmetic(line)
+                continue
+            hosts_match = self._HOSTS_RE.match(line)
+            if hosts_match:
+                domain = hosts_match.group(1).lower()
+                if domain not in {"localhost", "localhost.localdomain", "broadcasthost"}:
+                    self.blocked_domains.add(domain)
+                    self.rule_count += 1
+                continue
+            exception = line.startswith("@@")
+            if exception:
+                line = line[2:]
+            body, _, options = line.partition("$")
+            if options and not self._options_supported(options):
+                self.skipped_count += 1
+                continue
+            if body.startswith("||"):
+                rest = body[2:]
+                if self._DOMAIN_RULE_RE.match(rest):
+                    domain = rest.rstrip("^").lower().strip(".")
+                    if domain:
+                        (self.exception_domains if exception else self.blocked_domains).add(domain)
+                        self.rule_count += 1
+                    continue
+            if exception:
+                # Path-level exceptions are rare and risky to approximate.
+                self.skipped_count += 1
+                continue
+            pattern = self._compile_pattern(body)
+            if pattern is None:
+                self.skipped_count += 1
+                continue
+            token = self._pick_token(body)
+            if token:
+                self.token_buckets.setdefault(token, []).append(pattern)
+                self.rule_count += 1
+            elif len(self.generic_patterns) < self.GENERIC_CAP:
+                self.generic_patterns.append(pattern)
+                self.rule_count += 1
+            else:
+                self.skipped_count += 1
+
+    def _parse_cosmetic(self, line: str) -> None:
+        domains_part, _, selector = line.partition("##")
+        selector = selector.strip()
+        if not selector or "{" in selector or "}" in selector:
+            self.skipped_count += 1
+            return
+        domains_part = domains_part.strip().lower()
+        if not domains_part:
+            if len(self.generic_selectors) < self.GENERIC_SELECTOR_CAP:
+                self.generic_selectors.append(selector)
+                self.cosmetic_count += 1
+            else:
+                self.skipped_count += 1
+            return
+        if "~" in domains_part:
+            # Negated-domain cosmetics would need exclusion logic; skip safely.
+            self.skipped_count += 1
+            return
+        added = False
+        for domain in domains_part.split(","):
+            domain = domain.strip()
+            if domain:
+                self.domain_selectors.setdefault(domain, []).append(selector)
+                added = True
+        if added:
+            self.cosmetic_count += 1
+        else:
+            self.skipped_count += 1
+
+    @classmethod
+    def _css_block(cls, selectors: list[str]) -> str:
+        # Chunked so a single invalid selector cannot invalidate every rule.
+        blocks = []
+        for start in range(0, len(selectors), cls._CSS_CHUNK):
+            chunk = selectors[start : start + cls._CSS_CHUNK]
+            blocks.append(", ".join(chunk) + " { display: none !important; }")
+        return "\n".join(blocks)
+
+    def cosmetic_css_for(self, host: str) -> str:
+        if self._generic_css is None:
+            self._generic_css = self._css_block(self.generic_selectors)
+        site_selectors: list[str] = []
+        if host:
+            parts = host.split(".")
+            for index in range(len(parts) - 1):
+                candidate = ".".join(parts[index:])
+                site_selectors.extend(self.domain_selectors.get(candidate, ()))
+        site_css = self._css_block(site_selectors) if site_selectors else ""
+        return "\n".join(part for part in (site_css, self._generic_css) if part)
+
+    def _options_supported(self, options: str) -> bool:
+        for option in options.split(","):
+            if option.strip().lower() not in self.SUPPORTED_OPTIONS:
+                return False
+        return True
+
+    @staticmethod
+    def _compile_pattern(body: str) -> re.Pattern[str] | None:
+        text = body
+        host_anchor = anchor_start = anchor_end = False
+        if text.startswith("||"):
+            host_anchor = True
+            text = text[2:]
+        elif text.startswith("|"):
+            anchor_start = True
+            text = text[1:]
+        if text.endswith("|"):
+            anchor_end = True
+            text = text[:-1]
+        if not text:
+            return None
+        parts: list[str] = []
+        for char in text:
+            if char == "*":
+                parts.append(".*")
+            elif char == "^":
+                parts.append(r"(?:[^a-zA-Z0-9_.%-]|$)")
+            else:
+                parts.append(re.escape(char))
+        regex = "".join(parts)
+        if host_anchor:
+            regex = r"^[a-z][a-z0-9+.-]*://(?:[^/?#]*\.)?" + regex
+        elif anchor_start:
+            regex = "^" + regex
+        if anchor_end:
+            regex += "$"
+        try:
+            return re.compile(regex, re.IGNORECASE)
+        except re.error:
+            return None
+
+    def _pick_token(self, body: str) -> str | None:
+        tokens: list[str] = []
+        for segment in re.split(r"[*^|]", body.lower()):
+            tokens.extend(self._TOKEN_RE.findall(segment))
+        tokens = [token for token in tokens if token not in {"http", "https", "www"}]
+        return max(tokens, key=len) if tokens else None
+
+    def is_exception_host(self, host: str) -> bool:
+        return _domain_suffix_match(host, self.exception_domains) is not None
+
+    def should_block(self, url_text: str, host: str) -> bool:
+        if self.is_exception_host(host):
+            return False
+        if _domain_suffix_match(host, self.blocked_domains) is not None:
+            return True
+        lowered = url_text.lower()
+        for token in set(self._TOKEN_RE.findall(lowered)):
+            for pattern in self.token_buckets.get(token, ()):
+                if pattern.search(url_text):
+                    return True
+        for pattern in self.generic_patterns:
+            if pattern.search(url_text):
+                return True
+        return False
+
+
+def _domain_suffix_match(host: str, domains: set[str]) -> str | None:
+    """Walk the host's label suffixes; O(labels) regardless of set size."""
+    if not host or not domains:
+        return None
+    parts = host.split(".")
+    for index in range(len(parts) - 1):
+        candidate = ".".join(parts[index:])
+        if candidate in domains:
+            return candidate
+    return None
+
+
+class FilterParseWorker(QThread):
+    parsed = pyqtSignal(object)
+
+    def __init__(self, texts: list[str], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.texts = texts
+
+    def run(self) -> None:
+        rules = FilterRuleSet()
+        for text in self.texts:
+            try:
+                rules.parse_text(text)
+            except Exception:  # pragma: no cover - malformed list defensive guard
+                continue
+        self.parsed.emit(rules)
+
+
 class ApiFetchWorker(QThread):
     data_ready = pyqtSignal(str, object)
     failed = pyqtSignal(str, str)
 
-    def __init__(self, kind: str, url: str, parent: QWidget | None = None) -> None:
+    def __init__(self, kind: str, url: str, parent: QWidget | None = None, as_json: bool = True) -> None:
         super().__init__(parent)
         self.kind = kind
         self.url = url
+        self.as_json = as_json
 
     def run(self) -> None:
         if requests is None:
             self.failed.emit(self.kind, "Install the requests package.")
             return
         try:
-            response = requests.get(self.url, timeout=6)
+            response = requests.get(self.url, timeout=6 if self.as_json else 30)
             response.raise_for_status()
-            self.data_ready.emit(self.kind, response.json())
+            self.data_ready.emit(self.kind, response.json() if self.as_json else response.text)
         except Exception as exc:  # pragma: no cover - network dependent
             self.failed.emit(self.kind, str(exc))
 
@@ -330,30 +841,68 @@ class OpenAIWorker(QThread):
         return "\n".join(chunks)
 
 
-class AdBlockerInterceptor(QWebEngineUrlRequestInterceptor):
+class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
+    """Single request interceptor handling ad blocking, HTTPS-only upgrades, and GPC.
+
+    Domain matching walks the host's label suffixes against a set, so each
+    request costs O(host labels) instead of O(blocklist size).
+    """
+
     def __init__(self, block_list: set[str]) -> None:
         super().__init__()
         self.block_list = {domain.lower() for domain in block_list}
         self.blocked_by_domain: Counter[str] = Counter()
+        self.ad_block_enabled = False
+        self.https_only = False
+        self.gpc_enabled = True
+        self.https_upgrades = 0
+        self.filter_rules: FilterRuleSet | None = None
 
     def interceptRequest(self, info: Any) -> None:
-        host = info.requestUrl().host().lower()
-        match = self._matching_domain(host)
-        if match:
-            self.blocked_by_domain[match] += 1
-            info.block(True)
+        url = info.requestUrl()
+        host = url.host().lower()
+        if self.ad_block_enabled:
+            rules = self.filter_rules
+            excepted = rules.is_exception_host(host) if rules is not None else False
+            if not excepted:
+                match = self._matching_domain(host)
+                if match:
+                    self.blocked_by_domain[match] += 1
+                    info.block(True)
+                    return
+                if rules is not None and rules.should_block(url.toString(), host):
+                    self.blocked_by_domain[host or "pattern-rule"] += 1
+                    info.block(True)
+                    return
+        if self.https_only and url.scheme() == "http" and self._upgradable_host(host):
+            if info.resourceType() == QWebEngineUrlRequestInfo.ResourceType.ResourceTypeMainFrame:
+                secure = QUrl(url)
+                secure.setScheme("https")
+                self.https_upgrades += 1
+                info.redirect(secure)
+                return
+        if self.gpc_enabled:
+            info.setHttpHeader(b"Sec-GPC", b"1")
+            info.setHttpHeader(b"DNT", b"1")
 
     def reset_stats(self) -> None:
         self.blocked_by_domain.clear()
+        self.https_upgrades = 0
 
     def total_blocked(self) -> int:
         return sum(self.blocked_by_domain.values())
 
     def _matching_domain(self, host: str) -> str | None:
-        for domain in self.block_list:
-            if host == domain or host.endswith(f".{domain}"):
-                return domain
-        return None
+        return _domain_suffix_match(host, self.block_list)
+
+    @staticmethod
+    def _upgradable_host(host: str) -> bool:
+        if not host or host == "localhost" or host.endswith(".local"):
+            return False
+        # Skip bare IPv4/IPv6 hosts; certificates rarely match them.
+        if host.replace(".", "").isdigit() or ":" in host:
+            return False
+        return "." in host
 
 
 class PasswordManager:
@@ -384,6 +933,199 @@ class PasswordManager:
         if not encrypted:
             return None
         return self.decrypt(encrypted)
+
+
+PLUGIN_PERMISSIONS = {
+    "tabs": "Open, list, switch, and close tabs",
+    "navigation": "Navigate and reload the current tab",
+    "page": "Read the current page's URL, title, and text",
+    "history": "Read browsing history",
+    "bookmarks": "Read and add bookmarks",
+    "notes": "Add notes and todo items",
+    "ui": "Show status messages and dialogs",
+    "clipboard": "Read and write the clipboard",
+    "network": "Fetch web resources over HTTP(S)",
+}
+
+PLUGIN_FETCH_LIMIT = 2_000_000  # bytes of response text a plugin may receive
+
+
+def make_safe_builtins(print_fn: Any) -> dict[str, Any]:
+    """Restricted builtins for plugin and extension-lab execution."""
+    return {
+        "Exception": Exception,
+        "PermissionError": PermissionError,
+        "ValueError": ValueError,
+        "False": False,
+        "True": True,
+        "None": None,
+        "abs": abs,
+        "all": all,
+        "any": any,
+        "bool": bool,
+        "dict": dict,
+        "enumerate": enumerate,
+        "filter": filter,
+        "float": float,
+        "int": int,
+        "isinstance": isinstance,
+        "len": len,
+        "list": list,
+        "map": map,
+        "max": max,
+        "min": min,
+        "print": print_fn,
+        "range": range,
+        "repr": repr,
+        "reversed": reversed,
+        "round": round,
+        "set": set,
+        "sorted": sorted,
+        "str": str,
+        "sum": sum,
+        "tuple": tuple,
+        "zip": zip,
+    }
+
+
+class OctoPluginAPI:
+    """Capability object handed to plugins; every call checks a granted permission."""
+
+    def __init__(self, browser_window: "OctoBrowse", plugin_name: str, granted: set[str]) -> None:
+        self._browser = browser_window
+        self.plugin_name = plugin_name
+        self.granted = frozenset(granted)
+
+    def _require(self, permission: str) -> None:
+        if permission not in self.granted:
+            raise PermissionError(
+                f"Plugin '{self.plugin_name}' was not granted the '{permission}' permission."
+            )
+
+    # --- tabs ---
+    def open_tab(self, url: str) -> None:
+        self._require("tabs")
+        self._browser.add_tab(self._browser.build_url(str(url)), "Plugin Tab", private=False)
+
+    def list_tabs(self) -> list[dict[str, Any]]:
+        self._require("tabs")
+        tabs = []
+        for index in range(self._browser.tabs.count()):
+            widget = self._browser.tabs.widget(index)
+            if isinstance(widget, QWebEngineView):
+                tabs.append(
+                    {
+                        "index": index,
+                        "title": self._browser.tabs.tabText(index),
+                        "url": widget.url().toString(),
+                    }
+                )
+        return tabs
+
+    def switch_to_tab(self, index: int) -> None:
+        self._require("tabs")
+        if 0 <= int(index) < self._browser.tabs.count():
+            self._browser.tabs.setCurrentIndex(int(index))
+
+    def close_tab(self, index: int) -> None:
+        self._require("tabs")
+        if 0 <= int(index) < self._browser.tabs.count():
+            self._browser.close_tab(int(index))
+
+    # --- navigation ---
+    def navigate(self, url: str) -> None:
+        self._require("navigation")
+        browser = self._browser.current_browser()
+        if browser:
+            browser.setUrl(self._browser.build_url(str(url)))
+
+    def reload(self) -> None:
+        self._require("navigation")
+        self._browser.refresh_page()
+
+    # --- page ---
+    def page_url(self) -> str:
+        self._require("page")
+        browser = self._browser.current_browser()
+        return browser.url().toString() if browser else ""
+
+    def page_title(self) -> str:
+        self._require("page")
+        index = self._browser.tabs.currentIndex()
+        return self._browser.tabs.tabText(index) if index >= 0 else ""
+
+    def get_page_text(self, callback: Any) -> None:
+        self._require("page")
+        browser = self._browser.current_browser()
+        if browser:
+            browser.page().toPlainText(callback)
+
+    # --- collections ---
+    def history(self, limit: int = 50) -> list[dict[str, Any]]:
+        self._require("history")
+        return [dict(entry) for entry in self._browser.history[-max(1, int(limit)):]]
+
+    def bookmarks(self) -> list[str]:
+        self._require("bookmarks")
+        return list(self._browser.bookmarks)
+
+    def add_bookmark(self, url: str) -> None:
+        self._require("bookmarks")
+        url = str(url).strip()
+        if url and url not in self._browser.bookmarks:
+            self._browser.bookmarks.append(url)
+            self._browser.bookmarks_sidebar.addItem(QListWidgetItem(url))
+            self._browser.save_settings()
+
+    def add_note(self, note: str) -> None:
+        self._require("notes")
+        note = str(note).strip()
+        if not note:
+            return
+        browser = self._browser.current_browser()
+        url = browser.url().toString() if browser else "plugin"
+        self._browser.notes.append({"url": url, "note": note})
+        self._browser.notes_sidebar.append(f"Note for {url}:\n{note}\n")
+        self._browser.save_settings()
+
+    def add_todo(self, text: str) -> None:
+        self._require("notes")
+        text = str(text).strip()
+        if not text:
+            return
+        self._browser.todos.append(text)
+        self._browser.todo_sidebar.addItem(QListWidgetItem(text))
+        self._browser.save_settings()
+
+    # --- ui ---
+    def set_status(self, message: str) -> None:
+        self._require("ui")
+        self._browser.set_status(f"[{self.plugin_name}] {message}")
+
+    def show_message(self, title: str, text: str) -> None:
+        self._require("ui")
+        QMessageBox.information(self._browser, f"{self.plugin_name}: {title}", str(text)[:4000])
+
+    # --- clipboard ---
+    def clipboard_text(self) -> str:
+        self._require("clipboard")
+        return QApplication.clipboard().text()
+
+    def set_clipboard_text(self, text: str) -> None:
+        self._require("clipboard")
+        QApplication.clipboard().setText(str(text))
+
+    # --- network ---
+    def fetch(self, url: str, timeout: float = 10.0) -> str:
+        self._require("network")
+        if requests is None:
+            raise RuntimeError("Install the requests package to use plugin networking.")
+        url = str(url)
+        if not url.lower().startswith(("http://", "https://")):
+            raise ValueError("Plugins may only fetch http(s) URLs.")
+        response = requests.get(url, timeout=min(float(timeout), 15.0))
+        response.raise_for_status()
+        return response.text[:PLUGIN_FETCH_LIMIT]
 
 
 class OctoWebPage(QWebEnginePage):
@@ -423,11 +1165,33 @@ class SettingsDialog(QDialog):
         self.weather_key_edit = QLineEdit(settings.weather_api_key)
         self.news_key_edit = QLineEdit(settings.news_api_key)
 
+        self.search_engine_combo = QComboBox()
+        for engine in SEARCH_ENGINES:
+            self.search_engine_combo.addItem(engine.title(), engine)
+        current_index = self.search_engine_combo.findData(settings.search_engine)
+        self.search_engine_combo.setCurrentIndex(max(0, current_index))
+
+        self.https_only_check = QCheckBox("Upgrade http:// page loads to https://")
+        self.https_only_check.setChecked(settings.https_only)
+        self.gpc_check = QCheckBox("Send Global Privacy Control (Sec-GPC) and DNT headers")
+        self.gpc_check.setChecked(settings.gpc_enabled)
+        self.hibernation_check = QCheckBox("Hibernate idle background tabs to save memory")
+        self.hibernation_check.setChecked(settings.tab_hibernation_enabled)
+        self.hibernation_minutes_spin = QSpinBox()
+        self.hibernation_minutes_spin.setRange(1, 240)
+        self.hibernation_minutes_spin.setValue(settings.hibernation_minutes)
+        self.hibernation_minutes_spin.setSuffix(" min idle")
+
         for key_edit in (self.openai_key_edit, self.weather_key_edit, self.news_key_edit):
             key_edit.setEchoMode(QLineEdit.EchoMode.Password)
 
         layout.addRow("Homepage URL:", self.homepage_edit)
+        layout.addRow("Search Engine:", self.search_engine_combo)
         layout.addRow("Browser Identity:", self.user_agent_edit)
+        layout.addRow("Privacy:", self.https_only_check)
+        layout.addRow("", self.gpc_check)
+        layout.addRow("Performance:", self.hibernation_check)
+        layout.addRow("", self.hibernation_minutes_spin)
         layout.addRow("OpenAI API Key:", self.openai_key_edit)
         layout.addRow("OpenAI Model:", self.openai_model_edit)
         layout.addRow("Weather Location:", self.weather_location_edit)
@@ -460,6 +1224,11 @@ class SettingsDialog(QDialog):
             custom_theme=current.custom_theme,
             ad_block_enabled=current.ad_block_enabled,
             user_agent=self.user_agent_edit.text().strip() or OCTO_BROWSER_USER_AGENT,
+            search_engine=str(self.search_engine_combo.currentData() or DEFAULT_SEARCH_ENGINE),
+            https_only=self.https_only_check.isChecked(),
+            gpc_enabled=self.gpc_check.isChecked(),
+            tab_hibernation_enabled=self.hibernation_check.isChecked(),
+            hibernation_minutes=self.hibernation_minutes_spin.value(),
         )
 
 
@@ -580,14 +1349,27 @@ class OctoBrowse(QMainWindow):
         self.store = SettingsStore()
         (
             self.settings,
-            self.history,
+            legacy_history,
             self.bookmarks,
             self.notes,
             self.todos,
             self.session_tabs,
             self.reading_list,
+            self.site_permissions,
+            self.site_content,
+            self.downloads_history,
+            self.plugin_grants,
         ) = self.store.load()
         self.openai_api_key = self.settings.openai_api_key
+        self.plugins_dir = self.store.directory / "plugins"
+
+        self.history_db = HistoryDatabase(self.store.directory)
+        self.history = self.history_db.load()
+        if not self.history and legacy_history:
+            # One-time migration from the old JSON history blob.
+            self.history_db.import_entries(legacy_history)
+            self.history = self.history_db.load()
+        self._history_index: dict[str, dict[str, Any]] = {entry["url"]: entry for entry in self.history}
 
         self.dark_mode = self.settings.theme == "dark"
         self.ad_block_enabled = self.settings.ad_block_enabled
@@ -607,8 +1389,20 @@ class OctoBrowse(QMainWindow):
         self.apply_browser_identity(self.profile)
         self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
         self.profile.downloadRequested.connect(self.handle_download_requested)
-        self.ad_block_interceptor = AdBlockerInterceptor(AD_BLOCK_LIST)
-        self.apply_ad_block_to_profiles()
+        self.request_interceptor = OctoRequestInterceptor(AD_BLOCK_LIST)
+        self.request_interceptor.ad_block_enabled = self.ad_block_enabled
+        self.request_interceptor.https_only = self.settings.https_only
+        self.request_interceptor.gpc_enabled = self.settings.gpc_enabled
+        self.profile.setUrlRequestInterceptor(self.request_interceptor)
+
+        self.filter_workers: list[FilterParseWorker] = []
+        self.filter_list_dir = self.store.directory / "filterlists"
+        QTimer.singleShot(0, self.reload_filter_lists)
+        QTimer.singleShot(5_000, self.refresh_stale_filter_lists)
+
+        self.hibernation_timer = QTimer(self)
+        self.hibernation_timer.timeout.connect(self.hibernate_idle_tabs)
+        self.hibernation_timer.start(60_000)
 
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
@@ -639,6 +1433,8 @@ class OctoBrowse(QMainWindow):
 
         self.downloads_sidebar = QListWidget()
         self.downloads_sidebar.hide()
+        self.downloads_sidebar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.downloads_sidebar.customContextMenuRequested.connect(self.show_downloads_context_menu)
 
         self.reading_sidebar = QListWidget()
         self.reading_sidebar.hide()
@@ -712,6 +1508,11 @@ class OctoBrowse(QMainWindow):
         self._add_action("Reload", "Refresh (F5)", self.refresh_page, "F5", QStyle.StandardPixmap.SP_BrowserReload)
         self._add_action("Home", "Open Homepage", self.go_home, icon=QStyle.StandardPixmap.SP_DirHomeIcon)
 
+        self.security_badge = QLabel("Octo")
+        self.security_badge.setObjectName("SecurityBadge")
+        self.security_badge.setToolTip("Connection security")
+        self.toolbar.addWidget(self.security_badge)
+
         self.url_bar = QLineEdit()
         self.url_bar.setObjectName("AddressBar")
         self.url_bar.setPlaceholderText("Enter URL or search term... (Ctrl+L)")
@@ -733,6 +1534,11 @@ class OctoBrowse(QMainWindow):
         self.find_bar.textChanged.connect(self.find_in_page)
         self.find_bar.hide()
         self.toolbar.addWidget(self.find_bar)
+
+        self.find_count_label = QLabel("")
+        self.find_count_label.setObjectName("FindCount")
+        self.find_count_label.hide()
+        self.toolbar.addWidget(self.find_count_label)
 
         self._add_action("Find", "Find in Page (Ctrl+F)", self.toggle_find_bar, "Ctrl+F", QStyle.StandardPixmap.SP_FileDialogContentsView)
         self._add_action("Prev", "Previous Find Match", self.find_previous)
@@ -760,6 +1566,12 @@ class OctoBrowse(QMainWindow):
 
         tools_menu = QMenu("Tools", self)
         self._add_menu_action(tools_menu, "Privacy Report", "Show ad-block and privacy state", self.show_privacy_report)
+        self._add_menu_action(tools_menu, "Site Permissions", "Review saved per-site permissions", self.open_site_permissions)
+        self._add_menu_action(tools_menu, "Site Controls", "Per-site JavaScript and image toggles", self.open_site_controls)
+        self._add_menu_action(tools_menu, "Update EasyList", "Download and apply the EasyList filter list", self.update_easylist)
+        self._add_menu_action(tools_menu, "Load Filter List...", "Import an Adblock-format filter list file", self.load_filter_list_file)
+        self._add_menu_action(tools_menu, "Hibernate Background Tabs", "Free memory used by background tabs", self.hibernate_background_tabs_now)
+        self._add_menu_action(tools_menu, "Mute/Unmute Tab", "Toggle audio for the current tab", self.toggle_mute_current_tab, "Ctrl+M")
         self._add_menu_action(tools_menu, "Feature Audit", "Show implemented feature checklist", self.open_feature_audit)
         self._add_menu_action(tools_menu, "Library Search", "Search all browser collections", self.open_library_search, "Ctrl+Shift+F")
         self._add_menu_action(tools_menu, "Page Insights", "Show word count and keywords", self.show_page_insights)
@@ -776,7 +1588,8 @@ class OctoBrowse(QMainWindow):
         self._add_menu_action(tools_menu, "Voice Command", "Control browser with speech", self.voice_command)
         self._add_menu_action(tools_menu, "Change User Agent", "Set a custom user agent", self.change_user_agent)
         self._add_menu_action(tools_menu, "Session Passwords", "Open session password scratchpad", self.manage_passwords)
-        self._add_menu_action(tools_menu, "Run Extension", "Run constrained extension code", self.run_extension)
+        self._add_menu_action(tools_menu, "Plugin Manager", "Install and run permissioned plugins", self.open_plugin_manager)
+        self._add_menu_action(tools_menu, "Run Extension", "Run constrained extension code (legacy)", self.run_extension)
         self._add_menu_action(tools_menu, "Run Trusted Extension", "Run extension with full Python access", self.run_trusted_extension)
         self.toolbar.addAction(tools_menu.menuAction())
 
@@ -885,6 +1698,13 @@ class OctoBrowse(QMainWindow):
 
         view_menu = menu_bar.addMenu("View")
         self._add_menu_action(view_menu, "Command Palette", "Search commands", self.open_command_palette, "Ctrl+K")
+        self._add_menu_action(view_menu, "Next Tab", "Switch to the next tab", self.next_tab, "Ctrl+Tab")
+        self._add_menu_action(view_menu, "Previous Tab", "Switch to the previous tab", self.previous_tab, "Ctrl+Shift+Tab")
+        for tab_number in range(1, 10):
+            jump_action = QAction(f"Tab {tab_number}", self)
+            jump_action.setShortcut(f"Ctrl+{tab_number}")
+            jump_action.triggered.connect(lambda _checked=False, number=tab_number: self.jump_to_tab(number))
+            self.addAction(jump_action)
         self._add_menu_action(view_menu, "Library Search", "Search tabs and collections", self.open_library_search, "Ctrl+Shift+F")
         self._add_menu_action(view_menu, "Feature Audit", "Show implemented feature checklist", self.open_feature_audit)
         self._add_menu_action(view_menu, "Find in Page", "Search text on the current page", self.toggle_find_bar, "Ctrl+F")
@@ -1028,7 +1848,7 @@ class OctoBrowse(QMainWindow):
                 border-radius: 5px;
                 background: {accent};
             }}
-            QLabel#WeatherBadge {{
+            QLabel#WeatherBadge, QLabel#SecurityBadge, QLabel#FindCount {{
                 padding: 3px 8px;
                 border: 1px solid {border};
                 border-radius: 7px;
@@ -1087,7 +1907,7 @@ class OctoBrowse(QMainWindow):
         zoom = browser.zoomFactor() if browser else 1.0
         self.status_privacy.setText("Private tab" if private else "Standard tab")
         self.status_blocked.setText(
-            f"Ad block {'on' if self.ad_block_enabled else 'off'} | {self.ad_block_interceptor.total_blocked()} blocked"
+            f"Ad block {'on' if self.ad_block_enabled else 'off'} | {self.request_interceptor.total_blocked()} blocked"
         )
         self.status_zoom.setText(f"Zoom {int(zoom * 100)}%")
 
@@ -1116,6 +1936,14 @@ class OctoBrowse(QMainWindow):
             BrowserCommand("Ask about page", "AI chat", self.open_chatbot),
             BrowserCommand("Toggle ad block", "privacy", self.toggle_ad_block),
             BrowserCommand("Privacy report", "blocked requests", self.show_privacy_report),
+            BrowserCommand("Site permissions", "camera mic location decisions", self.open_site_permissions),
+            BrowserCommand("Site controls", "per-site javascript images", self.open_site_controls),
+            BrowserCommand("Update EasyList", "download ad-block filter list", self.update_easylist),
+            BrowserCommand("Load filter list", "import adblock rules file", self.load_filter_list_file),
+            BrowserCommand("Hibernate background tabs", "free memory now", self.hibernate_background_tabs_now),
+            BrowserCommand("Mute tab", "toggle tab audio", self.toggle_mute_current_tab),
+            BrowserCommand("Next tab", "Ctrl+Tab", self.next_tab),
+            BrowserCommand("Previous tab", "Ctrl+Shift+Tab", self.previous_tab),
             BrowserCommand("Add bookmark", "Ctrl+D", self.add_bookmark),
             BrowserCommand("Add to reading list", "read later", self.add_to_reading_list),
             BrowserCommand("Show bookmarks", "panel", self.toggle_bookmarks),
@@ -1126,6 +1954,7 @@ class OctoBrowse(QMainWindow):
             BrowserCommand("Show downloads", "panel Ctrl+J", lambda: self.toggle_panel(self.downloads_sidebar)),
             BrowserCommand("Show reading list", "panel", lambda: self.toggle_panel(self.reading_sidebar)),
             BrowserCommand("Show extensions", "panel", self.toggle_extensions),
+            BrowserCommand("Plugin manager", "permissioned plugins", self.open_plugin_manager),
             BrowserCommand("Run trusted extension", "full Python access", self.run_trusted_extension),
             BrowserCommand("Add note", "current page", self.add_note_for_page),
             BrowserCommand("Add task", "todo", self.add_todo_item),
@@ -1154,6 +1983,8 @@ class OctoBrowse(QMainWindow):
             "octo:todos",
             "octo:notes",
             "octo:library",
+            "octo:permissions",
+            "octo:plugins",
             "octo:settings",
             "!ddg ",
             "!yt ",
@@ -1164,8 +1995,10 @@ class OctoBrowse(QMainWindow):
             "!pypi ",
             "!mdn ",
         ]
+        now = time.time()
+        ranked = sorted(self.history, key=lambda entry: self._frecency(entry, now), reverse=True)
         urls = []
-        for url in self.history[-60:] + self.bookmarks + self.reading_list:
+        for url in [entry["url"] for entry in ranked[:60]] + self.bookmarks + self.reading_list:
             if url and url not in urls:
                 urls.append(url)
         return commands + urls
@@ -1192,8 +2025,8 @@ class OctoBrowse(QMainWindow):
                         "tab_index": index,
                     }
                 )
-        for url in reversed(self.history[-120:]):
-            entries.append({"kind": "History", "title": url, "url": url})
+        for entry in reversed(self.history[-120:]):
+            entries.append({"kind": "History", "title": entry.get("title") or entry["url"], "url": entry["url"]})
         for url in self.bookmarks:
             entries.append({"kind": "Bookmark", "title": url, "url": url})
         for url in self.reading_list:
@@ -1310,8 +2143,14 @@ li {{ margin: 7px 0; }}
             "Core Browser": [
                 "Tabbed browsing with close, duplicate, restore, and target-blank support",
                 "Address/search bar with URL normalization, bang search, Octo commands, and suggestions",
+                "Frecency-ranked address suggestions from titled, visit-counted history",
+                "Configurable default search engine (Google, DuckDuckGo, Bing, Brave, Startpage)",
                 "Back, forward, reload, home, zoom, fullscreen, and user-agent controls",
+                "Tab navigation shortcuts (Ctrl+Tab, Ctrl+1-9) and per-tab audio mute",
+                "HTML5 fullscreen support for video players",
+                "Built-in PDF viewer",
                 "Session restore for standard tabs",
+                "Render-process crash detection with automatic reload",
             ],
             "Workspace": [
                 "Dashboard first screen",
@@ -1319,13 +2158,15 @@ li {{ margin: 7px 0; }}
                 "Unified library search",
                 "Left workspace rail and focused side panels",
                 "Tab overview",
+                "Automatic background-tab hibernation to reclaim memory",
+                "Find-in-page with live match counter",
             ],
             "Collections": [
-                "History with context actions",
+                "SQLite-backed history with titles, visit counts, and context actions",
                 "Bookmarks with context actions",
                 "Persistent reading list",
                 "Notes and todos",
-                "Download panel",
+                "Download manager with pause/resume/cancel and persistent download history",
             ],
             "Page Tools": [
                 "Reader view",
@@ -1337,7 +2178,15 @@ li {{ margin: 7px 0; }}
                 "Copy URL and Markdown link",
             ],
             "Privacy And Identity": [
-                "Ad-block interceptor and privacy report",
+                "Ad-block interceptor with fast suffix matching and privacy report",
+                "EasyList-compatible filter list parsing with token-indexed pattern rules",
+                "Cosmetic element-hiding rules injected per page",
+                "Automatic weekly EasyList refresh",
+                "Per-site content controls (JavaScript and image toggles)",
+                "HTTPS-only mode with automatic page upgrades",
+                "Global Privacy Control (Sec-GPC) and DNT request headers",
+                "Per-site permission prompts for camera, microphone, location, and notifications",
+                "Connection security badge in the toolbar",
                 "Private/off-the-record tabs",
                 "Global private mode history pause",
                 "Clear browser data",
@@ -1350,7 +2199,8 @@ li {{ margin: 7px 0; }}
                 "SpeechRecognition voice commands",
             ],
             "Extensibility": [
-                "Constrained extension lab",
+                "Permissioned plugin API with manifest-declared capabilities and a plugin manager",
+                "Constrained extension lab (legacy)",
                 "Trusted legacy extension execution path",
                 "Session password scratchpad",
                 "Persistent settings with atomic writes",
@@ -1369,7 +2219,7 @@ li {{ margin: 7px 0; }}
             f"Private tab: {'yes' if browser.property('private') else 'no'}",
             f"Zoom: {int(browser.zoomFactor() * 100)}%",
             f"Ad block: {'on' if self.ad_block_enabled else 'off'}",
-            f"Blocked this session: {self.ad_block_interceptor.total_blocked()}",
+            f"Blocked this session: {self.request_interceptor.total_blocked()}",
             f"HTTP user agent: {self.profile.httpUserAgent()}",
         ]
         QMessageBox.information(self, "Site Info", "\n".join(lines))
@@ -1455,8 +2305,15 @@ code, pre {{
         self.add_tab(QUrl("https://www.whatismybrowser.com/"), "Identity Test", private=False)
 
     def populate_sidebars(self) -> None:
-        for url in self.history:
-            self.history_sidebar.addItem(QListWidgetItem(url))
+        for entry in self.history:
+            self.history_sidebar.addItem(self._make_history_item(entry))
+        for past_download in self.downloads_history[-20:]:
+            file_path = str(past_download.get("file", ""))
+            status = str(past_download.get("status", "complete")).title()
+            item = QListWidgetItem(f"{status}: {Path(file_path).name}")
+            item.setToolTip(file_path)
+            item.setData(DOWNLOAD_PATH_ROLE, file_path)
+            self.downloads_sidebar.addItem(item)
         for bookmark in self.bookmarks:
             self.bookmarks_sidebar.addItem(QListWidgetItem(bookmark))
         for url in self.reading_list:
@@ -1477,8 +2334,7 @@ code, pre {{
             self.private_profile = QWebEngineProfile(self)
             self.apply_browser_identity(self.private_profile)
             self.private_profile.downloadRequested.connect(self.handle_download_requested)
-            if self.ad_block_enabled:
-                self.private_profile.setUrlRequestInterceptor(self.ad_block_interceptor)
+            self.private_profile.setUrlRequestInterceptor(self.request_interceptor)
         return self.private_profile
 
     def apply_browser_identity(self, profile: QWebEngineProfile) -> None:
@@ -1577,11 +2433,104 @@ code, pre {{
                 pass
         scripts.insert(script)
 
-    def apply_ad_block_to_profiles(self) -> None:
-        interceptor = self.ad_block_interceptor if self.ad_block_enabled else None
-        self.profile.setUrlRequestInterceptor(interceptor)
-        if self.private_profile is not None:
-            self.private_profile.setUrlRequestInterceptor(interceptor)
+    def apply_privacy_settings(self) -> None:
+        """Push the current privacy toggles into the always-installed interceptor."""
+        self.request_interceptor.ad_block_enabled = self.ad_block_enabled
+        self.request_interceptor.https_only = self.settings.https_only
+        self.request_interceptor.gpc_enabled = self.settings.gpc_enabled
+
+    def reload_filter_lists(self) -> None:
+        """Parse every cached filter list off the UI thread."""
+        texts: list[str] = []
+        if self.filter_list_dir.is_dir():
+            for list_path in sorted(self.filter_list_dir.glob("*.txt")):
+                try:
+                    texts.append(list_path.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    continue
+        if not texts:
+            self.request_interceptor.filter_rules = None
+            return
+        worker = FilterParseWorker(texts, self)
+        worker.parsed.connect(self.handle_filter_rules_parsed)
+        worker.finished.connect(lambda worker=worker: self.cleanup_filter_worker(worker))
+        self.filter_workers.append(worker)
+        worker.start()
+
+    def cleanup_filter_worker(self, worker: FilterParseWorker) -> None:
+        if worker in self.filter_workers:
+            self.filter_workers.remove(worker)
+
+    def handle_filter_rules_parsed(self, rules: object) -> None:
+        if not isinstance(rules, FilterRuleSet):
+            return
+        self.request_interceptor.filter_rules = rules
+        self.set_status(
+            f"Filter lists loaded: {rules.rule_count} rules "
+            f"({len(rules.blocked_domains)} domains, {rules.skipped_count} unsupported skipped)"
+        )
+
+    def load_filter_list_file(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Load Filter List", "", "Filter Lists (*.txt);;All Files (*)"
+        )
+        if not file_path:
+            return
+        source = Path(file_path)
+        try:
+            self.filter_list_dir.mkdir(parents=True, exist_ok=True)
+            (self.filter_list_dir / source.name).write_text(
+                source.read_text(encoding="utf-8", errors="replace"), encoding="utf-8"
+            )
+        except OSError as exc:
+            QMessageBox.critical(self, "Filter List", f"Could not import filter list: {exc}")
+            return
+        self.reload_filter_lists()
+        self.set_status(f"Imported filter list {source.name}")
+
+    def update_easylist(self) -> None:
+        self.set_status("Downloading EasyList...")
+        self.start_api_worker("filterlist", EASYLIST_URL, as_json=False)
+
+    def refresh_stale_filter_lists(self) -> None:
+        """Re-download EasyList automatically when the cached copy is over a week old."""
+        cache_path = self.filter_list_dir / "easylist.txt"
+        try:
+            if cache_path.exists() and time.time() - cache_path.stat().st_mtime > 7 * 86400:
+                self.update_easylist()
+        except OSError:
+            pass
+
+    def _wire_browser(self, browser: QWebEngineView) -> None:
+        """Connections and engine settings shared by every tab."""
+        browser.setProperty("last_active", time.time())
+        page = browser.page()
+        settings = browser.settings()
+        for attr_name, value in (
+            ("FullScreenSupportEnabled", True),
+            ("PdfViewerEnabled", True),
+            ("PluginsEnabled", True),
+            ("ScrollAnimatorEnabled", True),
+        ):
+            attr = getattr(QWebEngineSettings.WebAttribute, attr_name, None)
+            if attr is not None:
+                settings.setAttribute(attr, value)
+
+        browser.urlChanged.connect(lambda new_url, browser=browser: self.update_url_bar(new_url, browser))
+        browser.urlChanged.connect(lambda new_url, browser=browser: self.apply_site_content(browser, new_url))
+        browser.loadProgress.connect(lambda progress, browser=browser: self.update_progress_bar(progress, browser))
+        browser.loadFinished.connect(lambda _ok, browser=browser: self.on_load_finished(browser))
+        browser.titleChanged.connect(lambda page_title, browser=browser: self.update_tab_title(browser, page_title))
+        page.fullScreenRequested.connect(self.handle_fullscreen_request)
+        page.renderProcessTerminated.connect(
+            lambda status, _code, browser=browser: self.handle_render_crash(browser, status)
+        )
+        if hasattr(page, "permissionRequested"):  # Qt 6.8+
+            page.permissionRequested.connect(self.handle_permission_request)
+        elif hasattr(page, "featurePermissionRequested"):
+            page.featurePermissionRequested.connect(
+                lambda origin, feature, page=page: self.handle_feature_permission(page, origin, feature)
+            )
 
     def add_tab(self, url: QUrl, title: str, private: bool | None = None) -> QWebEngineView:
         is_private = self.incognito_mode if private is None else private
@@ -1594,10 +2543,7 @@ code, pre {{
         index = self.tabs.addTab(browser, display_title)
         self.tabs.setCurrentIndex(index)
 
-        browser.urlChanged.connect(lambda new_url, browser=browser: self.update_url_bar(new_url, browser))
-        browser.loadProgress.connect(lambda progress, browser=browser: self.update_progress_bar(progress, browser))
-        browser.loadFinished.connect(lambda _ok, browser=browser: self.on_load_finished(browser))
-        browser.titleChanged.connect(lambda page_title, browser=browser: self.update_tab_title(browser, page_title))
+        self._wire_browser(browser)
         self.update_status_badges()
         self.set_status("Opened private tab" if is_private else "Opened tab")
         return browser
@@ -1651,6 +2597,8 @@ code, pre {{
             cleaned = f"{cleaned[:29]}..."
         self.tabs.setTabText(index, cleaned)
         self.tabs.setTabToolTip(index, browser.url().toString())
+        if not browser.property("private"):
+            self.update_history_title(browser.url().toString(), title)
 
     def close_tab(self, index: int) -> None:
         widget = self.tabs.widget(index)
@@ -1684,7 +2632,9 @@ code, pre {{
         browser = self.current_browser()
         if not browser:
             return
+        self.wake_browser(browser)
         self.url_bar.setText(browser.url().toString())
+        self.update_security_badge(browser.url())
         self.progress_bar.hide()
         self.update_status_badges()
         self.set_status("Ready")
@@ -1759,6 +2709,8 @@ code, pre {{
             "todos": lambda: self.toggle_panel(self.todo_sidebar),
             "tasks": lambda: self.toggle_panel(self.todo_sidebar),
             "notes": lambda: self.toggle_panel(self.notes_sidebar),
+            "permissions": self.open_site_permissions,
+            "plugins": self.open_plugin_manager,
             "settings": self.open_settings,
         }
         action = actions.get(target)
@@ -1770,23 +2722,47 @@ code, pre {{
 
     def toggle_find_bar(self) -> None:
         self.find_bar.setVisible(not self.find_bar.isVisible())
+        self.find_count_label.setVisible(self.find_bar.isVisible())
         if self.find_bar.isVisible():
             self.find_bar.setFocus()
             self.find_bar.selectAll()
         else:
+            self.find_count_label.clear()
             browser = self.current_browser()
             if browser:
                 browser.page().findText("")
 
+    def _handle_find_result(self, result: Any) -> None:
+        try:
+            total = result.numberOfMatches()
+            active = result.activeMatch()
+        except Exception:
+            return
+        self.find_count_label.setText(f"{active}/{total}" if total else "0/0")
+
     def find_in_page(self) -> None:
         browser = self.current_browser()
-        if browser:
-            browser.page().findText(self.find_bar.text())
+        if not browser:
+            return
+        query = self.find_bar.text()
+        if not query:
+            self.find_count_label.clear()
+            browser.page().findText("")
+            return
+        try:
+            browser.page().findText(query, QWebEnginePage.FindFlag(0), self._handle_find_result)
+        except TypeError:
+            browser.page().findText(query)
 
     def find_previous(self) -> None:
         browser = self.current_browser()
-        if browser:
-            browser.page().findText(self.find_bar.text(), QWebEnginePage.FindFlag.FindBackward)
+        if not browser:
+            return
+        query = self.find_bar.text()
+        try:
+            browser.page().findText(query, QWebEnginePage.FindFlag.FindBackward, self._handle_find_result)
+        except TypeError:
+            browser.page().findText(query, QWebEnginePage.FindFlag.FindBackward)
 
     def build_url(self, url_text: str) -> QUrl:
         lowered = url_text.lower()
@@ -1799,7 +2775,8 @@ code, pre {{
             candidate = QUrl.fromUserInput(url_text)
             if candidate.isValid():
                 return candidate
-        return QUrl(f"https://www.google.com/search?q={quote_plus(url_text)}")
+        template = SEARCH_ENGINES.get(self.settings.search_engine, SEARCH_ENGINES[DEFAULT_SEARCH_ENGINE])
+        return QUrl(template.format(query=quote_plus(url_text)))
 
     def build_bang_url(self, url_text: str) -> QUrl | None:
         bangs = {
@@ -1825,10 +2802,7 @@ code, pre {{
         browser.setHtml(html_text, QUrl("https://octobrowse.local/"))
         index = self.tabs.addTab(browser, title)
         self.tabs.setCurrentIndex(index)
-        browser.urlChanged.connect(lambda new_url, browser=browser: self.update_url_bar(new_url, browser))
-        browser.loadProgress.connect(lambda progress, browser=browser: self.update_progress_bar(progress, browser))
-        browser.loadFinished.connect(lambda _ok, browser=browser: self.on_load_finished(browser))
-        browser.titleChanged.connect(lambda page_title, browser=browser: self.update_tab_title(browser, page_title))
+        self._wire_browser(browser)
         self.update_status_badges()
 
     def open_dashboard(self) -> None:
@@ -1840,7 +2814,7 @@ code, pre {{
         notes_count = len(self.notes)
         todo_count = len(self.todos)
         reading_count = len(self.reading_list)
-        blocked = self.ad_block_interceptor.total_blocked()
+        blocked = self.request_interceptor.total_blocked()
         downloads_count = len(self.downloads)
         saved_tabs_count = len(self.session_tabs)
         weather = html.escape(self.weather_widget.text() if hasattr(self, "weather_widget") else "Weather unavailable")
@@ -1921,13 +2895,19 @@ li {{ margin: 8px 0; }}
 </body>
 </html>"""
 
-    def _dashboard_links(self, urls: list[str]) -> str:
-        if not urls:
+    def _dashboard_links(self, entries: list[Any]) -> str:
+        if not entries:
             return '<p class="empty">Nothing saved yet.</p>'
         items = []
-        for url in urls:
+        for entry in entries:
+            if isinstance(entry, dict):
+                url = str(entry.get("url") or "")
+                label_text = str(entry.get("title") or "").strip() or url.replace("https://", "").replace("http://", "")
+            else:
+                url = str(entry)
+                label_text = url.replace("https://", "").replace("http://", "")
             safe_url = html.escape(url, quote=True)
-            label = html.escape(url.replace("https://", "").replace("http://", "")[:72])
+            label = html.escape(label_text[:72])
             items.append(f'<li><a href="{safe_url}">{label}</a></li>')
         return f"<ul>{''.join(items)}</ul>"
 
@@ -1998,7 +2978,7 @@ p {{ margin: 0 0 20px; }}
             f"Words: {len(words)}",
             f"Estimated read time: {minutes} min",
             f"Top terms: {keywords}",
-            f"Ad-blocked requests this session: {self.ad_block_interceptor.total_blocked()}",
+            f"Ad-blocked requests this session: {self.request_interceptor.total_blocked()}",
         ]
         QMessageBox.information(self, "Page Insights", "\n".join(lines))
 
@@ -2034,39 +3014,124 @@ p {{ margin: 0 0 20px; }}
     def update_url_bar(self, url: QUrl, browser: QWebEngineView) -> None:
         if browser != self.current_browser():
             return
+        browser.setProperty("last_active", time.time())
         text = url.toString()
         self.url_bar.setText(text)
+        self.update_security_badge(url)
         if not self.incognito_mode and not browser.property("private") and not self.is_internal_url(text):
             self.add_to_history(text)
         self.update_status_badges()
 
-    def add_to_history(self, url: str) -> None:
-        if self.is_internal_url(url) or url in self.history:
+    def update_security_badge(self, url: QUrl) -> None:
+        if not hasattr(self, "security_badge"):
             return
-        self.history.append(url)
-        self.history = self.history[-MAX_HISTORY_ITEMS:]
-        self.history_sidebar.addItem(QListWidgetItem(url))
-        self.save_settings()
+        scheme = url.scheme().lower()
+        if self.is_internal_url(url.toString()):
+            self.security_badge.setText("Octo")
+            self.security_badge.setToolTip("Internal OctoBrowse page")
+        elif scheme == "https":
+            self.security_badge.setText("\U0001F512")
+            self.security_badge.setToolTip("Connection uses HTTPS")
+        elif scheme == "http":
+            self.security_badge.setText("⚠ http")
+            self.security_badge.setToolTip("Connection is not encrypted")
+        else:
+            self.security_badge.setText(scheme or "?")
+            self.security_badge.setToolTip(f"Scheme: {scheme or 'unknown'}")
+
+    def _make_history_item(self, entry: dict[str, Any]) -> QListWidgetItem:
+        title = str(entry.get("title") or "").strip()
+        url = str(entry.get("url") or "")
+        item = QListWidgetItem(f"{title}  -  {url}" if title else url)
+        item.setData(Qt.ItemDataRole.UserRole, url)
+        item.setToolTip(url)
+        return item
+
+    def _history_sidebar_item(self, url: str) -> QListWidgetItem | None:
+        for row in range(self.history_sidebar.count()):
+            item = self.history_sidebar.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == url:
+                return item
+        return None
+
+    @staticmethod
+    def _frecency(entry: dict[str, Any], now: float) -> float:
+        """Mozilla-style frecency: visit count weighted by recency buckets."""
+        age_days = max(0.0, now - float(entry.get("last_visit") or 0)) / 86400
+        if age_days <= 4:
+            weight = 100
+        elif age_days <= 14:
+            weight = 70
+        elif age_days <= 31:
+            weight = 50
+        elif age_days <= 90:
+            weight = 30
+        else:
+            weight = 10
+        return max(1, int(entry.get("visits") or 1)) * weight
+
+    def add_to_history(self, url: str) -> None:
+        if self.is_internal_url(url):
+            return
+        now = time.time()
+        entry = self._history_index.get(url)
+        if entry is not None:
+            entry["visits"] = int(entry.get("visits") or 0) + 1
+            entry["last_visit"] = now
+            item = self._history_sidebar_item(url)
+            if item is not None:
+                title = str(entry.get("title") or "").strip()
+                item.setText(f"{title}  -  {url}" if title else url)
+        else:
+            entry = {"url": url, "title": "", "visits": 1, "last_visit": now}
+            self.history.append(entry)
+            self._history_index[url] = entry
+            if len(self.history) > MAX_HISTORY_ITEMS:
+                for removed in self.history[: len(self.history) - MAX_HISTORY_ITEMS]:
+                    self._history_index.pop(removed["url"], None)
+                    stale_item = self._history_sidebar_item(removed["url"])
+                    if stale_item is not None:
+                        self.history_sidebar.takeItem(self.history_sidebar.row(stale_item))
+                self.history = self.history[-MAX_HISTORY_ITEMS:]
+            self.history_sidebar.addItem(self._make_history_item(entry))
+        self.history_db.record_visit(url, now)
+        self.refresh_address_suggestions()
+
+    def update_history_title(self, url: str, title: str) -> None:
+        entry = self._history_index.get(url)
+        title = title.strip()
+        if entry is None or not title or entry.get("title") == title:
+            return
+        entry["title"] = title
+        self.history_db.set_title(url, title)
+        item = self._history_sidebar_item(url)
+        if item is not None:
+            item.setText(f"{title}  -  {url}")
 
     def load_history_url(self, item: QListWidgetItem) -> None:
-        self.url_bar.setText(item.text())
+        url = item.data(Qt.ItemDataRole.UserRole) or item.text()
+        self.url_bar.setText(str(url))
         self.navigate_to_url()
 
     def clear_history(self) -> None:
         self.history.clear()
+        self._history_index.clear()
         self.history_sidebar.clear()
-        self.save_settings()
+        self.history_db.clear()
+        self.refresh_address_suggestions()
         QMessageBox.information(self, "History Cleared", "Browsing history has been cleared.")
 
     def clear_browser_data(self) -> None:
         self.history.clear()
+        self._history_index.clear()
         self.history_sidebar.clear()
+        self.history_db.clear()
         self.profile.clearHttpCache()
         self.profile.cookieStore().deleteAllCookies()
         if self.private_profile is not None:
             self.private_profile.clearHttpCache()
             self.private_profile.cookieStore().deleteAllCookies()
-        self.ad_block_interceptor.reset_stats()
+        self.request_interceptor.reset_stats()
         self.save_settings()
         QMessageBox.information(self, "Browser Data", "History, cookies, cache, and privacy stats were cleared.")
 
@@ -2082,11 +3147,45 @@ p {{ margin: 0 0 20px; }}
             self.update_status_badges()
         if self.dark_mode:
             self.apply_dark_mode(browser)
+        self.inject_cosmetic_filters(browser)
+
+    def inject_cosmetic_filters(self, browser: QWebEngineView) -> None:
+        """Apply element-hiding rules from loaded filter lists to the page."""
+        if not self.ad_block_enabled:
+            return
+        rules = self.request_interceptor.filter_rules
+        if rules is None or (not rules.generic_selectors and not rules.domain_selectors):
+            return
+        url = browser.url()
+        if self.is_internal_url(url.toString()):
+            return
+        css = rules.cosmetic_css_for(url.host().lower())
+        if not css:
+            return
+        script = f"""
+(() => {{
+  const id = "octo-cosmetic-style";
+  let style = document.getElementById(id);
+  if (!style) {{
+    style = document.createElement("style");
+    style.id = id;
+    (document.head || document.documentElement).appendChild(style);
+  }}
+  style.textContent = {json.dumps(css)};
+}})();
+"""
+        browser.page().runJavaScript(script)
 
     def toggle_dark_mode(self) -> None:
         self.set_theme("default" if self.dark_mode else "dark")
 
     def apply_dark_mode(self, browser: QWebEngineView) -> None:
+        # Prefer Chromium's auto-darkening (Qt 6.7+): it inverts intelligently
+        # and respects pages that already declare a dark color scheme.
+        force_dark = getattr(QWebEngineSettings.WebAttribute, "ForceDarkMode", None)
+        if force_dark is not None:
+            browser.settings().setAttribute(force_dark, self.dark_mode)
+            return
         css = """
             html, body {
                 background-color: #121212 !important;
@@ -2253,18 +3352,30 @@ p {{ margin: 0 0 20px; }}
 
     def toggle_ad_block(self) -> None:
         self.ad_block_enabled = not self.ad_block_enabled
-        self.apply_ad_block_to_profiles()
+        self.apply_privacy_settings()
         status = "enabled" if self.ad_block_enabled else "disabled"
         self.update_status_badges()
         self.save_settings()
         QMessageBox.information(self, "Ad Block", f"Ad block {status}.")
 
     def show_privacy_report(self) -> None:
-        blocked = self.ad_block_interceptor.total_blocked()
-        top_domains = self.ad_block_interceptor.blocked_by_domain.most_common(8)
+        blocked = self.request_interceptor.total_blocked()
+        top_domains = self.request_interceptor.blocked_by_domain.most_common(8)
+        rules = self.request_interceptor.filter_rules
+        filter_summary = (
+            f"{rules.rule_count} rules ({len(rules.blocked_domains)} domains, {rules.skipped_count} skipped)"
+            if rules is not None
+            else "built-in list only"
+        )
         lines = [
             f"Ad block: {'on' if self.ad_block_enabled else 'off'}",
             f"Blocked requests this session: {blocked}",
+            f"Filter lists: {filter_summary}",
+            f"Site content overrides: {len(self.site_content)}",
+            f"HTTPS-only mode: {'on' if self.settings.https_only else 'off'}",
+            f"HTTPS upgrades this session: {self.request_interceptor.https_upgrades}",
+            f"Global Privacy Control: {'on' if self.settings.gpc_enabled else 'off'}",
+            f"Saved site permissions: {sum(len(features) for features in self.site_permissions.values())}",
             f"History entries: {len(self.history)}",
             f"Bookmarks: {len(self.bookmarks)}",
             f"Current tab: {'private' if self.current_browser() and self.current_browser().property('private') else 'standard'}",
@@ -2454,8 +3565,8 @@ p {{ margin: 0 0 20px; }}
         url = f"https://newsapi.org/v2/top-headlines?country=us&apiKey={self.settings.news_api_key}"
         self.start_api_worker("news", url)
 
-    def start_api_worker(self, kind: str, url: str) -> None:
-        worker = ApiFetchWorker(kind, url, self)
+    def start_api_worker(self, kind: str, url: str, as_json: bool = True) -> None:
+        worker = ApiFetchWorker(kind, url, self, as_json=as_json)
         worker.data_ready.connect(self.handle_api_data)
         worker.failed.connect(self.handle_api_error)
         worker.finished.connect(lambda worker=worker: self.cleanup_api_worker(worker))
@@ -2467,6 +3578,15 @@ p {{ margin: 0 0 20px; }}
             self.network_workers.remove(worker)
 
     def handle_api_data(self, kind: str, data: object) -> None:
+        if kind == "filterlist" and isinstance(data, str):
+            try:
+                self.filter_list_dir.mkdir(parents=True, exist_ok=True)
+                (self.filter_list_dir / "easylist.txt").write_text(data, encoding="utf-8")
+            except OSError as exc:
+                QMessageBox.warning(self, "EasyList", f"Could not cache EasyList: {exc}")
+                return
+            self.reload_filter_lists()
+            return
         if kind == "weather" and isinstance(data, dict):
             try:
                 temp = data["main"]["temp"]
@@ -2488,12 +3608,14 @@ p {{ margin: 0 0 20px; }}
                 item.setData(Qt.ItemDataRole.UserRole, article.get("url") or "")
                 self.news_sidebar.addItem(item)
 
-    def handle_api_error(self, kind: str, _error: str) -> None:
+    def handle_api_error(self, kind: str, error: str) -> None:
         if kind == "weather":
             self.weather_widget.setText("Weather: Unavailable")
         elif kind == "news":
             self.news_sidebar.clear()
             self.news_sidebar.addItem(QListWidgetItem("News: Unavailable"))
+        elif kind == "filterlist":
+            self.set_status(f"EasyList download failed: {error}")
 
     def load_news_url(self, item: QListWidgetItem) -> None:
         url = item.data(Qt.ItemDataRole.UserRole)
@@ -2515,6 +3637,8 @@ p {{ margin: 0 0 20px; }}
         download.setDownloadFileName(target.name)
         item = QListWidgetItem(f"Downloading: {target.name}")
         item.setToolTip(str(target))
+        item.setData(DOWNLOAD_PATH_ROLE, str(target))
+        item.setData(DOWNLOAD_REQUEST_ROLE, download)
         self.downloads_sidebar.addItem(item)
         self.open_panel(self.downloads_sidebar, status=f"Downloading {target.name}")
         self.downloads.append({"file": str(target), "status": "downloading"})
@@ -2540,21 +3664,528 @@ p {{ margin: 0 0 20px; }}
     def update_download_state(self, download: Any, item: QListWidgetItem) -> None:
         state_name = getattr(download.state(), "name", str(download.state()))
         filename = download.downloadFileName() or "download"
+        finished_status: str | None = None
         if "Completed" in state_name:
             item.setText(f"Complete: {filename}")
             self.set_status(f"Downloaded {filename}")
+            finished_status = "complete"
         elif "Cancelled" in state_name:
             item.setText(f"Cancelled: {filename}")
             self.set_status("Download cancelled")
+            finished_status = "cancelled"
         elif "Interrupted" in state_name:
             item.setText(f"Failed: {filename}")
             self.set_status("Download failed")
+            finished_status = "failed"
+        if finished_status is not None:
+            item.setData(DOWNLOAD_REQUEST_ROLE, None)
+            try:
+                source_url = download.url().toString()
+            except Exception:
+                source_url = ""
+            self.downloads_history.append(
+                {
+                    "file": str(item.data(DOWNLOAD_PATH_ROLE) or filename),
+                    "url": source_url,
+                    "status": finished_status,
+                    "time": time.time(),
+                }
+            )
+            self.downloads_history = self.downloads_history[-100:]
+            self.save_settings()
+
+    def show_downloads_context_menu(self, position: Any) -> None:
+        item = self.downloads_sidebar.itemAt(position)
+        menu = QMenu(self)
+        if item is not None:
+            download = item.data(DOWNLOAD_REQUEST_ROLE)
+            file_path = str(item.data(DOWNLOAD_PATH_ROLE) or "")
+            if download is not None:
+                try:
+                    is_paused = bool(download.isPaused())
+                except Exception:
+                    is_paused = False
+                if is_paused:
+                    resume_action = QAction("Resume", self)
+                    resume_action.triggered.connect(lambda _checked=False, d=download: d.resume())
+                    menu.addAction(resume_action)
+                else:
+                    pause_action = QAction("Pause", self)
+                    pause_action.triggered.connect(lambda _checked=False, d=download: d.pause())
+                    menu.addAction(pause_action)
+                cancel_action = QAction("Cancel", self)
+                cancel_action.triggered.connect(lambda _checked=False, d=download: d.cancel())
+                menu.addAction(cancel_action)
+                menu.addSeparator()
+            if file_path:
+                open_file_action = QAction("Open File", self)
+                open_file_action.triggered.connect(
+                    lambda _checked=False, p=file_path: QDesktopServices.openUrl(QUrl.fromLocalFile(p))
+                )
+                open_file_action.setEnabled(Path(file_path).exists())
+                menu.addAction(open_file_action)
+                open_folder_action = QAction("Open Containing Folder", self)
+                open_folder_action.triggered.connect(
+                    lambda _checked=False, p=file_path: QDesktopServices.openUrl(
+                        QUrl.fromLocalFile(str(Path(p).parent))
+                    )
+                )
+                menu.addAction(open_folder_action)
+                menu.addSeparator()
+        clear_action = QAction("Clear Download List", self)
+        clear_action.triggered.connect(self.clear_download_list)
+        menu.addAction(clear_action)
+        menu.exec(self.downloads_sidebar.mapToGlobal(position))
+
+    def clear_download_list(self) -> None:
+        self.downloads_sidebar.clear()
+        self.downloads_history.clear()
+        self.save_settings()
+        self.set_status("Download list cleared")
 
     def toggle_fullscreen(self) -> None:
         if self.isFullScreen():
             self.showNormal()
         else:
             self.showFullScreen()
+
+    def handle_fullscreen_request(self, request: Any) -> None:
+        """Let pages (video players) enter real fullscreen by hiding browser chrome."""
+        request.accept()
+        entering = request.toggleOn()
+        for widget in (self.toolbar, self.workspace_rail, self.menuBar(), self.statusBar(), self.tabs.tabBar()):
+            widget.setVisible(not entering)
+        if entering:
+            self._was_window_fullscreen = self.isFullScreen()
+            self.showFullScreen()
+        elif not getattr(self, "_was_window_fullscreen", False):
+            self.showNormal()
+
+    def handle_render_crash(self, browser: QWebEngineView, status: Any) -> None:
+        if status == QWebEnginePage.RenderProcessTerminationStatus.NormalTerminationStatus:
+            return
+        now = time.time()
+        last_crash = float(browser.property("last_crash") or 0)
+        browser.setProperty("last_crash", now)
+        if now - last_crash > 30:
+            QTimer.singleShot(0, browser.reload)
+            self.set_status("Page crashed - reloading")
+        else:
+            self.set_status("Page keeps crashing - reload manually to retry")
+
+    def hibernate_idle_tabs(self, force: bool = False) -> int:
+        """Discard idle background tabs so Chromium frees their memory.
+
+        Mirrors Chrome's tab-discarding lifecycle: the page reloads
+        automatically the next time its tab is selected.
+        """
+        if not force and not self.settings.tab_hibernation_enabled:
+            return 0
+        threshold = 0 if force else max(1, self.settings.hibernation_minutes) * 60
+        now = time.time()
+        current = self.tabs.currentWidget()
+        hibernated = 0
+        for index in range(self.tabs.count()):
+            widget = self.tabs.widget(index)
+            if not isinstance(widget, QWebEngineView) or widget is current:
+                continue
+            if self.is_internal_url(widget.url().toString()):
+                continue
+            last_active = float(widget.property("last_active") or 0)
+            if now - last_active < threshold:
+                continue
+            page = widget.page()
+            try:
+                if page.recentlyAudible():
+                    continue
+                if page.lifecycleState() != QWebEnginePage.LifecycleState.Active:
+                    continue
+                page.setLifecycleState(QWebEnginePage.LifecycleState.Discarded)
+                hibernated += 1
+            except Exception:
+                continue
+        if hibernated:
+            self.set_status(f"Hibernated {hibernated} background tab{'s' if hibernated != 1 else ''}")
+        return hibernated
+
+    def hibernate_background_tabs_now(self) -> None:
+        if not self.hibernate_idle_tabs(force=True):
+            self.set_status("No background tabs to hibernate")
+
+    def wake_browser(self, browser: QWebEngineView) -> None:
+        browser.setProperty("last_active", time.time())
+        try:
+            if browser.page().lifecycleState() != QWebEnginePage.LifecycleState.Active:
+                browser.page().setLifecycleState(QWebEnginePage.LifecycleState.Active)
+        except Exception:
+            pass
+
+    def _permission_key(self, origin: QUrl) -> str:
+        if origin.port() != -1:
+            return f"{origin.scheme()}://{origin.host()}:{origin.port()}"
+        return f"{origin.scheme()}://{origin.host()}"
+
+    def _decide_permission(self, origin: QUrl, feature_name: str) -> bool:
+        key = self._permission_key(origin)
+        stored = self.site_permissions.get(key, {})
+        if feature_name in stored:
+            return stored[feature_name]
+        label = feature_name.replace("MediaAudioVideoCapture", "camera and microphone")
+        label = label.replace("MediaAudioCapture", "microphone").replace("MediaVideoCapture", "camera")
+        label = label.replace("DesktopAudioVideoCapture", "screen and audio capture")
+        label = label.replace("DesktopVideoCapture", "screen capture")
+        answer = QMessageBox.question(
+            self,
+            "Site Permission",
+            f"{key} wants to use: {label}\n\nAllow? Your choice is remembered for this site.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        allowed = answer == QMessageBox.StandardButton.Yes
+        self.site_permissions.setdefault(key, {})[feature_name] = allowed
+        self.save_settings()
+        return allowed
+
+    def handle_permission_request(self, permission: Any) -> None:
+        """Qt 6.8+ unified permission API."""
+        try:
+            feature_name = getattr(permission.permissionType(), "name", str(permission.permissionType()))
+            if self._decide_permission(permission.origin(), feature_name):
+                permission.grant()
+            else:
+                permission.deny()
+        except Exception:
+            pass
+
+    def handle_feature_permission(self, page: QWebEnginePage, origin: QUrl, feature: Any) -> None:
+        """Legacy per-feature permission API (Qt < 6.8)."""
+        feature_name = getattr(feature, "name", str(feature))
+        policy = (
+            QWebEnginePage.PermissionPolicy.PermissionGrantedByUser
+            if self._decide_permission(origin, feature_name)
+            else QWebEnginePage.PermissionPolicy.PermissionDeniedByUser
+        )
+        page.setFeaturePermission(origin, feature, policy)
+
+    def open_site_permissions(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Site Permissions")
+        dialog.resize(560, 400)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Saved per-site permission decisions. Double-click an entry to remove it."))
+        permissions_list = QListWidget()
+
+        def refresh() -> None:
+            permissions_list.clear()
+            for origin, features in sorted(self.site_permissions.items()):
+                for feature_name, allowed in sorted(features.items()):
+                    item = QListWidgetItem(f"{origin} - {feature_name}: {'allowed' if allowed else 'blocked'}")
+                    item.setData(Qt.ItemDataRole.UserRole, (origin, feature_name))
+                    permissions_list.addItem(item)
+            if not permissions_list.count():
+                permissions_list.addItem(QListWidgetItem("No saved site permissions."))
+
+        def remove_item(item: QListWidgetItem) -> None:
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if not data:
+                return
+            origin, feature_name = data
+            self.site_permissions.get(origin, {}).pop(feature_name, None)
+            if not self.site_permissions.get(origin):
+                self.site_permissions.pop(origin, None)
+            self.save_settings()
+            refresh()
+
+        permissions_list.itemDoubleClicked.connect(remove_item)
+        layout.addWidget(permissions_list)
+        clear_btn = QPushButton("Clear All")
+
+        def clear_all() -> None:
+            self.site_permissions.clear()
+            self.save_settings()
+            refresh()
+
+        clear_btn.clicked.connect(clear_all)
+        layout.addWidget(clear_btn)
+        refresh()
+        dialog.exec()
+
+    def apply_site_content(self, browser: QWebEngineView, url: QUrl) -> None:
+        """Apply per-site JavaScript/image preferences before the page renders."""
+        host = url.host().lower()
+        prefs = self.site_content.get(host, {})
+        settings = browser.settings()
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.JavascriptEnabled, bool(prefs.get("javascript", True))
+        )
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.AutoLoadImages, bool(prefs.get("images", True))
+        )
+
+    def open_site_controls(self) -> None:
+        browser = self.current_browser()
+        if not browser:
+            return
+        host = browser.url().host().lower()
+        if not host or self.is_internal_url(browser.url().toString()):
+            QMessageBox.information(self, "Site Controls", "Open a website tab to set per-site controls.")
+            return
+        prefs = self.site_content.get(host, {})
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Site Controls - {host}")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"Content controls for {host} (reload the page to fully apply):"))
+        javascript_check = QCheckBox("Allow JavaScript")
+        javascript_check.setChecked(bool(prefs.get("javascript", True)))
+        images_check = QCheckBox("Load images")
+        images_check.setChecked(bool(prefs.get("images", True)))
+        layout.addWidget(javascript_check)
+        layout.addWidget(images_check)
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(dialog.accept)
+        layout.addWidget(save_btn)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_prefs = {"javascript": javascript_check.isChecked(), "images": images_check.isChecked()}
+        if all(new_prefs.values()):
+            self.site_content.pop(host, None)
+        else:
+            self.site_content[host] = new_prefs
+        for index in range(self.tabs.count()):
+            widget = self.tabs.widget(index)
+            if isinstance(widget, QWebEngineView) and widget.url().host().lower() == host:
+                self.apply_site_content(widget, widget.url())
+        self.save_settings()
+        self.set_status(f"Site controls saved for {host}")
+
+    def _read_plugin_manifest(self, path: Path) -> dict[str, Any] | None:
+        """Extract MANIFEST from a plugin file without executing any of its code."""
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError):
+            return None
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "MANIFEST" for target in node.targets
+            ):
+                try:
+                    manifest = ast.literal_eval(node.value)
+                except (ValueError, SyntaxError):
+                    return None
+                if not isinstance(manifest, dict) or not str(manifest.get("name", "")).strip():
+                    return None
+                permissions = manifest.get("permissions", [])
+                if not isinstance(permissions, list):
+                    return None
+                manifest["permissions"] = [str(p) for p in permissions if str(p) in PLUGIN_PERMISSIONS]
+                return manifest
+        return None
+
+    def discover_plugins(self) -> list[dict[str, Any]]:
+        plugins: list[dict[str, Any]] = []
+        if not self.plugins_dir.is_dir():
+            return plugins
+        for path in sorted(self.plugins_dir.glob("*.py")):
+            manifest = self._read_plugin_manifest(path)
+            if manifest is not None:
+                plugins.append({"path": path, "manifest": manifest})
+        return plugins
+
+    def _ensure_plugin_grants(self, manifest: dict[str, Any]) -> set[str] | None:
+        """Return the granted permission set, prompting the user if needed."""
+        name = str(manifest["name"])
+        requested = list(manifest.get("permissions", []))
+        granted = set(self.plugin_grants.get(name, []))
+        missing = [p for p in requested if p not in granted]
+        if not missing:
+            return granted & set(requested) if requested else set()
+        lines = [f"  - {permission}: {PLUGIN_PERMISSIONS[permission]}" for permission in missing]
+        answer = QMessageBox.question(
+            self,
+            "Plugin Permissions",
+            f"Plugin '{name}' requests these permissions:\n\n"
+            + "\n".join(lines)
+            + "\n\nGrant them and run the plugin?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return None
+        granted.update(missing)
+        self.plugin_grants[name] = sorted(granted)
+        self.save_settings()
+        return granted & set(requested)
+
+    def run_plugin_file(self, path: Path) -> None:
+        manifest = self._read_plugin_manifest(path)
+        if manifest is None:
+            QMessageBox.critical(self, "Plugins", f"{path.name} has no valid MANIFEST.")
+            return
+        granted = self._ensure_plugin_grants(manifest)
+        if granted is None:
+            self.set_status("Plugin run cancelled")
+            return
+        api = OctoPluginAPI(self, str(manifest["name"]), granted)
+        output: list[str] = []
+
+        def plugin_print(*args: object, sep: str = " ", end: str = "\n") -> None:
+            output.append(sep.join(str(arg) for arg in args) + end.rstrip("\n"))
+
+        env: dict[str, Any] = {
+            "__builtins__": make_safe_builtins(plugin_print),
+            "api": api,
+            "MANIFEST": manifest,
+        }
+        try:
+            code = path.read_text(encoding="utf-8", errors="replace")
+            exec(compile(code, f"<plugin:{path.name}>", "exec"), env, env)
+            activate = env.get("activate")
+            if callable(activate):
+                activate(api)
+            self.set_status(f"Plugin '{manifest['name']}' ran")
+            if output:
+                QMessageBox.information(
+                    self, f"Plugin: {manifest['name']}", "\n".join(output)[:4000]
+                )
+        except Exception as exc:
+            QMessageBox.critical(self, "Plugins", f"Plugin '{manifest['name']}' failed: {exc}")
+
+    def install_plugin_file(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Install Plugin", "", "Python Plugins (*.py)"
+        )
+        if not file_path:
+            return
+        source = Path(file_path)
+        if self._read_plugin_manifest(source) is None:
+            QMessageBox.critical(
+                self,
+                "Plugins",
+                "That file has no valid MANIFEST dict (needs at least a 'name' and a "
+                "'permissions' list), so it cannot be installed.",
+            )
+            return
+        try:
+            self.plugins_dir.mkdir(parents=True, exist_ok=True)
+            (self.plugins_dir / source.name).write_text(
+                source.read_text(encoding="utf-8", errors="replace"), encoding="utf-8"
+            )
+        except OSError as exc:
+            QMessageBox.critical(self, "Plugins", f"Could not install plugin: {exc}")
+            return
+        self.set_status(f"Installed plugin {source.name}")
+
+    def open_plugin_manager(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Plugin Manager")
+        dialog.resize(640, 440)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(
+            QLabel(
+                "Plugins are Python files with a MANIFEST and an activate(api) entry point.\n"
+                "They run with restricted builtins and only the permissions you grant."
+            )
+        )
+        plugin_list = QListWidget()
+        layout.addWidget(plugin_list)
+
+        def refresh() -> None:
+            plugin_list.clear()
+            for plugin in self.discover_plugins():
+                manifest = plugin["manifest"]
+                name = manifest["name"]
+                permissions = ", ".join(manifest.get("permissions", [])) or "none"
+                granted = ", ".join(self.plugin_grants.get(name, [])) or "none yet"
+                item = QListWidgetItem(
+                    f"{name} {manifest.get('version', '')}\n"
+                    f"    {manifest.get('description', 'No description.')}\n"
+                    f"    Requests: {permissions} | Granted: {granted}"
+                )
+                item.setData(Qt.ItemDataRole.UserRole, str(plugin["path"]))
+                plugin_list.addItem(item)
+            if not plugin_list.count():
+                placeholder = QListWidgetItem("No plugins installed. Use Install Plugin... to add one.")
+                placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+                plugin_list.addItem(placeholder)
+
+        def selected_path() -> Path | None:
+            item = plugin_list.currentItem()
+            data = item.data(Qt.ItemDataRole.UserRole) if item else None
+            return Path(str(data)) if data else None
+
+        def run_selected() -> None:
+            path = selected_path()
+            if path:
+                self.run_plugin_file(path)
+                refresh()
+
+        def remove_selected() -> None:
+            path = selected_path()
+            if not path:
+                return
+            manifest = self._read_plugin_manifest(path)
+            try:
+                path.unlink()
+            except OSError as exc:
+                QMessageBox.critical(dialog, "Plugins", f"Could not remove plugin: {exc}")
+                return
+            if manifest is not None:
+                self.plugin_grants.pop(str(manifest["name"]), None)
+                self.save_settings()
+            refresh()
+
+        def revoke_selected() -> None:
+            path = selected_path()
+            if not path:
+                return
+            manifest = self._read_plugin_manifest(path)
+            if manifest is not None:
+                self.plugin_grants.pop(str(manifest["name"]), None)
+                self.save_settings()
+            refresh()
+
+        plugin_list.itemDoubleClicked.connect(lambda _item: run_selected())
+
+        buttons = QVBoxLayout()
+        for label, handler in (
+            ("Run Plugin", run_selected),
+            ("Install Plugin...", lambda: (self.install_plugin_file(), refresh())),
+            ("Revoke Permissions", revoke_selected),
+            ("Remove Plugin", remove_selected),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(lambda _checked=False, h=handler: h())
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        refresh()
+        dialog.exec()
+
+    def next_tab(self) -> None:
+        count = self.tabs.count()
+        if count > 1:
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() + 1) % count)
+
+    def previous_tab(self) -> None:
+        count = self.tabs.count()
+        if count > 1:
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() - 1) % count)
+
+    def jump_to_tab(self, number: int) -> None:
+        if number == 9:
+            self.tabs.setCurrentIndex(self.tabs.count() - 1)
+        elif 1 <= number <= self.tabs.count():
+            self.tabs.setCurrentIndex(number - 1)
+
+    def toggle_mute_current_tab(self) -> None:
+        browser = self.current_browser()
+        if not browser:
+            return
+        page = browser.page()
+        muted = not page.isAudioMuted()
+        page.setAudioMuted(muted)
+        self.set_status("Tab muted" if muted else "Tab unmuted")
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.settings, self)
@@ -2564,6 +4195,7 @@ p {{ margin: 0 0 20px; }}
         old_news_key = self.settings.news_api_key
         self.settings = dialog.to_settings(self.settings)
         self.openai_api_key = self.settings.openai_api_key
+        self.apply_privacy_settings()
         self.save_settings()
         if (self.settings.weather_api_key, self.settings.weather_location) != old_weather:
             self.update_weather()
@@ -2582,6 +4214,13 @@ p {{ margin: 0 0 20px; }}
         duplicate_action = QAction("Duplicate Tab", self)
         duplicate_action.triggered.connect(self.duplicate_current_tab)
         menu.addAction(duplicate_action)
+
+        browser = self.current_browser()
+        if browser is not None:
+            muted = browser.page().isAudioMuted()
+            mute_action = QAction("Unmute Tab" if muted else "Mute Tab", self)
+            mute_action.triggered.connect(self.toggle_mute_current_tab)
+            menu.addAction(mute_action)
 
         close_action = QAction("Close Tab", self)
         close_action.triggered.connect(lambda: self.close_tab(self.tabs.currentIndex()))
@@ -2716,32 +4355,8 @@ p {{ margin: 0 0 20px; }}
         def safe_print(*args: object, sep: str = " ", end: str = "\n") -> None:
             output.append(sep.join(str(arg) for arg in args) + end.rstrip("\n"))
 
-        safe_builtins = {
-            "Exception": Exception,
-            "False": False,
-            "True": True,
-            "None": None,
-            "abs": abs,
-            "all": all,
-            "any": any,
-            "bool": bool,
-            "dict": dict,
-            "enumerate": enumerate,
-            "float": float,
-            "int": int,
-            "len": len,
-            "list": list,
-            "max": max,
-            "min": min,
-            "print": safe_print,
-            "range": range,
-            "round": round,
-            "str": str,
-            "sum": sum,
-            "tuple": tuple,
-        }
         env = {
-            "__builtins__": safe_builtins,
+            "__builtins__": make_safe_builtins(safe_print),
             "browser": self,
             "current_tab": self.current_browser(),
             "QUrl": QUrl,
@@ -2905,7 +4520,9 @@ p {{ margin: 0 0 20px; }}
         open_action.triggered.connect(lambda: self.load_history_url(item))
         menu.addAction(open_action)
         new_tab_action = QAction("Open in New Tab", self)
-        new_tab_action.triggered.connect(lambda: self.add_tab(QUrl(item.text()), "History"))
+        new_tab_action.triggered.connect(
+            lambda: self.add_tab(QUrl(str(item.data(Qt.ItemDataRole.UserRole) or item.text())), "History")
+        )
         menu.addAction(new_tab_action)
         remove_action = QAction("Remove History Entry", self)
         remove_action.triggered.connect(lambda: self.remove_history_entry(item))
@@ -2913,13 +4530,15 @@ p {{ margin: 0 0 20px; }}
         menu.exec(self.history_sidebar.mapToGlobal(position))
 
     def remove_history_entry(self, item: QListWidgetItem) -> None:
-        url = item.text()
+        url = str(item.data(Qt.ItemDataRole.UserRole) or item.text())
         row = self.history_sidebar.row(item)
         if row >= 0:
             self.history_sidebar.takeItem(row)
-        if url in self.history:
-            self.history.remove(url)
-        self.save_settings()
+        entry = self._history_index.pop(url, None)
+        if entry is not None and entry in self.history:
+            self.history.remove(entry)
+        self.history_db.remove(url)
+        self.refresh_address_suggestions()
         self.set_status("History entry removed")
 
     def manage_passwords(self) -> None:
@@ -2959,12 +4578,15 @@ p {{ margin: 0 0 20px; }}
         try:
             self.store.save(
                 self.settings,
-                self.history,
                 self.bookmarks,
                 self.notes,
                 self.todos,
                 self.session_tabs,
                 self.reading_list,
+                self.site_permissions,
+                self.site_content,
+                self.downloads_history,
+                self.plugin_grants,
             )
         except OSError as exc:
             QMessageBox.warning(self, "Settings", f"Could not save settings: {exc}")
@@ -3015,7 +4637,11 @@ p {{ margin: 0 0 20px; }}
             super().keyPressEvent(event)
 
     def closeEvent(self, event: Any) -> None:
+        self.hibernation_timer.stop()
         self.save_settings()
+        self.history_db.close()
+        for worker in list(self.network_workers) + list(self.ai_workers) + list(self.filter_workers):
+            worker.wait(300)
         super().closeEvent(event)
 
 
