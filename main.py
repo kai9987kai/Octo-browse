@@ -178,7 +178,7 @@ EASYLIST_URL = "https://easylist.to/easylist/easylist.txt"
 DEFAULT_HOMEPAGE = "https://www.google.com"
 DEFAULT_OPENAI_MODEL = os.environ.get("OCTOBROWSE_OPENAI_MODEL", "gpt-5-mini")
 OCTO_BROWSER_NAME = "Octo Browser"
-OCTO_BROWSER_VERSION = "3.0"
+OCTO_BROWSER_VERSION = "3.1"
 OCTO_BROWSER_USER_AGENT = (
     f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     f"(KHTML, like Gecko) OctoBrowser/{OCTO_BROWSER_VERSION} "
@@ -241,7 +241,7 @@ class SettingsStore:
         dict[str, dict[str, bool]],
         dict[str, dict[str, bool]],
         list[dict[str, Any]],
-        dict[str, list[str]],
+        dict[str, dict[str, Any]],
     ]:
         data: dict[str, Any] = {}
         source = self.path if self.path.exists() else self.legacy_path
@@ -309,7 +309,7 @@ class SettingsStore:
         site_permissions: dict[str, dict[str, bool]],
         site_content: dict[str, dict[str, bool]],
         downloads_history: list[dict[str, Any]],
-        plugin_grants: dict[str, list[str]],
+        plugin_grants: dict[str, dict[str, Any]],
     ) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -383,15 +383,28 @@ class SettingsStore:
         return result
 
     @staticmethod
-    def _coerce_plugin_grants(values: Any) -> dict[str, list[str]]:
-        result: dict[str, list[str]] = {}
+    def _coerce_plugin_grants(values: Any) -> dict[str, dict[str, Any]]:
+        """Normalize plugin grants to {name: {permissions: [...], sha256: ...}}.
+
+        Accepts the legacy {name: [permissions]} form; legacy entries get an
+        empty sha256 so they are re-confirmed on next run (they predate
+        file-identity binding).
+        """
+        result: dict[str, dict[str, Any]] = {}
         if not isinstance(values, dict):
             return result
-        for name, permissions in values.items():
-            if not isinstance(permissions, list):
+        for name, record in values.items():
+            if isinstance(record, list):
+                permissions, sha256 = record, ""
+            elif isinstance(record, dict):
+                permissions = record.get("permissions", [])
+                sha256 = str(record.get("sha256", ""))
+                if not isinstance(permissions, list):
+                    permissions = []
+            else:
                 continue
             cleaned = [str(p) for p in permissions if str(p) in PLUGIN_PERMISSIONS]
-            result[str(name)] = cleaned
+            result[str(name)] = {"permissions": cleaned, "sha256": sha256}
         return result
 
     @staticmethod
@@ -4049,37 +4062,60 @@ p {{ margin: 0 0 20px; }}
                 plugins.append({"path": path, "manifest": manifest})
         return plugins
 
-    def _ensure_plugin_grants(self, manifest: dict[str, Any]) -> set[str] | None:
-        """Return the granted permission set, prompting the user if needed."""
+    @staticmethod
+    def _plugin_file_hash(path: Path) -> str:
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return ""
+
+    def _ensure_plugin_grants(self, manifest: dict[str, Any], path: Path) -> set[str] | None:
+        """Return the granted permission set, prompting the user if needed.
+
+        Grants are bound to the plugin file's content hash, so a different file
+        reusing an approved plugin's name (or an edited version of an approved
+        plugin) does not silently inherit the old permissions.
+        """
         name = str(manifest["name"])
-        requested = list(manifest.get("permissions", []))
-        granted = set(self.plugin_grants.get(name, []))
+        requested = [p for p in manifest.get("permissions", []) if p in PLUGIN_PERMISSIONS]
+        current_hash = self._plugin_file_hash(path)
+        record = self.plugin_grants.get(name)
+        same_file = bool(record) and record.get("sha256") and record.get("sha256") == current_hash
+        granted = set(record.get("permissions", [])) if same_file else set()
         missing = [p for p in requested if p not in granted]
-        if not missing:
+        if not missing and same_file:
             return granted & set(requested) if requested else set()
-        lines = [f"  - {permission}: {PLUGIN_PERMISSIONS[permission]}" for permission in missing]
+
+        prompt_lines = [f"  - {permission}: {PLUGIN_PERMISSIONS[permission]}" for permission in requested]
+        changed_note = ""
+        if record and not same_file:
+            changed_note = (
+                "\n\nNote: this file's contents differ from the version you previously "
+                "approved under this name, so its permissions must be re-confirmed."
+            )
         answer = QMessageBox.question(
             self,
             "Plugin Permissions",
             f"Plugin '{name}' requests these permissions:\n\n"
-            + "\n".join(lines)
+            + "\n".join(prompt_lines or ["  - (none)"])
+            + changed_note
             + "\n\nGrant them and run the plugin?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return None
-        granted.update(missing)
-        self.plugin_grants[name] = sorted(granted)
+        approved = set(requested)
+        self.plugin_grants[name] = {"permissions": sorted(approved), "sha256": current_hash}
         self.save_settings()
-        return granted & set(requested)
+        return approved
 
     def run_plugin_file(self, path: Path) -> None:
         manifest = self._read_plugin_manifest(path)
         if manifest is None:
             QMessageBox.critical(self, "Plugins", f"{path.name} has no valid MANIFEST.")
             return
-        granted = self._ensure_plugin_grants(manifest)
+        granted = self._ensure_plugin_grants(manifest, path)
         if granted is None:
             self.set_status("Plugin run cancelled")
             return
@@ -4153,7 +4189,7 @@ p {{ margin: 0 0 20px; }}
                 manifest = plugin["manifest"]
                 name = manifest["name"]
                 permissions = ", ".join(manifest.get("permissions", [])) or "none"
-                granted = ", ".join(self.plugin_grants.get(name, [])) or "none yet"
+                granted = ", ".join(self.plugin_grants.get(name, {}).get("permissions", [])) or "none yet"
                 item = QListWidgetItem(
                     f"{name} {manifest.get('version', '')}\n"
                     f"    {manifest.get('description', 'No description.')}\n"

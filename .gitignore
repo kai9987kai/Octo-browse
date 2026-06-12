@@ -8,4 +8,5 @@ octobrowse.*.log
 build/
 dist/
 release/
+release_build.log
 *.spec
