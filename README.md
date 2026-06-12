@@ -53,7 +53,16 @@ a session password scratchpad, and a constrained extension lab.
 - EasyList-compatible filter list support: `||domain^` rules, `@@` exceptions,
   hosts-file lines, and wildcard/separator path patterns indexed by literal
   token (uBlock Origin-style) so per-request matching stays fast. Lists load
-  from Tools > Update EasyList or any imported Adblock-format file.
+  from Tools > Update EasyList or any imported Adblock-format file, and the
+  cached EasyList refreshes itself weekly.
+- Cosmetic element-hiding rules (`##selector`, generic and per-domain) are
+  injected into pages as chunked CSS when ad blocking is on.
+- Permissioned plugin API: plugins are Python files with a `MANIFEST` dict and
+  an `activate(api)` entry point, installed through Tools > Plugin Manager
+  (`octo:plugins`). Each plugin declares permissions (tabs, navigation, page,
+  history, bookmarks, notes, ui, clipboard, network); you approve them on
+  first run, grants persist, and every API call is permission-checked. See
+  `examples/page_word_count.py`.
 - SQLite-backed browsing history (one upsert per visit instead of rewriting a
   JSON blob), with automatic migration from the old format.
 - Download manager with pause/resume/cancel, open file/folder actions, and a
@@ -150,6 +159,10 @@ secure vault for long-lived secrets.
 
 ## Security notes
 
+- Plugins run in-process with restricted builtins and a permission-gated API
+  object instead of the raw browser. This is a strong guardrail against
+  accidents, not a hard security boundary - Python cannot be fully sandboxed
+  in-process, so only install plugins you trust.
 - The extension lab is intentionally constrained, but it still exposes the
   running browser object. Run only code you understand.
 - The trusted extension action runs code with full Python access and should be
@@ -167,8 +180,9 @@ secure vault for long-lived secrets.
 - `OctoBrowse(QMainWindow)`: main window, toolbars, tabs, sidebars, actions.
 - `OctoRequestInterceptor`: ad/tracker blocking, HTTPS-only upgrades, and
   Global Privacy Control headers with per-session stats.
-- `FilterRuleSet` / `FilterParseWorker`: EasyList-subset parsing with
-  token-bucket indexing, run off the UI thread.
+- `FilterRuleSet` / `FilterParseWorker`: EasyList-subset parsing (network and
+  cosmetic rules) with token-bucket indexing, run off the UI thread.
+- `OctoPluginAPI`: permission-checked capability object passed to plugins.
 - `HistoryDatabase`: SQLite visit store (url, title, visit count, last visit)
   with legacy JSON import.
 - `SettingsStore`: JSON load/save, legacy settings migration, and
@@ -182,8 +196,8 @@ secure vault for long-lived secrets.
 
 ## Roadmap
 
-- Cosmetic (element-hiding) filter support on top of the network filter
-  engine.
 - Move bookmarks/notes/todos to SQLite alongside history.
-- Replace the extension lab with a real permissioned plugin API.
-- Scheduled automatic filter-list refresh.
+- Procedural cosmetic filters (`#?#`) and cosmetic exceptions (`#@#`).
+- Plugin lifecycle hooks (run on startup / on page load) and a curated
+  plugin gallery.
+- Granular per-permission approval in the plugin consent dialog.
