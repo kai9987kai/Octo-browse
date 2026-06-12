@@ -57,3 +57,10 @@ py -m venv .venv; .\.venv\Scripts\activate
 pip install -r requirements.txt
 python main.py
 ```
+
+## Asset integrity
+`OctoBrowse-3.1-Setup.exe` SHA-256:
+
+```
+5019B5554D534434CCE63E21CD0EFD3C4B9ABB3542F9B28B6C459814509724BB
+```
