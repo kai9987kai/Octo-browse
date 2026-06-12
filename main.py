@@ -10,9 +10,12 @@ experimental alpha improvements into one maintained entry point.
 from __future__ import annotations
 
 import ast
+import hashlib
+import ipaddress
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -753,6 +756,52 @@ def _domain_suffix_match(host: str, domains: set[str]) -> str | None:
     return None
 
 
+# Schemes allowed in hrefs on generated internal (octobrowse.local) pages.
+# Everything else - javascript:, data:, vbscript:, blob: - is neutralized so a
+# crafted bookmark/history/title cannot run script in the internal origin.
+SAFE_LINK_SCHEMES = {"http", "https", "file", "ftp", "mailto", "octo"}
+
+
+def safe_link_href(url: str) -> str:
+    """Return an attribute-safe href, blanking out dangerous URL schemes."""
+    text = str(url).strip()
+    scheme, sep, _ = text.partition(":")
+    if sep and scheme.lower() not in SAFE_LINK_SCHEMES:
+        return "#"
+    return html.escape(text, quote=True)
+
+
+def is_blocked_fetch_host(host: str) -> bool:
+    """True when a host resolves to a private/loopback/link-local/reserved address.
+
+    Used to keep plugin fetch() from reaching internal services or cloud
+    metadata endpoints (basic SSRF guardrail; redirects are also disabled).
+    """
+    host = host.strip().strip("[]").lower()
+    if not host or host == "localhost" or host.endswith((".local", ".internal", ".localhost")):
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, OSError):
+        return True  # Unresolvable -> fail closed.
+    for info in infos:
+        raw_ip = info[4][0].split("%", 1)[0]
+        try:
+            addr = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            return True
+        if (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_reserved
+            or addr.is_multicast
+            or addr.is_unspecified
+        ):
+            return True
+    return False
+
+
 class FilterParseWorker(QThread):
     parsed = pyqtSignal(object)
 
@@ -944,7 +993,7 @@ PLUGIN_PERMISSIONS = {
     "notes": "Add notes and todo items",
     "ui": "Show status messages and dialogs",
     "clipboard": "Read and write the clipboard",
-    "network": "Fetch web resources over HTTP(S)",
+    "network": "Fetch public web resources over HTTP(S) (private/loopback hosts blocked)",
 }
 
 PLUGIN_FETCH_LIMIT = 2_000_000  # bytes of response text a plugin may receive
@@ -1123,7 +1172,13 @@ class OctoPluginAPI:
         url = str(url)
         if not url.lower().startswith(("http://", "https://")):
             raise ValueError("Plugins may only fetch http(s) URLs.")
-        response = requests.get(url, timeout=min(float(timeout), 15.0))
+        host = QUrl(url).host()
+        if is_blocked_fetch_host(host):
+            raise ValueError(
+                "Plugins cannot fetch private, loopback, or link-local addresses."
+            )
+        # Redirects are disabled so a public URL cannot bounce to an internal one.
+        response = requests.get(url, timeout=min(float(timeout), 15.0), allow_redirects=False)
         response.raise_for_status()
         return response.text[:PLUGIN_FETCH_LIMIT]
 
@@ -2079,9 +2134,10 @@ class OctoBrowse(QMainWindow):
                 continue
             title = html.escape(self.tabs.tabText(index))
             url = widget.url().toString()
-            safe_url = html.escape(url, quote=True)
+            safe_href = safe_link_href(url)
+            safe_text = html.escape(url, quote=True)
             mode = "Private" if widget.property("private") else "Standard"
-            rows.append(f"<tr><td>{index + 1}</td><td>{title}</td><td>{mode}</td><td><a href=\"{safe_url}\">{safe_url}</a></td></tr>")
+            rows.append(f"<tr><td>{index + 1}</td><td>{title}</td><td>{mode}</td><td><a href=\"{safe_href}\">{safe_text}</a></td></tr>")
         table = "\n".join(rows) or "<tr><td colspan='4'>No open tabs.</td></tr>"
         overview_html = f"""<!doctype html>
 <html>
@@ -2906,7 +2962,7 @@ li {{ margin: 8px 0; }}
             else:
                 url = str(entry)
                 label_text = url.replace("https://", "").replace("http://", "")
-            safe_url = html.escape(url, quote=True)
+            safe_url = safe_link_href(url)
             label = html.escape(label_text[:72])
             items.append(f'<li><a href="{safe_url}">{label}</a></li>')
         return f"<ul>{''.join(items)}</ul>"
@@ -2926,7 +2982,7 @@ li {{ margin: 8px 0; }}
         minutes = max(1, round(len(words) / 220))
         paragraphs = [paragraph for paragraph in cleaned.split("\n\n") if paragraph.strip()][:80]
         body = "\n".join(f"<p>{html.escape(paragraph)}</p>" for paragraph in paragraphs)
-        keywords = ", ".join(self.extract_keywords(cleaned, limit=8))
+        keywords = html.escape(", ".join(self.extract_keywords(cleaned, limit=8)))
         safe_url = html.escape(url)
         reader_html = f"""<!doctype html>
 <html>
