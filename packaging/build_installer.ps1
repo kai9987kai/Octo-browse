@@ -2,6 +2,10 @@ param(
     [string]$Version = "3.1"
 )
 
+# FALLBACK installer builder (IExpress). The preferred installer is built by
+# build_inno.ps1, which produces a smaller package with a real uninstaller and
+# shortcuts. Use this only when Inno Setup is unavailable.
+
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot

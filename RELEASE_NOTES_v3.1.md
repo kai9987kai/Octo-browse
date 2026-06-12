@@ -49,8 +49,11 @@ Adversarial review of the new subsystems surfaced and fixed:
 > against accidents, not a hard sandbox — only install plugins you trust.
 
 ## Install (Windows)
-Download `OctoBrowse-3.1-Setup.exe` from the assets below and run it, or run from
-source:
+Download `OctoBrowse-3.1-Setup.exe` from the assets below and run it. It's a
+standard per-user installer (no admin prompt) with Start Menu and optional
+desktop shortcuts, and a proper uninstaller / Add-or-Remove-Programs entry.
+The binary is unsigned, so Windows SmartScreen will show a "More info → Run
+anyway" prompt on first launch. Or run from source:
 
 ```powershell
 py -m venv .venv; .\.venv\Scripts\activate
@@ -62,5 +65,5 @@ python main.py
 `OctoBrowse-3.1-Setup.exe` SHA-256:
 
 ```
-5019B5554D534434CCE63E21CD0EFD3C4B9ABB3542F9B28B6C459814509724BB
+CC9C48C2E87FF15122A682F1F31EAA898250FAE973B918EAD1E667B64854EBA9
 ```

@@ -142,6 +142,31 @@ The compatibility launcher still works:
 python alpha.py
 ```
 
+## Building a Windows installer
+
+The packaging scripts freeze the app and produce an installer
+(`release\OctoBrowse-<version>-Setup.exe`):
+
+```powershell
+# 1. Freeze main.py with PyInstaller -> dist\OctoBrowse\OctoBrowse.exe
+powershell -ExecutionPolicy Bypass -File packaging\build_app.ps1
+
+# 2a. Preferred: Inno Setup installer (uninstaller, shortcuts, ARP entry).
+#     Needs Inno Setup:  winget install --id JRSoftware.InnoSetup
+powershell -ExecutionPolicy Bypass -File packaging\build_inno.ps1
+
+# 2b. Fallback: IExpress self-extractor (no Inno Setup required)
+powershell -ExecutionPolicy Bypass -File packaging\build_installer.ps1
+```
+
+To publish a GitHub release (requires an authenticated `gh auth login`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\publish_release.ps1
+```
+
+The frozen binary is unsigned, so SmartScreen warns on first run.
+
 ## Configuration
 
 You can configure keys in the Settings dialog, or set environment variables
