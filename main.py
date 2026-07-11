@@ -28,6 +28,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
 
+from octobrowse.filtering import (
+    FilterRuleSet,
+    domain_suffix_match as _domain_suffix_match,
+    resource_type_name,
+)
+
 try:
     import cv2
 except ImportError:  # pragma: no cover - optional runtime feature
@@ -67,6 +73,8 @@ from PyQt6.QtWebEngineCore import (
     QWebEngineSettings,
     QWebEngineUrlRequestInfo,
     QWebEngineUrlRequestInterceptor,
+    qWebEngineChromiumSecurityPatchVersion,
+    qWebEngineChromiumVersion,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
@@ -176,13 +184,12 @@ DEFAULT_SEARCH_ENGINE = "google"
 EASYLIST_URL = "https://easylist.to/easylist/easylist.txt"
 
 DEFAULT_HOMEPAGE = "https://www.google.com"
-DEFAULT_OPENAI_MODEL = os.environ.get("OCTOBROWSE_OPENAI_MODEL", "gpt-5-mini")
+DEFAULT_OPENAI_MODEL = os.environ.get("OCTOBROWSE_OPENAI_MODEL", "gpt-5.6-luna")
 OCTO_BROWSER_NAME = "Octo Browser"
-OCTO_BROWSER_VERSION = "3.1"
-OCTO_BROWSER_USER_AGENT = (
-    f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    f"(KHTML, like Gecko) OctoBrowser/{OCTO_BROWSER_VERSION} "
-    f"Chrome/126.0.0.0 Safari/537.36"
+OCTO_BROWSER_VERSION = "3.2"
+LEGACY_OCTO_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) OctoBrowser/3.1 Chrome/126.0.0.0 Safari/537.36"
 )
 MAX_HISTORY_ITEMS = 500
 
@@ -201,7 +208,8 @@ class BrowserSettings:
     theme: str = "default"
     custom_theme: str | None = None
     ad_block_enabled: bool = False
-    user_agent: str = OCTO_BROWSER_USER_AGENT
+    # Empty means use Qt WebEngine's real, internally consistent Chromium UA.
+    user_agent: str = ""
     search_engine: str = DEFAULT_SEARCH_ENGINE
     https_only: bool = False
     gpc_enabled: bool = True
@@ -250,6 +258,18 @@ class SettingsStore:
                 data = json.loads(source.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 data = {}
+        if not isinstance(data, dict):
+            data = {}
+
+        try:
+            hibernation_minutes = max(1, int(data.get("hibernation_minutes") or 15))
+        except (TypeError, ValueError):
+            hibernation_minutes = 15
+        user_agent = str(data.get("user_agent") or "").strip()
+        if user_agent == LEGACY_OCTO_BROWSER_USER_AGENT:
+            # v3.1 advertised Chrome 126 even when Qt shipped a newer engine.
+            # Migrate that generated value back to the compatible native UA.
+            user_agent = ""
 
         settings = BrowserSettings(
             homepage=str(data.get("homepage") or DEFAULT_HOMEPAGE),
@@ -265,12 +285,12 @@ class SettingsStore:
             theme=str(data.get("theme") or "default"),
             custom_theme=data.get("custom_theme") or None,
             ad_block_enabled=bool(data.get("ad_block_enabled", False)),
-            user_agent=str(data.get("user_agent") or OCTO_BROWSER_USER_AGENT),
+            user_agent=user_agent,
             search_engine=str(data.get("search_engine") or DEFAULT_SEARCH_ENGINE).lower(),
             https_only=bool(data.get("https_only", False)),
             gpc_enabled=bool(data.get("gpc_enabled", True)),
             tab_hibernation_enabled=bool(data.get("tab_hibernation_enabled", True)),
-            hibernation_minutes=max(1, int(data.get("hibernation_minutes") or 15)),
+            hibernation_minutes=hibernation_minutes,
         )
         if settings.search_engine not in SEARCH_ENGINES:
             settings.search_engine = DEFAULT_SEARCH_ENGINE
@@ -554,221 +574,6 @@ class HistoryDatabase:
             pass
 
 
-class FilterRuleSet:
-    """Subset of the Adblock Plus filter syntax used by EasyList.
-
-    Supports: `||domain^` network rules, `@@||domain^` exceptions,
-    hosts-file lines, path/substring patterns with `*`, `^`, and `|`, and
-    `##` cosmetic element-hiding rules (generic and per-domain).
-    Pattern rules are indexed by their longest literal token (the same idea
-    uBlock Origin uses) so each request only tests a handful of candidates.
-    Procedural cosmetic rules and rules with unsupported options are skipped.
-    """
-
-    GENERIC_CAP = 100
-    GENERIC_SELECTOR_CAP = 5000
-    _CSS_CHUNK = 100  # selectors per CSS rule, so one bad selector only voids its chunk
-    _TOKEN_RE = re.compile(r"[a-z0-9]{4,}")
-    _HOSTS_RE = re.compile(r"^(?:0\.0\.0\.0|127\.0\.0\.1)\s+([a-z0-9.-]+)$", re.IGNORECASE)
-    _DOMAIN_RULE_RE = re.compile(r"^[a-z0-9.-]+\^?$", re.IGNORECASE)
-    SUPPORTED_OPTIONS = {
-        "third-party", "3p", "script", "image", "stylesheet", "xmlhttprequest",
-        "subdocument", "object", "media", "font", "websocket", "other", "ping", "document",
-    }
-
-    def __init__(self) -> None:
-        self.blocked_domains: set[str] = set()
-        self.exception_domains: set[str] = set()
-        self.token_buckets: dict[str, list[re.Pattern[str]]] = {}
-        self.generic_patterns: list[re.Pattern[str]] = []
-        self.generic_selectors: list[str] = []
-        self.domain_selectors: dict[str, list[str]] = {}
-        self.rule_count = 0
-        self.cosmetic_count = 0
-        self.skipped_count = 0
-        self._generic_css: str | None = None
-
-    def parse_text(self, text: str) -> None:
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith(("!", "[")):
-                continue
-            if "#@#" in line or "#?#" in line or "#$#" in line:
-                # Cosmetic exceptions and procedural/style rules are unsupported.
-                self.skipped_count += 1
-                continue
-            if "##" in line:
-                self._parse_cosmetic(line)
-                continue
-            hosts_match = self._HOSTS_RE.match(line)
-            if hosts_match:
-                domain = hosts_match.group(1).lower()
-                if domain not in {"localhost", "localhost.localdomain", "broadcasthost"}:
-                    self.blocked_domains.add(domain)
-                    self.rule_count += 1
-                continue
-            exception = line.startswith("@@")
-            if exception:
-                line = line[2:]
-            body, _, options = line.partition("$")
-            if options and not self._options_supported(options):
-                self.skipped_count += 1
-                continue
-            if body.startswith("||"):
-                rest = body[2:]
-                if self._DOMAIN_RULE_RE.match(rest):
-                    domain = rest.rstrip("^").lower().strip(".")
-                    if domain:
-                        (self.exception_domains if exception else self.blocked_domains).add(domain)
-                        self.rule_count += 1
-                    continue
-            if exception:
-                # Path-level exceptions are rare and risky to approximate.
-                self.skipped_count += 1
-                continue
-            pattern = self._compile_pattern(body)
-            if pattern is None:
-                self.skipped_count += 1
-                continue
-            token = self._pick_token(body)
-            if token:
-                self.token_buckets.setdefault(token, []).append(pattern)
-                self.rule_count += 1
-            elif len(self.generic_patterns) < self.GENERIC_CAP:
-                self.generic_patterns.append(pattern)
-                self.rule_count += 1
-            else:
-                self.skipped_count += 1
-
-    def _parse_cosmetic(self, line: str) -> None:
-        domains_part, _, selector = line.partition("##")
-        selector = selector.strip()
-        if not selector or "{" in selector or "}" in selector:
-            self.skipped_count += 1
-            return
-        domains_part = domains_part.strip().lower()
-        if not domains_part:
-            if len(self.generic_selectors) < self.GENERIC_SELECTOR_CAP:
-                self.generic_selectors.append(selector)
-                self.cosmetic_count += 1
-            else:
-                self.skipped_count += 1
-            return
-        if "~" in domains_part:
-            # Negated-domain cosmetics would need exclusion logic; skip safely.
-            self.skipped_count += 1
-            return
-        added = False
-        for domain in domains_part.split(","):
-            domain = domain.strip()
-            if domain:
-                self.domain_selectors.setdefault(domain, []).append(selector)
-                added = True
-        if added:
-            self.cosmetic_count += 1
-        else:
-            self.skipped_count += 1
-
-    @classmethod
-    def _css_block(cls, selectors: list[str]) -> str:
-        # Chunked so a single invalid selector cannot invalidate every rule.
-        blocks = []
-        for start in range(0, len(selectors), cls._CSS_CHUNK):
-            chunk = selectors[start : start + cls._CSS_CHUNK]
-            blocks.append(", ".join(chunk) + " { display: none !important; }")
-        return "\n".join(blocks)
-
-    def cosmetic_css_for(self, host: str) -> str:
-        if self._generic_css is None:
-            self._generic_css = self._css_block(self.generic_selectors)
-        site_selectors: list[str] = []
-        if host:
-            parts = host.split(".")
-            for index in range(len(parts) - 1):
-                candidate = ".".join(parts[index:])
-                site_selectors.extend(self.domain_selectors.get(candidate, ()))
-        site_css = self._css_block(site_selectors) if site_selectors else ""
-        return "\n".join(part for part in (site_css, self._generic_css) if part)
-
-    def _options_supported(self, options: str) -> bool:
-        for option in options.split(","):
-            if option.strip().lower() not in self.SUPPORTED_OPTIONS:
-                return False
-        return True
-
-    @staticmethod
-    def _compile_pattern(body: str) -> re.Pattern[str] | None:
-        text = body
-        host_anchor = anchor_start = anchor_end = False
-        if text.startswith("||"):
-            host_anchor = True
-            text = text[2:]
-        elif text.startswith("|"):
-            anchor_start = True
-            text = text[1:]
-        if text.endswith("|"):
-            anchor_end = True
-            text = text[:-1]
-        if not text:
-            return None
-        parts: list[str] = []
-        for char in text:
-            if char == "*":
-                parts.append(".*")
-            elif char == "^":
-                parts.append(r"(?:[^a-zA-Z0-9_.%-]|$)")
-            else:
-                parts.append(re.escape(char))
-        regex = "".join(parts)
-        if host_anchor:
-            regex = r"^[a-z][a-z0-9+.-]*://(?:[^/?#]*\.)?" + regex
-        elif anchor_start:
-            regex = "^" + regex
-        if anchor_end:
-            regex += "$"
-        try:
-            return re.compile(regex, re.IGNORECASE)
-        except re.error:
-            return None
-
-    def _pick_token(self, body: str) -> str | None:
-        tokens: list[str] = []
-        for segment in re.split(r"[*^|]", body.lower()):
-            tokens.extend(self._TOKEN_RE.findall(segment))
-        tokens = [token for token in tokens if token not in {"http", "https", "www"}]
-        return max(tokens, key=len) if tokens else None
-
-    def is_exception_host(self, host: str) -> bool:
-        return _domain_suffix_match(host, self.exception_domains) is not None
-
-    def should_block(self, url_text: str, host: str) -> bool:
-        if self.is_exception_host(host):
-            return False
-        if _domain_suffix_match(host, self.blocked_domains) is not None:
-            return True
-        lowered = url_text.lower()
-        for token in set(self._TOKEN_RE.findall(lowered)):
-            for pattern in self.token_buckets.get(token, ()):
-                if pattern.search(url_text):
-                    return True
-        for pattern in self.generic_patterns:
-            if pattern.search(url_text):
-                return True
-        return False
-
-
-def _domain_suffix_match(host: str, domains: set[str]) -> str | None:
-    """Walk the host's label suffixes; O(labels) regardless of set size."""
-    if not host or not domains:
-        return None
-    parts = host.split(".")
-    for index in range(len(parts) - 1):
-        candidate = ".".join(parts[index:])
-        if candidate in domains:
-            return candidate
-    return None
-
-
 # Schemes allowed in hrefs on generated internal (octobrowse.local) pages.
 # Everything else - javascript:, data:, vbscript:, blob: - is neutralized so a
 # crafted bookmark/history/title cannot run script in the internal origin.
@@ -925,14 +730,22 @@ class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
         host = url.host().lower()
         if self.ad_block_enabled:
             rules = self.filter_rules
-            excepted = rules.is_exception_host(host) if rules is not None else False
+            request_type = resource_type_name(info.resourceType())
+            first_party_host = info.firstPartyUrl().host().lower()
+            excepted = (
+                rules.allows_request(url.toString(), host, request_type, first_party_host)
+                if rules is not None
+                else False
+            )
             if not excepted:
                 match = self._matching_domain(host)
                 if match:
                     self.blocked_by_domain[match] += 1
                     info.block(True)
                     return
-                if rules is not None and rules.should_block(url.toString(), host):
+                if rules is not None and rules.should_block(
+                    url.toString(), host, request_type, first_party_host
+                ):
                     self.blocked_by_domain[host or "pattern-rule"] += 1
                     info.block(True)
                     return
@@ -1229,6 +1042,7 @@ class SettingsDialog(QDialog):
         self.openai_key_edit = QLineEdit(settings.openai_api_key)
         self.openai_model_edit = QLineEdit(settings.openai_model)
         self.user_agent_edit = QLineEdit(settings.user_agent)
+        self.user_agent_edit.setPlaceholderText("Native Qt Chromium identity (recommended)")
         self.weather_location_edit = QLineEdit(settings.weather_location)
         self.weather_key_edit = QLineEdit(settings.weather_api_key)
         self.news_key_edit = QLineEdit(settings.news_api_key)
@@ -1255,7 +1069,7 @@ class SettingsDialog(QDialog):
 
         layout.addRow("Homepage URL:", self.homepage_edit)
         layout.addRow("Search Engine:", self.search_engine_combo)
-        layout.addRow("Browser Identity:", self.user_agent_edit)
+        layout.addRow("Custom User-Agent:", self.user_agent_edit)
         layout.addRow("Privacy:", self.https_only_check)
         layout.addRow("", self.gpc_check)
         layout.addRow("Performance:", self.hibernation_check)
@@ -1291,7 +1105,7 @@ class SettingsDialog(QDialog):
             theme=current.theme,
             custom_theme=current.custom_theme,
             ad_block_enabled=current.ad_block_enabled,
-            user_agent=self.user_agent_edit.text().strip() or OCTO_BROWSER_USER_AGENT,
+            user_agent=self.user_agent_edit.text().strip(),
             search_engine=str(self.search_engine_combo.currentData() or DEFAULT_SEARCH_ENGINE),
             https_only=self.https_only_check.isChecked(),
             gpc_enabled=self.gpc_check.isChecked(),
@@ -1446,7 +1260,7 @@ class OctoBrowse(QMainWindow):
         self.voice_recognizer = sr.Recognizer() if sr is not None else None
         self.chat_mode = False
         self.vpn_enabled = False
-        self.default_user_agent = self.settings.user_agent or OCTO_BROWSER_USER_AGENT
+        self.default_user_agent = ""
 
         self.network_workers: list[ApiFetchWorker] = []
         self.ai_workers: list[OpenAIWorker] = []
@@ -1454,6 +1268,7 @@ class OctoBrowse(QMainWindow):
         self.closed_tabs: list[dict[str, str]] = []
         self.private_profile: QWebEngineProfile | None = None
         self.profile = QWebEngineProfile.defaultProfile()
+        self.native_user_agent = self.profile.httpUserAgent()
         self.apply_browser_identity(self.profile)
         self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
         self.profile.downloadRequested.connect(self.handle_download_requested)
@@ -2294,9 +2109,12 @@ li {{ margin: 7px 0; }}
         QMessageBox.information(self, "Site Info", "\n".join(lines))
 
     def open_browser_identity_page(self) -> None:
-        user_agent = html.escape(self.settings.user_agent or OCTO_BROWSER_USER_AGENT)
+        user_agent = html.escape(self.profile.httpUserAgent())
         name = html.escape(OCTO_BROWSER_NAME)
         version = html.escape(OCTO_BROWSER_VERSION)
+        chromium_version = html.escape(qWebEngineChromiumVersion())
+        security_patch = html.escape(qWebEngineChromiumSecurityPatchVersion())
+        identity_mode = "Custom override" if self.settings.user_agent else "Native Qt WebEngine (recommended)"
         identity_html = f"""<!doctype html>
 <html>
 <head>
@@ -2337,9 +2155,13 @@ code, pre {{
 <body>
 <main>
   <h1>{name}</h1>
-  <div class="sub">Identity sent to sites by OctoBrowser {version}</div>
+  <div class="sub">OctoBrowse {version} uses the native engine identity for compatibility and lower fingerprinting risk.</div>
+  <section class="grid">
+    <div class="panel"><h2>Engine</h2><p>Chromium {chromium_version}</p></div>
+    <div class="panel"><h2>Security patch base</h2><p>Chromium {security_patch}</p></div>
+  </section>
   <section class="panel">
-    <h2>HTTP User-Agent</h2>
+    <h2>HTTP User-Agent - {identity_mode}</h2>
     <code>{user_agent}</code>
   </section>
   <section class="grid">
@@ -2355,7 +2177,7 @@ code, pre {{
     userAgent: navigator.userAgent,
     vendor: navigator.vendor,
     platform: navigator.platform,
-    octoBrowser: window.octoBrowser || null
+    octoBrowseAppVersion: {json.dumps(OCTO_BROWSER_VERSION)}
   }}, null, 2);
   let hints = null;
   if (navigator.userAgentData) {{
@@ -2407,100 +2229,16 @@ code, pre {{
         return self.private_profile
 
     def apply_browser_identity(self, profile: QWebEngineProfile) -> None:
-        user_agent = self.settings.user_agent or OCTO_BROWSER_USER_AGENT
+        user_agent = self.settings.user_agent or self.native_user_agent
         self.default_user_agent = user_agent
         profile.setHttpUserAgent(user_agent)
-        self.install_identity_script(profile, user_agent)
-
-    def install_identity_script(self, profile: QWebEngineProfile, user_agent: str) -> None:
-        major_version = OCTO_BROWSER_VERSION.split(".", 1)[0]
-        identity = {
-            "name": OCTO_BROWSER_NAME,
-            "version": OCTO_BROWSER_VERSION,
-            "majorVersion": major_version,
-            "userAgent": user_agent,
-            "vendor": "OctoBrowse",
-            "platform": "Windows",
-        }
-        source = f"""
-(() => {{
-  const identity = {json.dumps(identity)};
-  const brands = [
-    {{ brand: identity.name, version: identity.majorVersion }},
-    {{ brand: "OctoBrowser", version: identity.majorVersion }},
-    {{ brand: "Chromium", version: "126" }}
-  ];
-  const fullVersionList = [
-    {{ brand: identity.name, version: identity.version }},
-    {{ brand: "OctoBrowser", version: identity.version }},
-    {{ brand: "Chromium", version: "126.0.0.0" }}
-  ];
-  const defineNavigator = (name, getter) => {{
-    try {{
-      Object.defineProperty(Navigator.prototype, name, {{ get: getter, configurable: true }});
-    }} catch (_err) {{
-      try {{ Object.defineProperty(navigator, name, {{ get: getter, configurable: true }}); }} catch (_err2) {{}}
-    }}
-  }};
-  defineNavigator("userAgent", () => identity.userAgent);
-  defineNavigator("appName", () => identity.name);
-  defineNavigator("appCodeName", () => "OctoBrowser");
-  defineNavigator("vendor", () => identity.vendor);
-  defineNavigator("platform", () => "Win32");
-  defineNavigator("userAgentData", () => ({{
-    brands,
-    mobile: false,
-    platform: identity.platform,
-    getHighEntropyValues: async (hints = []) => {{
-      const values = {{
-        brands,
-        mobile: false,
-        platform: identity.platform,
-        architecture: "x86",
-        bitness: "64",
-        model: "",
-        platformVersion: "15.0.0",
-        uaFullVersion: identity.version,
-        fullVersionList
-      }};
-      const out = {{}};
-      for (const hint of hints) {{
-        if (Object.prototype.hasOwnProperty.call(values, hint)) out[hint] = values[hint];
-      }}
-      return out;
-    }},
-    toJSON: () => ({{ brands, mobile: false, platform: identity.platform }})
-  }}));
-  Object.defineProperty(window, "octoBrowser", {{
-    value: Object.freeze({{ name: identity.name, version: identity.version, userAgent: identity.userAgent }}),
-    configurable: true
-  }});
-}})();
-"""
-        script = QWebEngineScript()
-        script.setName("OctoBrowserIdentity")
-        script.setSourceCode(source)
-        script.setRunsOnSubFrames(True)
-        try:
-            script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
-        except AttributeError:
-            script.setInjectionPoint(2)
-        try:
-            script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-        except AttributeError:
-            script.setWorldId(0)
-
+        # Remove the v3.1 navigator spoof if a long-lived profile still has it.
         scripts = profile.scripts()
         try:
             for old_script in scripts.findScripts("OctoBrowserIdentity"):
                 scripts.remove(old_script)
         except Exception:
-            try:
-                old_script = scripts.findScript("OctoBrowserIdentity")
-                scripts.remove(old_script)
-            except Exception:
-                pass
-        scripts.insert(script)
+            pass
 
     def apply_privacy_settings(self) -> None:
         """Push the current privacy toggles into the always-installed interceptor."""
@@ -2887,7 +2625,9 @@ code, pre {{
         downloads_count = len(self.downloads)
         saved_tabs_count = len(self.session_tabs)
         weather = html.escape(self.weather_widget.text() if hasattr(self, "weather_widget") else "Weather unavailable")
-        browser_identity = html.escape((self.settings.user_agent or OCTO_BROWSER_USER_AGENT).split(") ", 1)[-1])
+        browser_identity = html.escape(
+            f"OctoBrowse {OCTO_BROWSER_VERSION} · Chromium {qWebEngineChromiumVersion()}"
+        )
         return f"""<!doctype html>
 <html>
 <head>
@@ -3603,17 +3343,17 @@ p {{ margin: 0 0 20px; }}
         user_agent, ok = QInputDialog.getText(
             self,
             "Change User Agent",
-            "Enter the browser identity user agent:",
-            text=self.settings.user_agent or OCTO_BROWSER_USER_AGENT,
+            "Enter a custom User-Agent, or leave blank to restore Qt's native Chromium identity:",
+            text=self.settings.user_agent,
         )
-        if ok and user_agent.strip():
-            user_agent = user_agent.strip()
-            self.settings.user_agent = user_agent
+        if ok:
+            self.settings.user_agent = user_agent.strip()
             self.apply_browser_identity(self.profile)
             if self.private_profile is not None:
                 self.apply_browser_identity(self.private_profile)
             self.save_settings()
-            QMessageBox.information(self, "Browser Identity", f"Browser identity changed to:\n{user_agent}")
+            mode = self.settings.user_agent or f"Native Chromium {qWebEngineChromiumVersion()}"
+            QMessageBox.information(self, "Browser Identity", f"Browser identity changed to:\n{mode}")
 
     def update_weather(self) -> None:
         if not self.settings.weather_api_key:
@@ -4285,9 +4025,14 @@ p {{ margin: 0 0 20px; }}
             return
         old_weather = (self.settings.weather_api_key, self.settings.weather_location)
         old_news_key = self.settings.news_api_key
+        old_user_agent = self.settings.user_agent
         self.settings = dialog.to_settings(self.settings)
         self.openai_api_key = self.settings.openai_api_key
         self.apply_privacy_settings()
+        if self.settings.user_agent != old_user_agent:
+            self.apply_browser_identity(self.profile)
+            if self.private_profile is not None:
+                self.apply_browser_identity(self.private_profile)
         self.save_settings()
         if (self.settings.weather_api_key, self.settings.weather_location) != old_weather:
             self.update_weather()
