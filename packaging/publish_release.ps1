@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "3.1"
+    [string]$Version = "3.2"
 )
 
 # Pushes main + the version tag and creates the GitHub release with the

@@ -33,6 +33,9 @@ from octobrowse.filtering import (
     domain_suffix_match as _domain_suffix_match,
     resource_type_name,
 )
+from octobrowse.ai_context import build_qa_prompt, build_summary_prompt, split_page_text
+from octobrowse.urls import is_internal_url as classify_internal_url
+from octobrowse.workspaces import make_workspace, normalize_workspaces, workspace_to_markdown
 
 try:
     import cv2
@@ -43,6 +46,13 @@ try:
     import requests
 except ImportError:  # pragma: no cover - optional runtime feature
     requests = None
+
+try:
+    import keyring
+    from keyring.errors import KeyringError
+except ImportError:  # pragma: no cover - dependency fallback for source checkouts
+    keyring = None
+    KeyringError = Exception
 
 try:
     from cryptography.fernet import Fernet
@@ -86,6 +96,7 @@ from PyQt6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
+    QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -195,6 +206,7 @@ MAX_HISTORY_ITEMS = 500
 
 DOWNLOAD_PATH_ROLE = Qt.ItemDataRole.UserRole
 DOWNLOAD_REQUEST_ROLE = Qt.ItemDataRole.UserRole + 1
+DOWNLOAD_PRIVATE_ROLE = Qt.ItemDataRole.UserRole + 2
 
 
 @dataclass
@@ -213,8 +225,11 @@ class BrowserSettings:
     search_engine: str = DEFAULT_SEARCH_ENGINE
     https_only: bool = False
     gpc_enabled: bool = True
+    dnt_enabled: bool = False
+    block_third_party_cookies: bool = False
     tab_hibernation_enabled: bool = True
     hibernation_minutes: int = 15
+    python_automation_enabled: bool = False
 
 
 @dataclass
@@ -222,6 +237,37 @@ class BrowserCommand:
     label: str
     hint: str
     handler: Any
+
+
+class CredentialStore:
+    """Small OS-keyring adapter with a plaintext compatibility fallback."""
+
+    SERVICE = "OctoBrowse"
+
+    def get(self, name: str) -> str:
+        if keyring is None:
+            return ""
+        try:
+            return str(keyring.get_password(self.SERVICE, name) or "")
+        except (KeyringError, RuntimeError):
+            return ""
+
+    def set(self, name: str, value: str) -> bool:
+        if keyring is None:
+            return False
+        try:
+            if self.get(name) == value:
+                return True
+            if value:
+                keyring.set_password(self.SERVICE, name, value)
+            else:
+                try:
+                    keyring.delete_password(self.SERVICE, name)
+                except KeyringError:
+                    pass
+            return True
+        except (KeyringError, RuntimeError):
+            return False
 
 
 class SettingsStore:
@@ -235,6 +281,7 @@ class SettingsStore:
             self.directory = Path.home() / ".octobrowse"
         self.path = self.directory / "settings.json"
         self.legacy_path = Path.cwd() / "octobrowse_settings.json"
+        self.credentials = CredentialStore()
 
     def load(
         self,
@@ -250,6 +297,7 @@ class SettingsStore:
         dict[str, dict[str, bool]],
         list[dict[str, Any]],
         dict[str, dict[str, Any]],
+        list[dict[str, Any]],
     ]:
         data: dict[str, Any] = {}
         source = self.path if self.path.exists() else self.legacy_path
@@ -271,17 +319,19 @@ class SettingsStore:
             # Migrate that generated value back to the compatible native UA.
             user_agent = ""
 
+        openai_key = self._load_secret(
+            data, "openai_api_key", "OPENAI_API_KEY", legacy_key="openai_key"
+        )
+        weather_key = self._load_secret(data, "weather_api_key", "OPENWEATHER_API_KEY")
+        news_key = self._load_secret(data, "news_api_key", "NEWS_API_KEY")
+
         settings = BrowserSettings(
             homepage=str(data.get("homepage") or DEFAULT_HOMEPAGE),
-            openai_api_key=str(
-                data.get("openai_api_key")
-                or data.get("openai_key")
-                or os.environ.get("OPENAI_API_KEY", "")
-            ),
+            openai_api_key=openai_key,
             openai_model=str(data.get("openai_model") or DEFAULT_OPENAI_MODEL),
             weather_location=str(data.get("weather_location") or "London"),
-            weather_api_key=str(data.get("weather_api_key") or os.environ.get("OPENWEATHER_API_KEY", "")),
-            news_api_key=str(data.get("news_api_key") or os.environ.get("NEWS_API_KEY", "")),
+            weather_api_key=weather_key,
+            news_api_key=news_key,
             theme=str(data.get("theme") or "default"),
             custom_theme=data.get("custom_theme") or None,
             ad_block_enabled=bool(data.get("ad_block_enabled", False)),
@@ -289,8 +339,11 @@ class SettingsStore:
             search_engine=str(data.get("search_engine") or DEFAULT_SEARCH_ENGINE).lower(),
             https_only=bool(data.get("https_only", False)),
             gpc_enabled=bool(data.get("gpc_enabled", True)),
+            dnt_enabled=bool(data.get("dnt_enabled", False)),
+            block_third_party_cookies=bool(data.get("block_third_party_cookies", False)),
             tab_hibernation_enabled=bool(data.get("tab_hibernation_enabled", True)),
             hibernation_minutes=hibernation_minutes,
+            python_automation_enabled=bool(data.get("python_automation_enabled", False)),
         )
         if settings.search_engine not in SEARCH_ENGINES:
             settings.search_engine = DEFAULT_SEARCH_ENGINE
@@ -304,6 +357,7 @@ class SettingsStore:
         site_content = self._coerce_site_permissions(data.get("site_content", {}))
         downloads_history = self._coerce_downloads(data.get("downloads_history", []))
         plugin_grants = self._coerce_plugin_grants(data.get("plugin_grants", {}))
+        workspaces = normalize_workspaces(data.get("workspaces", []))
         return (
             settings,
             history,
@@ -316,6 +370,7 @@ class SettingsStore:
             site_content,
             downloads_history,
             plugin_grants,
+            workspaces,
         )
 
     def save(
@@ -330,15 +385,19 @@ class SettingsStore:
         site_content: dict[str, dict[str, bool]],
         downloads_history: list[dict[str, Any]],
         plugin_grants: dict[str, dict[str, Any]],
+        workspaces: list[dict[str, Any]],
     ) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
+        openai_fallback = "" if self.credentials.set("openai_api_key", settings.openai_api_key) else settings.openai_api_key
+        weather_fallback = "" if self.credentials.set("weather_api_key", settings.weather_api_key) else settings.weather_api_key
+        news_fallback = "" if self.credentials.set("news_api_key", settings.news_api_key) else settings.news_api_key
         payload = {
             "homepage": settings.homepage,
-            "openai_api_key": settings.openai_api_key,
+            "openai_api_key": openai_fallback,
             "openai_model": settings.openai_model,
             "weather_location": settings.weather_location,
-            "weather_api_key": settings.weather_api_key,
-            "news_api_key": settings.news_api_key,
+            "weather_api_key": weather_fallback,
+            "news_api_key": news_fallback,
             "theme": settings.theme,
             "custom_theme": settings.custom_theme,
             "ad_block_enabled": settings.ad_block_enabled,
@@ -346,8 +405,11 @@ class SettingsStore:
             "search_engine": settings.search_engine,
             "https_only": settings.https_only,
             "gpc_enabled": settings.gpc_enabled,
+            "dnt_enabled": settings.dnt_enabled,
+            "block_third_party_cookies": settings.block_third_party_cookies,
             "tab_hibernation_enabled": settings.tab_hibernation_enabled,
             "hibernation_minutes": settings.hibernation_minutes,
+            "python_automation_enabled": settings.python_automation_enabled,
             "bookmarks": bookmarks,
             "notes": notes,
             "todos": todos,
@@ -357,10 +419,31 @@ class SettingsStore:
             "site_content": site_content,
             "downloads_history": downloads_history[-100:],
             "plugin_grants": plugin_grants,
+            "workspaces": normalize_workspaces(workspaces),
         }
         tmp_path = self.path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         tmp_path.replace(self.path)
+
+    def _load_secret(
+        self,
+        data: dict[str, Any],
+        key: str,
+        environment_name: str,
+        *,
+        legacy_key: str | None = None,
+    ) -> str:
+        stored = self.credentials.get(key)
+        if stored:
+            return stored
+        legacy = str(
+            data.get(key)
+            or (data.get(legacy_key) if legacy_key else "")
+            or os.environ.get(environment_name, "")
+        )
+        if legacy:
+            self.credentials.set(key, legacy)
+        return legacy
 
     @staticmethod
     def _unique_strings(values: Any) -> list[str]:
@@ -668,7 +751,8 @@ class OpenAIWorker(QThread):
         task: str,
         api_key: str,
         model: str,
-        messages: list[dict[str, str]],
+        instructions: str,
+        input_text: str,
         max_output_tokens: int,
         parent: QWidget | None = None,
     ) -> None:
@@ -676,7 +760,8 @@ class OpenAIWorker(QThread):
         self.task = task
         self.api_key = api_key
         self.model = model
-        self.messages = messages
+        self.instructions = instructions
+        self.input_text = input_text
         self.max_output_tokens = max_output_tokens
 
     def run(self) -> None:
@@ -684,11 +769,13 @@ class OpenAIWorker(QThread):
             self.failed.emit(self.task, "Install the openai package to use AI features.")
             return
         try:
-            client = OpenAI(api_key=self.api_key)
+            client = OpenAI(api_key=self.api_key, timeout=30.0, max_retries=1)
             response = client.responses.create(
                 model=self.model,
-                input=self.messages,
+                instructions=self.instructions,
+                input=self.input_text,
                 max_output_tokens=self.max_output_tokens,
+                store=False,
             )
             text = getattr(response, "output_text", "") or self._extract_output_text(response)
             if not text:
@@ -722,6 +809,7 @@ class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
         self.ad_block_enabled = False
         self.https_only = False
         self.gpc_enabled = True
+        self.dnt_enabled = False
         self.https_upgrades = 0
         self.filter_rules: FilterRuleSet | None = None
 
@@ -758,6 +846,7 @@ class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
                 return
         if self.gpc_enabled:
             info.setHttpHeader(b"Sec-GPC", b"1")
+        if self.dnt_enabled:
             info.setHttpHeader(b"DNT", b"1")
 
     def reset_stats(self) -> None:
@@ -826,7 +915,7 @@ PLUGIN_FETCH_LIMIT = 2_000_000  # bytes of response text a plugin may receive
 
 
 def make_safe_builtins(print_fn: Any) -> dict[str, Any]:
-    """Restricted builtins for plugin and extension-lab execution."""
+    """Reduce accidental misuse in trusted automation; this is not a sandbox."""
     return {
         "Exception": Exception,
         "PermissionError": PermissionError,
@@ -864,7 +953,7 @@ def make_safe_builtins(print_fn: Any) -> dict[str, Any]:
 
 
 class OctoPluginAPI:
-    """Capability object handed to plugins; every call checks a granted permission."""
+    """Convenience API for trusted Python automation with declared capabilities."""
 
     def __init__(self, browser_window: "OctoBrowse", plugin_name: str, granted: set[str]) -> None:
         self._browser = browser_window
@@ -1057,12 +1146,21 @@ class SettingsDialog(QDialog):
         self.https_only_check.setChecked(settings.https_only)
         self.gpc_check = QCheckBox("Send Global Privacy Control (Sec-GPC) and DNT headers")
         self.gpc_check.setChecked(settings.gpc_enabled)
+        self.gpc_check.setText("Send Global Privacy Control (header and navigator signal)")
+        self.dnt_check = QCheckBox("Send legacy Do Not Track (DNT) header")
+        self.dnt_check.setChecked(settings.dnt_enabled)
+        self.third_party_cookies_check = QCheckBox("Block third-party cookies and storage")
+        self.third_party_cookies_check.setChecked(settings.block_third_party_cookies)
         self.hibernation_check = QCheckBox("Hibernate idle background tabs to save memory")
         self.hibernation_check.setChecked(settings.tab_hibernation_enabled)
         self.hibernation_minutes_spin = QSpinBox()
         self.hibernation_minutes_spin.setRange(1, 240)
         self.hibernation_minutes_spin.setValue(settings.hibernation_minutes)
         self.hibernation_minutes_spin.setSuffix(" min idle")
+        self.python_automation_check = QCheckBox(
+            "Enable trusted Python automation (full local account access)"
+        )
+        self.python_automation_check.setChecked(settings.python_automation_enabled)
 
         for key_edit in (self.openai_key_edit, self.weather_key_edit, self.news_key_edit):
             key_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -1072,8 +1170,11 @@ class SettingsDialog(QDialog):
         layout.addRow("Custom User-Agent:", self.user_agent_edit)
         layout.addRow("Privacy:", self.https_only_check)
         layout.addRow("", self.gpc_check)
+        layout.addRow("", self.dnt_check)
+        layout.addRow("", self.third_party_cookies_check)
         layout.addRow("Performance:", self.hibernation_check)
         layout.addRow("", self.hibernation_minutes_spin)
+        layout.addRow("Developer Mode:", self.python_automation_check)
         layout.addRow("OpenAI API Key:", self.openai_key_edit)
         layout.addRow("OpenAI Model:", self.openai_model_edit)
         layout.addRow("Weather Location:", self.weather_location_edit)
@@ -1109,8 +1210,11 @@ class SettingsDialog(QDialog):
             search_engine=str(self.search_engine_combo.currentData() or DEFAULT_SEARCH_ENGINE),
             https_only=self.https_only_check.isChecked(),
             gpc_enabled=self.gpc_check.isChecked(),
+            dnt_enabled=self.dnt_check.isChecked(),
+            block_third_party_cookies=self.third_party_cookies_check.isChecked(),
             tab_hibernation_enabled=self.hibernation_check.isChecked(),
             hibernation_minutes=self.hibernation_minutes_spin.value(),
+            python_automation_enabled=self.python_automation_check.isChecked(),
         )
 
 
@@ -1241,6 +1345,7 @@ class OctoBrowse(QMainWindow):
             self.site_content,
             self.downloads_history,
             self.plugin_grants,
+            self.workspaces,
         ) = self.store.load()
         self.openai_api_key = self.settings.openai_api_key
         self.plugins_dir = self.store.directory / "plugins"
@@ -1264,6 +1369,7 @@ class OctoBrowse(QMainWindow):
 
         self.network_workers: list[ApiFetchWorker] = []
         self.ai_workers: list[OpenAIWorker] = []
+        self.ai_task_metadata: dict[str, dict[str, str]] = {}
         self.downloads: list[dict[str, str]] = []
         self.closed_tabs: list[dict[str, str]] = []
         self.private_profile: QWebEngineProfile | None = None
@@ -1271,12 +1377,15 @@ class OctoBrowse(QMainWindow):
         self.native_user_agent = self.profile.httpUserAgent()
         self.apply_browser_identity(self.profile)
         self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
+        self.apply_cookie_policy(self.profile)
         self.profile.downloadRequested.connect(self.handle_download_requested)
         self.request_interceptor = OctoRequestInterceptor(AD_BLOCK_LIST)
         self.request_interceptor.ad_block_enabled = self.ad_block_enabled
         self.request_interceptor.https_only = self.settings.https_only
         self.request_interceptor.gpc_enabled = self.settings.gpc_enabled
+        self.request_interceptor.dnt_enabled = self.settings.dnt_enabled
         self.profile.setUrlRequestInterceptor(self.request_interceptor)
+        self.install_privacy_script(self.profile)
 
         self.filter_workers: list[FilterParseWorker] = []
         self.filter_list_dir = self.store.directory / "filterlists"
@@ -1286,6 +1395,12 @@ class OctoBrowse(QMainWindow):
         self.hibernation_timer = QTimer(self)
         self.hibernation_timer.timeout.connect(self.hibernate_idle_tabs)
         self.hibernation_timer.start(60_000)
+
+        # An atomic session snapshot every 30 seconds survives crashes and
+        # forced shutdowns instead of relying only on closeEvent.
+        self.session_autosave_timer = QTimer(self)
+        self.session_autosave_timer.timeout.connect(self.save_settings)
+        self.session_autosave_timer.start(30_000)
 
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
@@ -1457,6 +1572,8 @@ class OctoBrowse(QMainWindow):
         self._add_menu_action(tools_menu, "Mute/Unmute Tab", "Toggle audio for the current tab", self.toggle_mute_current_tab, "Ctrl+M")
         self._add_menu_action(tools_menu, "Feature Audit", "Show implemented feature checklist", self.open_feature_audit)
         self._add_menu_action(tools_menu, "Library Search", "Search all browser collections", self.open_library_search, "Ctrl+Shift+F")
+        self._add_menu_action(tools_menu, "Research Workspaces", "Save and restore named tab sets", self.open_workspace_manager)
+        self._add_menu_action(tools_menu, "Save Tabs as Workspace", "Capture ordinary tabs as a named workspace", self.save_current_workspace)
         self._add_menu_action(tools_menu, "Page Insights", "Show word count and keywords", self.show_page_insights)
         self._add_menu_action(tools_menu, "Upscale Page", "Open a 2x screenshot preview", self.upscale_page)
         self._add_menu_action(tools_menu, "Read Aloud", "Read page text aloud", self.read_aloud)
@@ -1471,8 +1588,8 @@ class OctoBrowse(QMainWindow):
         self._add_menu_action(tools_menu, "Voice Command", "Control browser with speech", self.voice_command)
         self._add_menu_action(tools_menu, "Change User Agent", "Set a custom user agent", self.change_user_agent)
         self._add_menu_action(tools_menu, "Session Passwords", "Open session password scratchpad", self.manage_passwords)
-        self._add_menu_action(tools_menu, "Plugin Manager", "Install and run permissioned plugins", self.open_plugin_manager)
-        self._add_menu_action(tools_menu, "Run Extension", "Run constrained extension code (legacy)", self.run_extension)
+        self._add_menu_action(tools_menu, "Plugin Manager", "Manage trusted Python automation", self.open_plugin_manager)
+        self._add_menu_action(tools_menu, "Run Extension", "Run trusted Python automation with reduced builtins", self.run_extension)
         self._add_menu_action(tools_menu, "Run Trusted Extension", "Run extension with full Python access", self.run_trusted_extension)
         self.toolbar.addAction(tools_menu.menuAction())
 
@@ -1540,6 +1657,7 @@ class OctoBrowse(QMainWindow):
 
         self._add_rail_action("Home", "Open dashboard", self.open_dashboard, QStyle.StandardPixmap.SP_DirHomeIcon)
         self._add_rail_action("Search", "Search tabs and saved collections", self.open_library_search, QStyle.StandardPixmap.SP_FileDialogContentsView)
+        self._add_rail_action("Spaces", "Open named research workspaces", self.open_workspace_manager, QStyle.StandardPixmap.SP_DirIcon)
         self._add_rail_action("Audit", "Show implemented feature checklist", self.open_feature_audit, QStyle.StandardPixmap.SP_DialogApplyButton)
         self.workspace_rail.addSeparator()
         self._add_rail_action("Notes", "Show notes and AI chat", lambda: self.toggle_panel(self.notes_sidebar), QStyle.StandardPixmap.SP_FileIcon)
@@ -1571,8 +1689,8 @@ class OctoBrowse(QMainWindow):
         menu_bar = self.menuBar()
 
         file_menu = menu_bar.addMenu("File")
-        self._add_menu_action(file_menu, "New Tab", "Open a new tab", lambda: self.add_tab(QUrl(self.settings.homepage), "New Tab"), "Ctrl+T")
-        self._add_menu_action(file_menu, "Private Tab", "Open a private tab", self.open_private_tab, "Ctrl+Shift+N")
+        self._add_menu_action(file_menu, "New Tab", "Open a new tab", lambda: self.add_tab(QUrl(self.settings.homepage), "New Tab"))
+        self._add_menu_action(file_menu, "Private Tab", "Open a private tab", self.open_private_tab)
         self._add_menu_action(file_menu, "Dashboard", "Open the OctoBrowse dashboard", self.open_dashboard)
         self._add_menu_action(file_menu, "Restore Saved Tabs", "Open tabs from the last saved session", self.restore_saved_tabs)
         self._add_menu_action(file_menu, "Reopen Closed Tab", "Restore the most recently closed tab", self.reopen_closed_tab, "Ctrl+Shift+T")
@@ -1580,7 +1698,7 @@ class OctoBrowse(QMainWindow):
         self._add_menu_action(file_menu, "View Source", "View page source", self.view_page_source)
 
         view_menu = menu_bar.addMenu("View")
-        self._add_menu_action(view_menu, "Command Palette", "Search commands", self.open_command_palette, "Ctrl+K")
+        self._add_menu_action(view_menu, "Command Palette", "Search commands", self.open_command_palette)
         self._add_menu_action(view_menu, "Next Tab", "Switch to the next tab", self.next_tab, "Ctrl+Tab")
         self._add_menu_action(view_menu, "Previous Tab", "Switch to the previous tab", self.previous_tab, "Ctrl+Shift+Tab")
         for tab_number in range(1, 10):
@@ -1588,9 +1706,9 @@ class OctoBrowse(QMainWindow):
             jump_action.setShortcut(f"Ctrl+{tab_number}")
             jump_action.triggered.connect(lambda _checked=False, number=tab_number: self.jump_to_tab(number))
             self.addAction(jump_action)
-        self._add_menu_action(view_menu, "Library Search", "Search tabs and collections", self.open_library_search, "Ctrl+Shift+F")
+        self._add_menu_action(view_menu, "Library Search", "Search tabs and collections", self.open_library_search)
         self._add_menu_action(view_menu, "Feature Audit", "Show implemented feature checklist", self.open_feature_audit)
-        self._add_menu_action(view_menu, "Find in Page", "Search text on the current page", self.toggle_find_bar, "Ctrl+F")
+        self._add_menu_action(view_menu, "Find in Page", "Search text on the current page", self.toggle_find_bar)
         self._add_menu_action(view_menu, "Reader View", "Open current page text in a clean reader tab", self.open_reader_view)
         self._add_menu_action(view_menu, "Page Insights", "Show page reading metrics", self.show_page_insights)
         self._add_menu_action(view_menu, "Dashboard", "Open workspace dashboard", self.open_dashboard)
@@ -1599,11 +1717,13 @@ class OctoBrowse(QMainWindow):
         self._add_menu_action(view_menu, "Fullscreen", "Toggle fullscreen", self.toggle_fullscreen, "F11")
 
         data_menu = menu_bar.addMenu("Data")
-        self._add_menu_action(data_menu, "Add Bookmark", "Bookmark current page", self.add_bookmark, "Ctrl+D")
+        self._add_menu_action(data_menu, "Add Bookmark", "Bookmark current page", self.add_bookmark)
         self._add_menu_action(data_menu, "Add to Reading List", "Save current page for later", self.add_to_reading_list)
         self._add_menu_action(data_menu, "Add Note", "Attach a note to the current page", self.add_note_for_page)
         self._add_menu_action(data_menu, "Add Task", "Add a todo item", self.add_todo_item)
-        self._add_menu_action(data_menu, "Downloads", "Show download panel", lambda: self.toggle_panel(self.downloads_sidebar), "Ctrl+J")
+        self._add_menu_action(data_menu, "Research Workspaces", "Save, restore, and export tab workspaces", self.open_workspace_manager)
+        self._add_menu_action(data_menu, "Save Tabs as Workspace", "Capture ordinary tabs", self.save_current_workspace)
+        self._add_menu_action(data_menu, "Downloads", "Show download panel", lambda: self.toggle_panel(self.downloads_sidebar))
         self._add_menu_action(data_menu, "Clear History", "Clear browser history", self.clear_history)
         self._add_menu_action(data_menu, "Clear Browser Data", "Clear history, cookies, cache, and block stats", self.clear_browser_data)
 
@@ -1799,6 +1919,8 @@ class OctoBrowse(QMainWindow):
             BrowserCommand("Open dashboard", "workspace overview", self.open_dashboard),
             BrowserCommand("Feature audit", "implemented checklist", self.open_feature_audit),
             BrowserCommand("Library search", "tabs history bookmarks notes tasks", self.open_library_search),
+            BrowserCommand("Research workspaces", "named tab sets save restore export", self.open_workspace_manager),
+            BrowserCommand("Save tabs as workspace", "capture current research session", self.save_current_workspace),
             BrowserCommand("Restore saved tabs", "last session", self.restore_saved_tabs),
             BrowserCommand("New tab", "Ctrl+T", lambda: self.add_tab(QUrl(self.settings.homepage), "New Tab")),
             BrowserCommand("Private tab", "Ctrl+Shift+N", self.open_private_tab),
@@ -1825,6 +1947,7 @@ class OctoBrowse(QMainWindow):
             BrowserCommand("Load filter list", "import adblock rules file", self.load_filter_list_file),
             BrowserCommand("Hibernate background tabs", "free memory now", self.hibernate_background_tabs_now),
             BrowserCommand("Mute tab", "toggle tab audio", self.toggle_mute_current_tab),
+            BrowserCommand("Pin tab", "protect from automatic hibernation", self.toggle_pin_current_tab),
             BrowserCommand("Next tab", "Ctrl+Tab", self.next_tab),
             BrowserCommand("Previous tab", "Ctrl+Shift+Tab", self.previous_tab),
             BrowserCommand("Add bookmark", "Ctrl+D", self.add_bookmark),
@@ -1866,6 +1989,7 @@ class OctoBrowse(QMainWindow):
             "octo:todos",
             "octo:notes",
             "octo:library",
+            "octo:workspaces",
             "octo:permissions",
             "octo:plugins",
             "octo:settings",
@@ -1918,11 +2042,24 @@ class OctoBrowse(QMainWindow):
             entries.append({"kind": "Note", "title": note.get("note", ""), "url": note.get("url", "")})
         for todo in self.todos:
             entries.append({"kind": "Task", "title": todo})
+        for workspace in self.workspaces:
+            entries.append(
+                {
+                    "kind": "Workspace",
+                    "title": workspace["name"],
+                    "workspace_id": workspace["id"],
+                }
+            )
         return entries
 
     def open_library_entry(self, entry: dict[str, Any]) -> None:
         if "tab_index" in entry:
             self.tabs.setCurrentIndex(int(entry["tab_index"]))
+            return
+        if entry.get("workspace_id"):
+            workspace = self.workspace_by_id(str(entry["workspace_id"]))
+            if workspace is not None:
+                self.restore_workspace(workspace)
             return
         if entry.get("url"):
             self.add_tab(QUrl(str(entry["url"])), str(entry.get("kind", "Library")))
@@ -1931,6 +2068,207 @@ class OctoBrowse(QMainWindow):
             self.open_panel(self.todo_sidebar)
         else:
             self.open_panel(self.notes_sidebar)
+
+    def workspace_by_id(self, identifier: str) -> dict[str, Any] | None:
+        return next((item for item in self.workspaces if item.get("id") == identifier), None)
+
+    def current_workspace_tabs(self) -> tuple[list[dict[str, Any]], int]:
+        """Capture ordinary web tabs and the selected position without private data."""
+        tabs: list[dict[str, Any]] = []
+        active_index = 0
+        current = self.tabs.currentWidget()
+        for index in range(self.tabs.count()):
+            widget = self.tabs.widget(index)
+            if not isinstance(widget, QWebEngineView) or widget.property("private"):
+                continue
+            url = widget.url().toString()
+            if self.is_internal_url(url):
+                continue
+            if widget is current:
+                active_index = len(tabs)
+            raw_title = str(widget.property("raw_title") or widget.page().title() or url)
+            tabs.append(
+                {
+                    "url": url,
+                    "title": raw_title,
+                    "pinned": bool(widget.property("pinned")),
+                }
+            )
+        return tabs, active_index
+
+    def save_current_workspace(self) -> None:
+        tabs, active_index = self.current_workspace_tabs()
+        if not tabs:
+            QMessageBox.information(
+                self,
+                "Research Workspaces",
+                "Open at least one ordinary website tab. Private and internal tabs are never saved.",
+            )
+            return
+        name, ok = QInputDialog.getText(self, "Save Workspace", "Workspace name:")
+        if not ok or not name.strip():
+            return
+        clean_name = " ".join(name.split())
+        existing_index = next(
+            (
+                index
+                for index, item in enumerate(self.workspaces)
+                if str(item.get("name", "")).casefold() == clean_name.casefold()
+            ),
+            None,
+        )
+        workspace = make_workspace(clean_name, tabs, active_index)
+        if existing_index is not None:
+            answer = QMessageBox.question(
+                self,
+                "Update Workspace",
+                f"Replace the saved tabs in '{clean_name}'?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            existing = self.workspaces[existing_index]
+            workspace["id"] = existing["id"]
+            workspace["created_at"] = existing.get("created_at", workspace["created_at"])
+            self.workspaces[existing_index] = workspace
+            verb = "Updated"
+        else:
+            self.workspaces.append(workspace)
+            verb = "Saved"
+        self.workspaces = normalize_workspaces(self.workspaces)
+        self.save_settings()
+        self.set_status(f"{verb} workspace '{clean_name}' with {len(tabs)} tabs")
+
+    def restore_workspace(self, workspace: dict[str, Any], replace: bool = False) -> None:
+        normalized = normalize_workspaces([workspace])
+        if not normalized:
+            return
+        workspace = normalized[0]
+        if replace:
+            answer = QMessageBox.question(
+                self,
+                "Replace Tabs",
+                "Close all ordinary tabs and open this workspace? Private tabs stay open.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            for index in reversed(range(self.tabs.count())):
+                widget = self.tabs.widget(index)
+                if isinstance(widget, QWebEngineView) and not widget.property("private"):
+                    self.tabs.removeTab(index)
+                    widget.deleteLater()
+
+        first_index = self.tabs.count()
+        for tab in workspace["tabs"]:
+            browser = self.add_tab(QUrl(tab["url"]), tab.get("title") or "Workspace", private=False)
+            browser.setProperty("pinned", bool(tab.get("pinned", False)))
+            self.update_tab_title(browser, tab.get("title") or browser.page().title())
+        selected = first_index + int(workspace.get("active_index", 0))
+        if first_index <= selected < self.tabs.count():
+            self.tabs.setCurrentIndex(selected)
+        self.save_settings()
+        self.set_status(
+            f"Opened workspace '{workspace['name']}' ({len(workspace['tabs'])} tabs)"
+        )
+
+    def export_workspace(self, workspace: dict[str, Any]) -> None:
+        default_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", str(workspace.get("name", "workspace")))
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Workspace", f"{default_name}.md", "Markdown Files (*.md)"
+        )
+        if not file_path:
+            return
+        try:
+            Path(file_path).write_text(workspace_to_markdown(workspace), encoding="utf-8")
+            self.set_status(f"Exported workspace to {file_path}")
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Export Workspace", str(exc))
+
+    def open_workspace_manager(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Research Workspaces")
+        dialog.resize(700, 460)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(
+            QLabel(
+                "Named workspaces preserve tab order and pinned state. "
+                "Private tabs are deliberately excluded."
+            )
+        )
+        workspace_list = QListWidget()
+        layout.addWidget(workspace_list)
+
+        def refresh() -> None:
+            workspace_list.clear()
+            for workspace in sorted(
+                self.workspaces, key=lambda item: float(item.get("updated_at", 0)), reverse=True
+            ):
+                stamp = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(float(workspace.get("updated_at", 0)))
+                )
+                item = QListWidgetItem(
+                    f"{workspace['name']}  ·  {len(workspace['tabs'])} tabs  ·  {stamp}"
+                )
+                item.setData(Qt.ItemDataRole.UserRole, workspace["id"])
+                workspace_list.addItem(item)
+            if not workspace_list.count():
+                workspace_list.addItem("No saved workspaces yet.")
+
+        def selected() -> dict[str, Any] | None:
+            item = workspace_list.currentItem()
+            identifier = item.data(Qt.ItemDataRole.UserRole) if item else None
+            return self.workspace_by_id(str(identifier)) if identifier else None
+
+        def open_selected(replace: bool = False) -> None:
+            workspace = selected()
+            if workspace is not None:
+                self.restore_workspace(workspace, replace=replace)
+
+        def delete_selected() -> None:
+            workspace = selected()
+            if workspace is None:
+                return
+            answer = QMessageBox.question(
+                dialog,
+                "Delete Workspace",
+                f"Delete '{workspace['name']}'?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.workspaces = [item for item in self.workspaces if item["id"] != workspace["id"]]
+                self.save_settings()
+                refresh()
+
+        buttons = QHBoxLayout()
+        save_button = QPushButton("Save Current Tabs")
+        open_button = QPushButton("Open Alongside")
+        replace_button = QPushButton("Replace Ordinary Tabs")
+        export_button = QPushButton("Export Markdown")
+        delete_button = QPushButton("Delete")
+        close_button = QPushButton("Close")
+        save_button.clicked.connect(lambda: (self.save_current_workspace(), refresh()))
+        open_button.clicked.connect(lambda: open_selected(False))
+        replace_button.clicked.connect(lambda: open_selected(True))
+        export_button.clicked.connect(lambda: self.export_workspace(selected()) if selected() else None)
+        delete_button.clicked.connect(delete_selected)
+        close_button.clicked.connect(dialog.accept)
+        for button in (
+            save_button,
+            open_button,
+            replace_button,
+            export_button,
+            delete_button,
+            close_button,
+        ):
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        workspace_list.itemDoubleClicked.connect(lambda _item: open_selected(False))
+        refresh()
+        dialog.exec()
 
     def duplicate_current_tab(self) -> None:
         browser = self.current_browser()
@@ -1960,12 +2298,14 @@ class OctoBrowse(QMainWindow):
             widget = self.tabs.widget(index)
             if not isinstance(widget, QWebEngineView):
                 continue
+            if widget.property("private"):
+                # Never copy private URLs into a standard-profile internal page.
+                continue
             title = html.escape(self.tabs.tabText(index))
             url = widget.url().toString()
             safe_href = safe_link_href(url)
             safe_text = html.escape(url, quote=True)
-            mode = "Private" if widget.property("private") else "Standard"
-            rows.append(f"<tr><td>{index + 1}</td><td>{title}</td><td>{mode}</td><td><a href=\"{safe_href}\">{safe_text}</a></td></tr>")
+            rows.append(f"<tr><td>{index + 1}</td><td>{title}</td><td>Standard</td><td><a href=\"{safe_href}\">{safe_text}</a></td></tr>")
         table = "\n".join(rows) or "<tr><td colspan='4'>No open tabs.</td></tr>"
         overview_html = f"""<!doctype html>
 <html>
@@ -1984,12 +2324,12 @@ a {{ color: #0f5dcc; overflow-wrap: anywhere; }}
 <body>
 <main>
 <h1>Tab Overview</h1>
-<p>{len(rows)} open tabs. Private tabs are not included in session restore.</p>
+<p>{len(rows)} ordinary tabs. Private tabs are intentionally hidden from this standard-profile page.</p>
 <table><thead><tr><th>#</th><th>Title</th><th>Mode</th><th>URL</th></tr></thead><tbody>{table}</tbody></table>
 </main>
 </body>
 </html>"""
-        self.add_html_tab(overview_html, "Tab Overview", private=False)
+        self.add_html_tab(overview_html, "Tab Overview", private=False, internal_page="tabs")
 
     def open_feature_audit(self) -> None:
         rows = []
@@ -2020,7 +2360,7 @@ li {{ margin: 7px 0; }}
 </main>
 </body>
 </html>"""
-        self.add_html_tab(audit_html, "Feature Audit", private=False)
+        self.add_html_tab(audit_html, "Feature Audit", private=False, internal_page="features")
 
     def feature_catalog(self) -> dict[str, list[str]]:
         return {
@@ -2042,7 +2382,9 @@ li {{ margin: 7px 0; }}
                 "Unified library search",
                 "Left workspace rail and focused side panels",
                 "Tab overview",
-                "Automatic background-tab hibernation to reclaim memory",
+                "Named research workspaces with restore, pinned state, and Markdown export",
+                "Pinned tabs and activity-safe hibernation using Qt's recommended lifecycle state",
+                "Crash-resilient 30-second session autosave",
                 "Find-in-page with live match counter",
             ],
             "Collections": [
@@ -2063,31 +2405,34 @@ li {{ margin: 7px 0; }}
             ],
             "Privacy And Identity": [
                 "Ad-block interceptor with fast suffix matching and privacy report",
-                "EasyList-compatible filter list parsing with token-indexed pattern rules",
+                "EasyList-compatible filters with resource-type, third-party, and exception semantics",
                 "Cosmetic element-hiding rules injected per page",
                 "Automatic weekly EasyList refresh",
                 "Per-site content controls (JavaScript and image toggles)",
                 "HTTPS-only mode with automatic page upgrades",
-                "Global Privacy Control (Sec-GPC) and DNT request headers",
+                "Global Privacy Control through Sec-GPC and navigator.globalPrivacyControl",
+                "Optional legacy DNT and strict third-party cookie/storage blocking",
                 "Per-site permission prompts for camera, microphone, location, and notifications",
                 "Connection security badge in the toolbar",
                 "Private/off-the-record tabs",
                 "Global private mode history pause",
-                "Clear browser data",
-                "Octo Browser HTTP and navigator identity",
+                "Expanded clear-browser-data controls",
+                "Native Qt Chromium identity with runtime and security-patch reporting",
+                "Private URLs redacted from standard overview and download history",
             ],
             "AI And Voice": [
-                "OpenAI page summarization",
-                "Page-aware AI chat",
+                "Citation-grounded OpenAI page summaries with save-to-note",
+                "Query-relevant cited page assistant with dedicated input and output",
+                "Prompt-injection-aware context boundaries, store=False, and private-tab consent",
                 "Text-to-speech read aloud",
                 "SpeechRecognition voice commands",
             ],
             "Extensibility": [
-                "Permissioned plugin API with manifest-declared capabilities and a plugin manager",
-                "Constrained extension lab (legacy)",
-                "Trusted legacy extension execution path",
+                "Trusted Python plugin API with manifest-declared intended capabilities",
+                "Python automation disabled by default behind explicit Developer Mode",
+                "Reduced-builtins and full-access trusted extension execution paths",
                 "Session password scratchpad",
-                "Persistent settings with atomic writes",
+                "Persistent settings with atomic writes and OS-keyring secrets",
             ],
         }
 
@@ -2190,7 +2535,7 @@ code, pre {{
 </script>
 </body>
 </html>"""
-        self.add_html_tab(identity_html, "Browser Identity", private=False)
+        self.add_html_tab(identity_html, "Browser Identity", private=False, internal_page="identity")
 
     def open_browser_identity_test(self) -> None:
         self.add_tab(QUrl("https://www.whatismybrowser.com/"), "Identity Test", private=False)
@@ -2224,6 +2569,8 @@ code, pre {{
         if self.private_profile is None:
             self.private_profile = QWebEngineProfile(self)
             self.apply_browser_identity(self.private_profile)
+            self.install_privacy_script(self.private_profile)
+            self.apply_cookie_policy(self.private_profile)
             self.private_profile.downloadRequested.connect(self.handle_download_requested)
             self.private_profile.setUrlRequestInterceptor(self.request_interceptor)
         return self.private_profile
@@ -2240,11 +2587,47 @@ code, pre {{
         except Exception:
             pass
 
+    def install_privacy_script(self, profile: QWebEngineProfile) -> None:
+        """Expose the DOM-level GPC signal alongside the Sec-GPC header."""
+        scripts = profile.scripts()
+        try:
+            for old_script in scripts.findScripts("OctoGlobalPrivacyControl"):
+                scripts.remove(old_script)
+        except Exception:
+            pass
+        if not self.settings.gpc_enabled:
+            return
+        script = QWebEngineScript()
+        script.setName("OctoGlobalPrivacyControl")
+        script.setSourceCode(
+            "try { Object.defineProperty(Navigator.prototype, 'globalPrivacyControl', "
+            "{ get: () => true, configurable: true }); } catch (_error) {}"
+        )
+        script.setRunsOnSubFrames(True)
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        try:
+            script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        except AttributeError:
+            script.setWorldId(0)
+        scripts.insert(script)
+
+    def apply_cookie_policy(self, profile: QWebEngineProfile) -> None:
+        block_third_party = self.settings.block_third_party_cookies
+        profile.cookieStore().setCookieFilter(
+            lambda request, block=block_third_party: not (block and request.thirdParty)
+        )
+
     def apply_privacy_settings(self) -> None:
         """Push the current privacy toggles into the always-installed interceptor."""
         self.request_interceptor.ad_block_enabled = self.ad_block_enabled
         self.request_interceptor.https_only = self.settings.https_only
         self.request_interceptor.gpc_enabled = self.settings.gpc_enabled
+        self.request_interceptor.dnt_enabled = self.settings.dnt_enabled
+        self.install_privacy_script(self.profile)
+        self.apply_cookie_policy(self.profile)
+        if self.private_profile is not None:
+            self.install_privacy_script(self.private_profile)
+            self.apply_cookie_policy(self.private_profile)
 
     def reload_filter_lists(self) -> None:
         """Parse every cached filter list off the UI thread."""
@@ -2343,6 +2726,7 @@ code, pre {{
         is_private = self.incognito_mode if private is None else private
         browser = QWebEngineView()
         browser.setProperty("private", is_private)
+        browser.setProperty("pinned", False)
         browser.setPage(OctoWebPage(self, self.profile_for_tab(is_private), is_private, browser))
         browser.load(url)
 
@@ -2386,26 +2770,33 @@ code, pre {{
         return urls[:12]
 
     def is_internal_url(self, url: str) -> bool:
-        return (
-            not url
-            or url.startswith("about:")
-            or url.startswith("data:")
-            or "octobrowse.local" in url
-        )
+        return classify_internal_url(url)
 
     def update_tab_title(self, browser: QWebEngineView, title: str) -> None:
         index = self.tabs.indexOf(browser)
         if index == -1:
             return
         cleaned = title.strip() or "New Tab"
+        browser.setProperty("raw_title", cleaned)
         if browser.property("private"):
             cleaned = f"Private - {cleaned}"
+        if browser.property("pinned"):
+            cleaned = f"📌 {cleaned}"
         if len(cleaned) > 32:
             cleaned = f"{cleaned[:29]}..."
         self.tabs.setTabText(index, cleaned)
         self.tabs.setTabToolTip(index, browser.url().toString())
         if not browser.property("private"):
             self.update_history_title(browser.url().toString(), title)
+
+    def toggle_pin_current_tab(self) -> None:
+        browser = self.current_browser()
+        if browser is None:
+            return
+        pinned = not bool(browser.property("pinned"))
+        browser.setProperty("pinned", pinned)
+        self.update_tab_title(browser, str(browser.property("raw_title") or browser.page().title()))
+        self.set_status("Pinned tab; automatic hibernation disabled" if pinned else "Unpinned tab")
 
     def close_tab(self, index: int) -> None:
         widget = self.tabs.widget(index)
@@ -2509,6 +2900,8 @@ code, pre {{
             "audit": self.open_feature_audit,
             "library": self.open_library_search,
             "search": self.open_library_search,
+            "workspaces": self.open_workspace_manager,
+            "workspace": self.open_workspace_manager,
             "downloads": lambda: self.toggle_panel(self.downloads_sidebar),
             "history": lambda: self.toggle_panel(self.history_sidebar),
             "bookmarks": self.toggle_bookmarks,
@@ -2602,9 +2995,25 @@ code, pre {{
             return None
         return QUrl(bangs[command].format(query=quote_plus(query.strip())))
 
-    def add_html_tab(self, html_text: str, title: str, private: bool = False) -> None:
+    def add_html_tab(
+        self,
+        html_text: str,
+        title: str,
+        private: bool = False,
+        internal_page: str | None = None,
+    ) -> None:
+        if internal_page:
+            for index in range(self.tabs.count()):
+                existing = self.tabs.widget(index)
+                if isinstance(existing, QWebEngineView) and existing.property("internal_page") == internal_page:
+                    existing.setHtml(html_text, QUrl("https://octobrowse.local/"))
+                    self.tabs.setTabText(index, title)
+                    self.tabs.setCurrentIndex(index)
+                    return
         browser = QWebEngineView()
         browser.setProperty("private", private)
+        browser.setProperty("pinned", False)
+        browser.setProperty("internal_page", internal_page or "")
         browser.setPage(OctoWebPage(self, self.profile_for_tab(private), private, browser))
         browser.setHtml(html_text, QUrl("https://octobrowse.local/"))
         index = self.tabs.addTab(browser, title)
@@ -2613,7 +3022,9 @@ code, pre {{
         self.update_status_badges()
 
     def open_dashboard(self) -> None:
-        self.add_html_tab(self.build_dashboard_html(), "Dashboard", private=False)
+        self.add_html_tab(
+            self.build_dashboard_html(), "Dashboard", private=False, internal_page="dashboard"
+        )
 
     def build_dashboard_html(self) -> str:
         history_links = self._dashboard_links(self.history[-8:])
@@ -2624,9 +3035,10 @@ code, pre {{
         blocked = self.request_interceptor.total_blocked()
         downloads_count = len(self.downloads)
         saved_tabs_count = len(self.session_tabs)
+        workspace_count = len(self.workspaces)
         weather = html.escape(self.weather_widget.text() if hasattr(self, "weather_widget") else "Weather unavailable")
         browser_identity = html.escape(
-            f"OctoBrowse {OCTO_BROWSER_VERSION} · Chromium {qWebEngineChromiumVersion()}"
+            f"OctoBrowse {OCTO_BROWSER_VERSION} | Chromium {qWebEngineChromiumVersion()}"
         )
         return f"""<!doctype html>
 <html>
@@ -2647,7 +3059,7 @@ main {{
 }}
 h1 {{ margin: 0 0 6px; font-size: 38px; }}
 .sub {{ color: #536174; margin-bottom: 24px; }}
-.grid {{ display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 14px; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 14px; }}
 .actions {{ margin-top: 16px; display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 12px; }}
 .metric, .panel, .action {{
   background: #ffffff;
@@ -2683,12 +3095,14 @@ li {{ margin: 8px 0; }}
     <a class="metric" href="octo:features">Features<strong>{sum(len(items) for items in self.feature_catalog().values())}</strong></a>
     <a class="metric" href="octo:reading">Reading<strong>{reading_count}</strong></a>
     <a class="metric" href="octo:tabs">Saved Tabs<strong>{saved_tabs_count}</strong></a>
+    <a class="metric" href="octo:workspaces">Workspaces<strong>{workspace_count}</strong></a>
   </section>
   <section class="actions">
     <a class="action" href="octo:features"><strong>Feature Audit</strong><span>Verify the old and new capability set.</span></a>
     <a class="action" href="octo:library"><strong>Library Search</strong><span>Search tabs, history, bookmarks, notes, and tasks.</span></a>
+    <a class="action" href="octo:workspaces"><strong>Research Workspaces</strong><span>Save, restore, and export named tab sets.</span></a>
     <a class="action" href="octo:identity"><strong>Browser Identity</strong><span>Inspect Octo Browser user agent and navigator values.</span></a>
-    <a class="action" href="octo:tabs"><strong>Tab Overview</strong><span>Review every open standard and private tab.</span></a>
+    <a class="action" href="octo:tabs"><strong>Tab Overview</strong><span>Review ordinary tabs without exposing private browsing.</span></a>
     <a class="action" href="octo:downloads"><strong>Downloads</strong><span>Open download progress and completed files.</span></a>
     <a class="action" href="octo:settings"><strong>Settings</strong><span>Manage homepage, keys, model, weather, and news.</span></a>
   </section>
@@ -2931,18 +3345,55 @@ p {{ margin: 0 0 20px; }}
         QMessageBox.information(self, "History Cleared", "Browsing history has been cleared.")
 
     def clear_browser_data(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Clear Browser Data",
+            "Clear browsing history, cookies, HTTP cache, visited-link state, saved site "
+            "permissions, per-site controls, and active-tab web storage?\n\n"
+            "Bookmarks, notes, workspaces, and downloaded files are kept.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
         self.history.clear()
         self._history_index.clear()
         self.history_sidebar.clear()
         self.history_db.clear()
-        self.profile.clearHttpCache()
-        self.profile.cookieStore().deleteAllCookies()
+        profiles = [self.profile]
         if self.private_profile is not None:
-            self.private_profile.clearHttpCache()
-            self.private_profile.cookieStore().deleteAllCookies()
+            profiles.append(self.private_profile)
+        for profile in profiles:
+            profile.clearHttpCache()
+            profile.cookieStore().deleteAllCookies()
+            profile.clearAllVisitedLinks()
+            try:
+                for permission in profile.listAllPermissions():
+                    permission.reset()
+            except Exception:
+                pass
+        clear_storage = """
+            try { localStorage.clear(); } catch (_error) {}
+            try { sessionStorage.clear(); } catch (_error) {}
+            try {
+              if (indexedDB.databases) {
+                indexedDB.databases().then(items => items.forEach(item => item.name && indexedDB.deleteDatabase(item.name)));
+              }
+            } catch (_error) {}
+        """
+        for index in range(self.tabs.count()):
+            widget = self.tabs.widget(index)
+            if isinstance(widget, QWebEngineView):
+                widget.page().runJavaScript(clear_storage)
+        self.site_permissions.clear()
+        self.site_content.clear()
         self.request_interceptor.reset_stats()
         self.save_settings()
-        QMessageBox.information(self, "Browser Data", "History, cookies, cache, and privacy stats were cleared.")
+        QMessageBox.information(
+            self,
+            "Browser Data",
+            "History, cookies, cache, site permissions, active-site storage, and privacy stats were cleared.",
+        )
 
     def update_progress_bar(self, progress: int, browser: QWebEngineView) -> None:
         if browser == self.current_browser():
@@ -3184,6 +3635,8 @@ p {{ margin: 0 0 20px; }}
             f"HTTPS-only mode: {'on' if self.settings.https_only else 'off'}",
             f"HTTPS upgrades this session: {self.request_interceptor.https_upgrades}",
             f"Global Privacy Control: {'on' if self.settings.gpc_enabled else 'off'}",
+            f"Legacy Do Not Track: {'on' if self.settings.dnt_enabled else 'off'}",
+            f"Third-party cookies/storage: {'blocked' if self.settings.block_third_party_cookies else 'allowed'}",
             f"Saved site permissions: {sum(len(features) for features in self.site_permissions.values())}",
             f"History entries: {len(self.history)}",
             f"Bookmarks: {len(self.bookmarks)}",
@@ -3198,8 +3651,28 @@ p {{ margin: 0 0 20px; }}
         if not self.ensure_openai_key():
             return
         browser = self.current_browser()
-        if browser:
-            browser.page().toPlainText(lambda text: self.generate_summary(text[:8000]))
+        if browser and self.confirm_cloud_ai(browser):
+            title = browser.page().title() or self.tabs.tabText(self.tabs.currentIndex())
+            url = browser.url().toString()
+            self.set_status("Preparing cited page summary...")
+            browser.page().toPlainText(
+                lambda text, title=title, url=url: self.generate_summary(text, title, url)
+            )
+
+    def confirm_cloud_ai(self, browser: QWebEngineView) -> bool:
+        """Require explicit consent before private-page text leaves the device."""
+        if not browser.property("private"):
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Send Private Page to OpenAI?",
+            "This is a private tab. OctoBrowse normally keeps its content isolated.\n\n"
+            f"Send readable text from:\n{browser.url().toString()}\n\n"
+            "The request is made with API response storage disabled.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def ensure_openai_key(self) -> bool:
         if self.openai_api_key:
@@ -3213,60 +3686,122 @@ p {{ margin: 0 0 20px; }}
         self.save_settings()
         return True
 
-    def generate_summary(self, text: str) -> None:
-        text = text.strip()
-        if not text:
+    def generate_summary(self, text: str, title: str, url: str) -> None:
+        chunks = split_page_text(text, title=title, url=url)
+        if not chunks:
             QMessageBox.information(self, "Summary", "There is no readable text on this page.")
             return
-        messages = [
-            {
-                "role": "developer",
-                "content": "Summarize browser page text clearly. Keep it concise, factual, and useful.",
-            },
-            {
-                "role": "user",
-                "content": f"Summarize this page in five bullets and include one suggested next action:\n\n{text}",
-            },
-        ]
-        self.start_openai_worker("summary", messages, max_output_tokens=260)
+        prompt = build_summary_prompt(chunks)
+        self.start_openai_worker(
+            "summary", prompt, max_output_tokens=520, source_url=url, source_title=title
+        )
 
     def open_chatbot(self) -> None:
-        self.chat_mode = True
-        self.open_panel(self.notes_sidebar, status="Page chat mode")
-        self.notes_sidebar.append("Ask about the current page on a new line, then press Enter.\n")
+        if not self.ensure_openai_key():
+            return
+        existing = getattr(self, "page_chat_dialog", None)
+        try:
+            if existing is not None and existing.isVisible():
+                existing.raise_()
+                existing.activateWindow()
+                return
+        except RuntimeError:
+            pass
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Ask About This Page")
+        dialog.resize(720, 560)
+        dialog.setModal(False)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(
+            QLabel(
+                "Answers use query-relevant page excerpts and cite their source labels. "
+                "Web-page instructions are treated as untrusted text."
+            )
+        )
+        output = QPlainTextEdit()
+        output.setReadOnly(True)
+        output.setPlaceholderText("Ask a question about the current tab...")
+        layout.addWidget(output)
+        input_row = QHBoxLayout()
+        question = QLineEdit()
+        question.setPlaceholderText("What does this page say about…?")
+        ask_button = QPushButton("Ask")
+        input_row.addWidget(question, 1)
+        input_row.addWidget(ask_button)
+        layout.addLayout(input_row)
+
+        def submit() -> None:
+            query = question.text().strip()
+            if not query:
+                return
+            output.appendPlainText(f"You: {query}\n")
+            question.clear()
+            self.process_chatbot_query(query)
+
+        ask_button.clicked.connect(submit)
+        question.returnPressed.connect(submit)
+        self.page_chat_dialog = dialog
+        self.page_chat_output = output
+        dialog.destroyed.connect(lambda: self.clear_page_chat_dialog(dialog))
+        dialog.show()
+        question.setFocus()
+
+    def clear_page_chat_dialog(self, dialog: QDialog) -> None:
+        if getattr(self, "page_chat_dialog", None) is dialog:
+            self.page_chat_dialog = None
+            self.page_chat_output = None
 
     def process_chatbot_query(self, query: str) -> None:
         query = query.strip()
         if not query or not self.ensure_openai_key():
             return
         browser = self.current_browser()
-        if browser:
-            browser.page().toPlainText(lambda text: self.generate_chatbot_response(query, text[:8000]))
+        if browser and self.confirm_cloud_ai(browser):
+            title = browser.page().title() or self.tabs.tabText(self.tabs.currentIndex())
+            url = browser.url().toString()
+            output = getattr(self, "page_chat_output", None)
+            if output is not None:
+                output.appendPlainText("OctoBrowse: selecting relevant source passages...\n")
+            browser.page().toPlainText(
+                lambda text, query=query, title=title, url=url: self.generate_chatbot_response(
+                    query, text, title, url
+                )
+            )
 
-    def generate_chatbot_response(self, query: str, page_text: str) -> None:
-        messages = [
-            {
-                "role": "developer",
-                "content": "Answer questions about the current browser page. Say when the page text is insufficient.",
-            },
-            {
-                "role": "user",
-                "content": f"Page text:\n{page_text}\n\nQuestion: {query}",
-            },
-        ]
-        self.start_openai_worker("chat", messages, max_output_tokens=320)
+    def generate_chatbot_response(self, query: str, page_text: str, title: str, url: str) -> None:
+        chunks = split_page_text(page_text, title=title, url=url)
+        if not chunks:
+            output = getattr(self, "page_chat_output", None)
+            if output is not None:
+                output.appendPlainText("OctoBrowse: no readable page text was found.\n")
+            return
+        prompt = build_qa_prompt(chunks, query)
+        self.start_openai_worker(
+            "chat", prompt, max_output_tokens=640, source_url=url, source_title=title
+        )
 
     def start_openai_worker(
         self,
         task: str,
-        messages: list[dict[str, str]],
+        prompt: dict[str, str],
         max_output_tokens: int,
+        source_url: str = "",
+        source_title: str = "",
     ) -> None:
+        task_id = f"{task}:{time.time_ns()}"
+        self.ai_task_metadata[task_id] = {
+            "kind": task,
+            "source_url": source_url,
+            "source_title": source_title,
+        }
         worker = OpenAIWorker(
-            task=task,
+            task=task_id,
             api_key=self.openai_api_key,
             model=self.settings.openai_model or DEFAULT_OPENAI_MODEL,
-            messages=messages,
+            instructions=prompt["instructions"],
+            input_text=prompt["input"],
             max_output_tokens=max_output_tokens,
             parent=self,
         )
@@ -3274,6 +3809,7 @@ p {{ margin: 0 0 20px; }}
         worker.failed.connect(self.handle_openai_error)
         worker.finished.connect(lambda worker=worker: self.cleanup_ai_worker(worker))
         self.ai_workers.append(worker)
+        self.set_status("Waiting for grounded AI response...")
         worker.start()
 
     def cleanup_ai_worker(self, worker: OpenAIWorker) -> None:
@@ -3281,17 +3817,54 @@ p {{ margin: 0 0 20px; }}
             self.ai_workers.remove(worker)
 
     def handle_openai_result(self, task: str, text: str) -> None:
-        if task == "chat":
-            self.notes_sidebar.append(f"\nAI:\n{text}\n")
+        metadata = self.ai_task_metadata.pop(task, {})
+        kind = metadata.get("kind") or task.split(":", 1)[0]
+        if kind == "chat":
+            output = getattr(self, "page_chat_output", None)
+            if output is not None:
+                output.appendPlainText(f"AI:\n{text}\n")
         else:
-            QMessageBox.information(self, "Summary", text)
+            self.show_ai_summary(text, metadata.get("source_url", ""))
+        self.set_status("AI response complete")
+
+    def show_ai_summary(self, text: str, source_url: str = "") -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Cited Page Summary")
+        dialog.resize(700, 520)
+        layout = QVBoxLayout(dialog)
+        output = QPlainTextEdit(text)
+        output.setReadOnly(True)
+        layout.addWidget(output)
+        buttons = QHBoxLayout()
+        copy_button = QPushButton("Copy")
+        note_button = QPushButton("Save as Note")
+        close_button = QPushButton("Close")
+        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(text))
+
+        def save_note() -> None:
+            url = source_url or "ai-summary"
+            self.notes.append({"url": url, "note": text[:12_000]})
+            self.notes_sidebar.append(f"Note for {url}:\n{text}\n")
+            self.save_settings()
+            self.set_status("Saved AI summary as note")
+            dialog.accept()
+
+        note_button.clicked.connect(save_note)
+        close_button.clicked.connect(dialog.accept)
+        for button in (copy_button, note_button, close_button):
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        dialog.exec()
 
     def handle_openai_error(self, task: str, error: str) -> None:
-        target = self.notes_sidebar if task == "chat" else None
-        if target is not None:
-            target.append(f"\nAI error: {error}\n")
+        metadata = self.ai_task_metadata.pop(task, {})
+        kind = metadata.get("kind") or task.split(":", 1)[0]
+        output = getattr(self, "page_chat_output", None) if kind == "chat" else None
+        if output is not None:
+            output.appendPlainText(f"AI error: {error}\n")
         else:
-            QMessageBox.critical(self, "OpenAI", f"Failed to generate summary: {error}")
+            QMessageBox.critical(self, "OpenAI", f"AI request failed: {error}")
+        self.set_status("AI request failed")
 
     def voice_command(self) -> None:
         if sr is None or self.voice_recognizer is None:
@@ -3448,6 +4021,14 @@ p {{ margin: 0 0 20px; }}
         item.setToolTip(str(target))
         item.setData(DOWNLOAD_PATH_ROLE, str(target))
         item.setData(DOWNLOAD_REQUEST_ROLE, download)
+        try:
+            private_download = bool(
+                self.private_profile is not None
+                and download.page().profile() is self.private_profile
+            )
+        except Exception:
+            private_download = False
+        item.setData(DOWNLOAD_PRIVATE_ROLE, private_download)
         self.downloads_sidebar.addItem(item)
         self.open_panel(self.downloads_sidebar, status=f"Downloading {target.name}")
         self.downloads.append({"file": str(target), "status": "downloading"})
@@ -3488,19 +4069,22 @@ p {{ margin: 0 0 20px; }}
             finished_status = "failed"
         if finished_status is not None:
             item.setData(DOWNLOAD_REQUEST_ROLE, None)
+            file_path = str(item.data(DOWNLOAD_PATH_ROLE) or filename)
+            self.downloads = [record for record in self.downloads if record.get("file") != file_path]
             try:
                 source_url = download.url().toString()
             except Exception:
                 source_url = ""
-            self.downloads_history.append(
-                {
-                    "file": str(item.data(DOWNLOAD_PATH_ROLE) or filename),
-                    "url": source_url,
-                    "status": finished_status,
-                    "time": time.time(),
-                }
-            )
-            self.downloads_history = self.downloads_history[-100:]
+            if not item.data(DOWNLOAD_PRIVATE_ROLE):
+                self.downloads_history.append(
+                    {
+                        "file": file_path,
+                        "url": source_url,
+                        "status": finished_status,
+                        "time": time.time(),
+                    }
+                )
+                self.downloads_history = self.downloads_history[-100:]
             self.save_settings()
 
     def show_downloads_context_menu(self, position: Any) -> None:
@@ -3598,7 +4182,7 @@ p {{ margin: 0 0 20px; }}
             widget = self.tabs.widget(index)
             if not isinstance(widget, QWebEngineView) or widget is current:
                 continue
-            if self.is_internal_url(widget.url().toString()):
+            if self.is_internal_url(widget.url().toString()) or widget.property("pinned"):
                 continue
             last_active = float(widget.property("last_active") or 0)
             if now - last_active < threshold:
@@ -3608,6 +4192,10 @@ p {{ margin: 0 0 20px; }}
                 if page.recentlyAudible():
                     continue
                 if page.lifecycleState() != QWebEnginePage.LifecycleState.Active:
+                    continue
+                # Qt accounts for active media, downloads, notifications, and
+                # partially completed forms when calculating this safe limit.
+                if page.recommendedState() != QWebEnginePage.LifecycleState.Discarded:
                     continue
                 page.setLifecycleState(QWebEnginePage.LifecycleState.Discarded)
                 hibernated += 1
@@ -3839,7 +4427,9 @@ p {{ margin: 0 0 20px; }}
             f"Plugin '{name}' requests these permissions:\n\n"
             + "\n".join(prompt_lines or ["  - (none)"])
             + changed_note
-            + "\n\nGrant them and run the plugin?",
+            + "\n\nPython code is not safely sandboxable in-process. These grants document "
+            "intended API use, but the plugin has the same local account access as OctoBrowse. "
+            "Only continue for code you trust.\n\nGrant and run?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -3850,7 +4440,21 @@ p {{ margin: 0 0 20px; }}
         self.save_settings()
         return approved
 
+    def ensure_python_automation_enabled(self) -> bool:
+        if self.settings.python_automation_enabled:
+            return True
+        QMessageBox.warning(
+            self,
+            "Trusted Python Automation Disabled",
+            "Python plugins and extension code have full access to your local account and cannot "
+            "be made into a security sandbox inside OctoBrowse.\n\nEnable Developer Mode in "
+            "Settings only if you intend to run code you trust.",
+        )
+        return False
+
     def run_plugin_file(self, path: Path) -> None:
+        if not self.ensure_python_automation_enabled():
+            return
         manifest = self._read_plugin_manifest(path)
         if manifest is None:
             QMessageBox.critical(self, "Plugins", f"{path.name} has no valid MANIFEST.")
@@ -3917,7 +4521,8 @@ p {{ margin: 0 0 20px; }}
         layout.addWidget(
             QLabel(
                 "Plugins are Python files with a MANIFEST and an activate(api) entry point.\n"
-                "They run with restricted builtins and only the permissions you grant."
+                "They are trusted automation, not sandboxed extensions. Developer Mode must be enabled; "
+                "declared permissions document intended API use but cannot restrict arbitrary Python."
             )
         )
         plugin_list = QListWidget()
@@ -4059,10 +4664,20 @@ p {{ margin: 0 0 20px; }}
             mute_action.triggered.connect(self.toggle_mute_current_tab)
             menu.addAction(mute_action)
 
+            pin_action = QAction(
+                "Unpin Tab" if browser.property("pinned") else "Pin Tab (keep active)", self
+            )
+            pin_action.triggered.connect(self.toggle_pin_current_tab)
+            menu.addAction(pin_action)
+
         close_action = QAction("Close Tab", self)
         close_action.triggered.connect(lambda: self.close_tab(self.tabs.currentIndex()))
         menu.addAction(close_action)
         menu.addSeparator()
+
+        workspace_action = QAction("Save All Tabs as Workspace...", self)
+        workspace_action.triggered.connect(self.save_current_workspace)
+        menu.addAction(workspace_action)
 
         save_action = QAction("Save Page As...", self)
         save_action.triggered.connect(self.save_page)
@@ -4184,6 +4799,8 @@ p {{ margin: 0 0 20px; }}
         self.toggle_panel(self.extension_tab)
 
     def run_extension(self) -> None:
+        if not self.ensure_python_automation_enabled():
+            return
         code = self.extension_tab.toPlainText().strip()
         if not code:
             return
@@ -4206,6 +4823,8 @@ p {{ margin: 0 0 20px; }}
             QMessageBox.critical(self, "Extension", f"Failed to run extension: {exc}")
 
     def run_trusted_extension(self) -> None:
+        if not self.ensure_python_automation_enabled():
+            return
         code = self.extension_tab.toPlainText().strip()
         if not code:
             return
@@ -4409,9 +5028,7 @@ p {{ margin: 0 0 20px; }}
     def save_settings(self) -> None:
         self.settings.openai_api_key = self.openai_api_key
         self.settings.ad_block_enabled = self.ad_block_enabled
-        session_tabs = self.get_session_tabs()
-        if session_tabs:
-            self.session_tabs = session_tabs
+        self.session_tabs = self.get_session_tabs()
         try:
             self.store.save(
                 self.settings,
@@ -4424,6 +5041,7 @@ p {{ margin: 0 0 20px; }}
                 self.site_content,
                 self.downloads_history,
                 self.plugin_grants,
+                self.workspaces,
             )
         except OSError as exc:
             QMessageBox.warning(self, "Settings", f"Could not save settings: {exc}")
@@ -4475,10 +5093,22 @@ p {{ margin: 0 0 20px; }}
 
     def closeEvent(self, event: Any) -> None:
         self.hibernation_timer.stop()
+        self.session_autosave_timer.stop()
+        workers = list(self.network_workers) + list(self.ai_workers) + list(self.filter_workers)
+        running = [worker for worker in workers if worker.isRunning()]
+        if running:
+            event.ignore()
+            if not getattr(self, "shutting_down", False):
+                self.shutting_down = True
+                self.setEnabled(False)
+                self.set_status("Finishing background work before closing safely...")
+                for worker in running:
+                    worker.requestInterruption()
+                    worker.blockSignals(True)
+            QTimer.singleShot(250, self.close)
+            return
         self.save_settings()
         self.history_db.close()
-        for worker in list(self.network_workers) + list(self.ai_workers) + list(self.filter_workers):
-            worker.wait(300)
         super().closeEvent(event)
 
 

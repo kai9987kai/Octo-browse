@@ -5,7 +5,7 @@
 ; an Add/Remove Programs entry. Installs per-user (no admin prompt).
 
 #ifndef MyAppVersion
-  #define MyAppVersion "3.1"
+  #define MyAppVersion "3.2"
 #endif
 #define MyAppName "OctoBrowse"
 #define MyAppPublisher "OctoBrowse"

@@ -3,8 +3,9 @@
 Octo-browse is an experimental Python + PyQt6/QtWebEngine desktop browser. It
 combines a normal tabbed browser surface with power tools for notes, history,
 bookmarks, page source, page saving, ad blocking, private tabs, page upscaling,
-text-to-speech, voice commands, AI page summarisation, weather/news side panels,
-a session password scratchpad, and a constrained extension lab.
+text-to-speech, voice commands, cited AI page research, weather/news side panels,
+named research workspaces, a session password scratchpad, and opt-in trusted
+Python automation.
 
 ## Entry points
 
@@ -16,14 +17,20 @@ a session password scratchpad, and a constrained extension lab.
 
 - Tabbed browsing with movable/closable tabs, dynamic page titles, Ctrl+Tab /
   Ctrl+1-9 tab navigation, and per-tab audio mute.
-- Background-tab hibernation: idle tabs are discarded through Chromium's page
-  lifecycle API to reclaim memory and reload automatically when reselected.
+- Activity-safe background-tab hibernation uses Qt's recommended lifecycle
+  state, skips pinned tabs and pages with active content or forms, and reloads
+  discarded tabs automatically when reselected.
+- Named Research Workspaces save ordinary tabs, order, active position, and
+  pinned state; workspaces can be reopened alongside the current session,
+  restored as a replacement, searched from Library Search, or exported as
+  Markdown. Private tabs are never captured.
 - Frecency-ranked address suggestions (Mozilla-style visit-count x recency
   scoring) backed by titled history entries with visit counts and timestamps.
 - Configurable default search engine: Google, DuckDuckGo, Bing, Brave, or
   Startpage.
-- HTTPS-only mode that upgrades http:// page loads, plus Global Privacy
-  Control (Sec-GPC) and DNT request headers.
+- HTTPS-only mode, Global Privacy Control through both `Sec-GPC` and
+  `navigator.globalPrivacyControl`, optional legacy DNT, and an optional strict
+  third-party cookie/storage filter.
 - Per-site permission prompts (camera, microphone, location, notifications)
   with remembered decisions and a Site Permissions manager (`octo:permissions`).
 - Connection security badge, find-in-page match counter, HTML5 fullscreen for
@@ -41,8 +48,8 @@ a session password scratchpad, and a constrained extension lab.
 - Smart address commands: `octo:dashboard`, `octo:identity`, `octo:tabs`,
   `octo:features`, `octo:library`, `octo:downloads`, `octo:reading`,
   `octo:history`, `octo:bookmarks`, `octo:todos`, `octo:notes`,
-  `octo:permissions`, plus bang searches like `!yt`, `!gh`, `!w`, `!maps`,
-  `!news`, `!pypi`, and `!mdn`.
+  `octo:permissions`, `octo:workspaces`, plus bang searches like `!yt`, `!gh`,
+  `!w`, `!maps`, `!news`, `!pypi`, and `!mdn`.
 - Address-bar autocomplete for Octo commands, bang searches, history,
   bookmarks, and reading list items.
 - Standard and private tabs. Private tabs use a separate off-the-record
@@ -50,18 +57,17 @@ a session password scratchpad, and a constrained extension lab.
 - Ad and tracker blocking through `QWebEngineUrlRequestInterceptor`, with
   O(host-labels) suffix matching, an expanded tracker domain list, and an
   in-session privacy report covering blocks and HTTPS upgrades.
-- EasyList-compatible filter list support: `||domain^` rules, `@@` exceptions,
-  hosts-file lines, and wildcard/separator path patterns indexed by literal
-  token (uBlock Origin-style) so per-request matching stays fast. Lists load
-  from Tools > Update EasyList or any imported Adblock-format file, and the
-  cached EasyList refreshes itself weekly.
+- EasyList-compatible filter list support: `||domain^` rules, path-level `@@`
+  exceptions, hosts-file lines, wildcard/separator patterns, resource-type
+  options, inverse types, and first/third-party constraints. Literal-token
+  indexing keeps matching fast. Lists load from Tools > Update EasyList or an
+  imported Adblock-format file and refresh weekly.
 - Cosmetic element-hiding rules (`##selector`, generic and per-domain) are
   injected into pages as chunked CSS when ad blocking is on.
-- Permissioned plugin API: plugins are Python files with a `MANIFEST` dict and
-  an `activate(api)` entry point, installed through Tools > Plugin Manager
-  (`octo:plugins`). Each plugin declares permissions (tabs, navigation, page,
-  history, bookmarks, notes, ui, clipboard, network); you approve them on
-  first run, grants persist, and every API call is permission-checked. See
+- Trusted Python automation API: plugins are Python files with a `MANIFEST`
+  and `activate(api)` entry point. Declared capabilities document intended API
+  use, but arbitrary Python cannot be sandboxed in-process. Execution is off by
+  default and requires explicit Developer Mode; only run code you trust. See
   `examples/page_word_count.py`.
 - SQLite-backed browsing history (one upsert per visit instead of rewriting a
   JSON blob), with automatic migration from the old format.
@@ -69,10 +75,11 @@ a session password scratchpad, and a constrained extension lab.
   persistent download history.
 - Per-site content controls: disable JavaScript or image loading for chosen
   sites (Tools > Site Controls).
-- Persistent settings, bookmarks, notes, and todos stored as JSON under the
-  platform app-data directory (history lives in `history.sqlite` next to it),
-  with migration from the old `octobrowse_settings.json` file if it exists.
-- Session restore for standard tabs from the previous run.
+- Persistent settings, workspaces, bookmarks, notes, and todos stored as JSON
+  under the platform app-data directory (history lives in `history.sqlite`);
+  API keys use the OS credential vault through `keyring` when available.
+- Crash-resilient session restore for standard tabs with an atomic 30-second
+  autosave. Closing all ordinary tabs now persists an empty session correctly.
 - Reopen recently closed tabs with `Ctrl+Shift+T`.
 - Download handling with a save prompt, progress state, and downloads panel.
 - Persistent reading list panel for pages to revisit later.
@@ -85,15 +92,16 @@ a session password scratchpad, and a constrained extension lab.
   zoom controls,
   duplicate tab, copy URL, copy Markdown link, tab overview, browser identity,
   site info, custom user agent, themes, and fullscreen.
-- Octo Browser identity is applied through the HTTP user agent and injected
-  `navigator` values so browser-check pages can see `OctoBrowser`.
-- Optional OpenAI page summarisation and page Q&A through the current OpenAI
-  Responses API.
+- Native Qt WebEngine identity avoids contradictory User-Agent and Client Hint
+  spoofing; the identity page reports the actual Chromium runtime and security
+  patch base. A custom User-Agent remains available for compatibility testing.
+- Optional OpenAI summaries and page Q&A select relevant labelled excerpts,
+  require evidence citations, isolate untrusted page instructions, set
+  `store=False`, and require per-use consent before sending private-tab text.
 - Optional weather and news fetches run off the UI thread, with timeouts.
-- Extension lab executes code in a constrained namespace with `browser`,
-  `current_tab`, and a small safe builtins set instead of full process globals.
-- A separate trusted extension action preserves the original full Python
-  execution behavior behind an explicit warning.
+- Python automation is treated as trusted local code. A reduced-builtins path
+  helps prevent accidents, while the full-access path retains an explicit
+  warning; neither path is presented as a security sandbox.
 
 ## Requirements
 
@@ -174,46 +182,50 @@ before launching:
 
 ```bash
 OPENAI_API_KEY=...
-OCTOBROWSE_OPENAI_MODEL=gpt-5-mini
+OCTOBROWSE_OPENAI_MODEL=gpt-5.6-luna
 OPENWEATHER_API_KEY=...
 NEWS_API_KEY=...
 ```
 
-Settings entered in the app are stored as local JSON. Do not treat this as a
-secure vault for long-lived secrets.
+API keys entered in the app are stored in the operating-system credential
+vault through `keyring`. If no usable keyring backend exists, OctoBrowse falls
+back to the legacy JSON fields and the Settings dialog should not be treated as
+a secure vault on that system.
 
 ## Security notes
 
-- Plugins run in-process with restricted builtins and a permission-gated API
-  object instead of the raw browser. This is a strong guardrail against
-  accidents, not a hard security boundary - Python cannot be fully sandboxed
-  in-process, so only install plugins you trust.
-- The extension lab is intentionally constrained, but it still exposes the
-  running browser object. Run only code you understand.
+- Python plugins and the extension lab run in-process as trusted automation.
+  They are disabled by default behind Developer Mode. Manifest permissions and
+  reduced builtins are usability guardrails, not a security boundary.
 - The trusted extension action runs code with full Python access and should be
   treated like running a local script.
 - The session password scratchpad is in-memory only. It is not a persistent
   password manager.
 - Private tabs isolate browser profile storage for new private tabs, but this
   prototype should not be treated as a hardened privacy browser.
-- The filter engine implements a practical subset of the Adblock Plus syntax
-  (network rules); cosmetic rules and advanced options are skipped, so
-  coverage is below a full uBlock Origin.
+- The filter engine implements a practical subset of Adblock Plus syntax;
+  domain scoping and advanced procedural cosmetic rules are still skipped, so
+  coverage remains below a full uBlock Origin.
 
 ## Architecture map
 
 - `OctoBrowse(QMainWindow)`: main window, toolbars, tabs, sidebars, actions.
 - `OctoRequestInterceptor`: ad/tracker blocking, HTTPS-only upgrades, and
   Global Privacy Control headers with per-session stats.
-- `FilterRuleSet` / `FilterParseWorker`: EasyList-subset parsing (network and
-  cosmetic rules) with token-bucket indexing, run off the UI thread.
-- `OctoPluginAPI`: permission-checked capability object passed to plugins.
+- `octobrowse/filtering.py` / `FilterParseWorker`: testable EasyList-subset
+  parsing and indexed matching, parsed off the UI thread.
+- `octobrowse/ai_context.py`: source chunking, deterministic relevance
+  selection, citations, and untrusted-content prompt boundaries.
+- `octobrowse/workspaces.py`: versioned workspace validation and Markdown
+  export.
+- `octobrowse/urls.py`: exact internal URL trust-boundary classification.
+- `OctoPluginAPI`: intended-capability API passed to trusted Python automation.
 - `HistoryDatabase`: SQLite visit store (url, title, visit count, last visit)
   with legacy JSON import.
-- `SettingsStore`: JSON load/save, legacy settings migration, and
-  site-permission/content/download coercion.
+- `SettingsStore` / `CredentialStore`: atomic JSON state, malformed-data
+  recovery, legacy migration, and OS-keyring secret storage.
 - `ApiFetchWorker`: weather/news requests on a worker thread.
-- `OpenAIWorker`: page summarisation and page Q&A on a worker thread.
+- `OpenAIWorker`: bounded, non-stored Responses API calls on a worker thread.
 - `CommandPalette`: keyboard-first command discovery and execution.
 - `LibrarySearchDialog`: unified search across tabs and saved browser
   collections.
@@ -221,8 +233,18 @@ secure vault for long-lived secrets.
 
 ## Roadmap
 
-- Move bookmarks/notes/todos to SQLite alongside history.
+- Move bookmarks/notes/todos and captured article text to SQLite/FTS5.
 - Procedural cosmetic filters (`#?#`) and cosmetic exceptions (`#@#`).
-- Plugin lifecycle hooks (run on startup / on page load) and a curated
-  plugin gallery.
-- Granular per-permission approval in the plugin consent dialog.
+- Native Manifest V3 extension management on Qt 6.10+; keep Python automation
+  explicitly trusted.
+- Readability extraction, selection-anchored notes, and offline MHTML research
+  snapshots.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile main.py alpha.py
+```
+
+GitHub Actions runs the same regression suite on Python 3.10 and 3.13.

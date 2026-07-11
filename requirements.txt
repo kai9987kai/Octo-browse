@@ -2,6 +2,7 @@ PyQt6>=6.7
 PyQt6-WebEngine>=6.7
 cryptography>=42.0
 gTTS>=2.5
+keyring>=25.0
 openai>=1.99
 opencv-python>=4.9
 requests>=2.31

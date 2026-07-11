@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "3.1"
+    [string]$Version = "3.2"
 )
 
 # Builds release\OctoBrowse-<Version>-Setup.exe with Inno Setup from the

@@ -24,12 +24,14 @@ Please include:
 
 ## Known Prototype Risks
 
-- The extension lab runs user-provided Python in a constrained namespace, but
-  it is not a hardened sandbox.
+- Python plugins and the extension lab are trusted local automation, not a
+  sandbox. They are disabled by default behind an explicit Developer Mode.
 - The trusted extension action intentionally preserves the original prototype's
   full Python execution behavior. Treat it as local code execution.
-- Settings API keys are stored in local JSON when entered through the app.
+- API keys use the operating-system credential vault through `keyring` when a
+  backend is available. The app retains a JSON fallback for unsupported source
+  environments and reports this limitation in the README.
 - Private tabs use an off-the-record Qt profile, but the application has not
   undergone a full privacy/security audit.
-- The ad blocker is a small static blocklist and does not implement full
-  browser-grade filter rules.
+- The ad blocker implements a tested EasyList subset, including resource-type
+  and first/third-party semantics, but is not a full uBlock Origin replacement.

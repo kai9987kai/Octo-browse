@@ -1,8 +1,9 @@
 """Example OctoBrowse plugin: shows a word count for the current page.
 
 Install it via Tools > Plugin Manager > Install Plugin..., then run it.
-Plugins execute with restricted builtins and only the permissions granted
-through the `api` object; see PLUGIN_PERMISSIONS in main.py for the full list.
+Python plugins are trusted local automation and require Developer Mode.
+Manifest permissions document intended use of the `api` object; they are not a
+security sandbox. See PLUGIN_PERMISSIONS in main.py for the full list.
 """
 
 MANIFEST = {
