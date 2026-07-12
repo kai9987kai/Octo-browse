@@ -78,8 +78,10 @@ Python automation.
 - Persistent settings, workspaces, bookmarks, notes, and todos stored as JSON
   under the platform app-data directory (history lives in `history.sqlite`);
   API keys use the OS credential vault through `keyring` when available.
-- Crash-resilient session restore for standard tabs with an atomic 30-second
-  autosave. Closing all ordinary tabs now persists an empty session correctly.
+- Crash-resilient, versioned session restore preserves as many as 50 standard
+  tabs, including order, duplicate URLs, titles, pinned state, and the active
+  position, with an atomic 30-second autosave. Legacy URL-only sessions migrate
+  automatically and closing all ordinary tabs persists an empty session.
 - Reopen recently closed tabs with `Ctrl+Shift+T`.
 - Download handling with a save prompt, progress state, and downloads panel.
 - Persistent reading list panel for pages to revisit later.
@@ -113,7 +115,9 @@ Optional system/runtime notes:
 
 - Voice commands usually require a working microphone and PyAudio support for
   `SpeechRecognition`.
-- Text-to-speech uses `gTTS` and opens the generated audio file with the OS.
+- Text-to-speech uses the cloud-based `gTTS` service off the UI thread, opens
+  the generated audio with the OS, and removes its temporary file. Private-tab
+  text is sent only after confirmation on every use.
 - Weather needs an OpenWeather API key.
 - News needs a NewsAPI key.
 - AI features need an OpenAI API key.
@@ -150,22 +154,31 @@ The compatibility launcher still works:
 python alpha.py
 ```
 
-## Building a Windows installer
+## Building the Windows release
 
-The packaging scripts freeze the app and produce an installer
-(`release\OctoBrowse-<version>-Setup.exe`):
+The one-command release pipeline compiles and tests the source, builds both
+application formats, creates the Inno Setup installer, smoke-tests the frozen
+apps, checks embedded versions and QtWebEngine resources, and writes SHA-256
+checksums plus a JSON build manifest:
 
 ```powershell
-# 1. Freeze main.py with PyInstaller -> dist\OctoBrowse\OctoBrowse.exe
-powershell -ExecutionPolicy Bypass -File packaging\build_app.ps1
-
-# 2a. Preferred: Inno Setup installer (uninstaller, shortcuts, ARP entry).
-#     Needs Inno Setup:  winget install --id JRSoftware.InnoSetup
-powershell -ExecutionPolicy Bypass -File packaging\build_inno.ps1
-
-# 2b. Fallback: IExpress self-extractor (no Inno Setup required)
-powershell -ExecutionPolicy Bypass -File packaging\build_installer.ps1
+# Requires Inno Setup: winget install --id JRSoftware.InnoSetup
+powershell -NoProfile -ExecutionPolicy Bypass -File packaging\build_release.ps1
 ```
+
+The release outputs are:
+
+- `release\OctoBrowse-<version>.exe`: standalone portable x64 executable.
+- `release\OctoBrowse-<version>-Setup.exe`: per-user installer with shortcuts,
+  upgrade handling, Add/Remove Programs registration, and an uninstaller.
+- `release\SHA256SUMS.txt` and `release\build-manifest.json`: integrity and
+  provenance records.
+- `dist\OctoBrowse\OctoBrowse.exe`: onedir application used by the installer;
+  it requires the adjacent `_internal` folder and is not standalone.
+
+Individual stages remain available as `build_app.ps1`, `build_portable.ps1`,
+`build_inno.ps1`, and `verify_release.ps1`. The IExpress builder is retained as
+a clearly named fallback package when Inno Setup is unavailable.
 
 To publish a GitHub release (requires an authenticated `gh auth login`):
 
@@ -173,7 +186,9 @@ To publish a GitHub release (requires an authenticated `gh auth login`):
 powershell -ExecutionPolicy Bypass -File packaging\publish_release.ps1
 ```
 
-The frozen binary is unsigned, so SmartScreen warns on first run.
+The generated binaries are unsigned unless a code-signing certificate is added
+to the local release process, so Windows SmartScreen may warn on first run. The
+manifest records the Authenticode status rather than implying a signed build.
 
 ## Configuration
 
@@ -203,6 +218,8 @@ a secure vault on that system.
   password manager.
 - Private tabs isolate browser profile storage for new private tabs, but this
   prototype should not be treated as a hardened privacy browser.
+- Read Aloud uses Google Text-to-Speech. Standard pages are sent when the action
+  is invoked; private pages require an explicit confirmation every time.
 - The filter engine implements a practical subset of Adblock Plus syntax;
   domain scoping and advanced procedural cosmetic rules are still skipped, so
   coverage remains below a full uBlock Origin.

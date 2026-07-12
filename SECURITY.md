@@ -33,5 +33,10 @@ Please include:
   environments and reports this limitation in the README.
 - Private tabs use an off-the-record Qt profile, but the application has not
   undergone a full privacy/security audit.
+- Read Aloud uses the cloud-based Google Text-to-Speech service. Private-page
+  text requires confirmation on each use; generated audio is temporary.
+- Release binaries are not Authenticode-signed by default. Verify published
+  artifacts against `SHA256SUMS.txt`; SmartScreen trust requires a separately
+  configured signing certificate.
 - The ad blocker implements a tested EasyList subset, including resource-type
   and first/third-party semantics, but is not a full uBlock Origin replacement.

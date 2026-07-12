@@ -4,9 +4,8 @@ param(
     [switch]$SkipDependencyInstall
 )
 
-# Build the onedir application consumed by the Inno Setup installer.
-# Native command failures, stale output, architecture drift, missing
-# QtWebEngine resources, and version mismatches all fail the build.
+# Build a genuinely standalone, single-file Windows executable. The installer
+# uses the faster onedir build; this artifact is for portable use.
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -21,22 +20,24 @@ if (-not $SkipDependencyInstall) {
     Install-OctoBuildDependencies -Root $root -Python $Python
 }
 
-$distApp = Join-Path $root "dist\OctoBrowse"
-$workPath = Join-Path $root "build\pyinstaller-onedir"
-$specPath = Join-Path $root "build\pyinstaller-spec"
+$releaseDir = Join-Path $root "release"
+$outputExe = Join-Path $releaseDir "OctoBrowse-$Version.exe"
+$workPath = Join-Path $root "build\pyinstaller-onefile"
+$specPath = Join-Path $root "build\pyinstaller-portable-spec"
 $versionFile = Join-Path $root "build\version_info.txt"
-Remove-OctoBuildPath -Root $root -Path $distApp
+Remove-OctoBuildPath -Root $root -Path $outputExe
 Remove-OctoBuildPath -Root $root -Path $workPath
 Remove-OctoBuildPath -Root $root -Path $specPath
 Write-OctoVersionFile -Version $Version -Path $versionFile
+New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
 New-Item -ItemType Directory -Path $specPath -Force | Out-Null
 
 $arguments = @(
     "-m", "PyInstaller"
 ) + (Get-OctoPyInstallerArguments -Root $root -VersionFile $versionFile) + @(
-    "--onedir",
-    "--name", "OctoBrowse",
-    "--distpath", (Join-Path $root "dist"),
+    "--onefile",
+    "--name", "OctoBrowse-$Version",
+    "--distpath", $releaseDir,
     "--workpath", $workPath,
     "--specpath", $specPath,
     (Join-Path $root "main.py")
@@ -45,35 +46,23 @@ $arguments = @(
 $buildStarted = Get-Date
 Push-Location $root
 try {
-    Invoke-OctoPython -Python $Python -Arguments $arguments -Description "PyInstaller onedir build"
+    Invoke-OctoPython -Python $Python -Arguments $arguments -Description "PyInstaller onefile build"
 }
 finally {
     Pop-Location
 }
 
-$exe = Join-Path $distApp "OctoBrowse.exe"
-$item = Assert-OctoExecutableMetadata -Path $exe -Version $Version
+$item = Assert-OctoExecutableMetadata -Path $outputExe -Version $Version
 if ($item.LastWriteTime -lt $buildStarted) {
-    throw "Executable timestamp predates this build; refusing a stale artifact."
+    throw "Portable executable timestamp predates this build; refusing a stale artifact."
 }
 
-foreach ($requiredName in @("QtWebEngineProcess.exe", "qtwebengine_resources.pak", "icudtl.dat", "qt.conf")) {
-    $match = Get-ChildItem -LiteralPath $distApp -Recurse -File -Filter $requiredName |
-        Select-Object -First 1
-    if (-not $match) {
-        throw "Required QtWebEngine runtime file is missing: $requiredName"
-    }
-}
-
-$files = Get-ChildItem -LiteralPath $distApp -Recurse -File
-$size = ($files | Measure-Object -Property Length -Sum).Sum
 [pscustomobject]@{
     Version = $Version
     Architecture = $architecture
     Executable = $item.FullName
     FileVersion = $item.VersionInfo.FileVersion
     ProductVersion = $item.VersionInfo.ProductVersion
-    Files = $files.Count
-    SizeMB = [math]::Round($size / 1MB, 1)
+    SizeMB = [math]::Round($item.Length / 1MB, 1)
     SHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $item.FullName).Hash
 }

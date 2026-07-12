@@ -34,13 +34,10 @@ from octobrowse.filtering import (
     resource_type_name,
 )
 from octobrowse.ai_context import build_qa_prompt, build_summary_prompt, split_page_text
-from octobrowse.urls import is_internal_url as classify_internal_url
+from octobrowse.session import make_session_snapshot, normalize_session_snapshot
+from octobrowse.urls import can_dispatch_octo_command, is_internal_url as classify_internal_url
+from octobrowse.version import __version__
 from octobrowse.workspaces import make_workspace, normalize_workspaces, workspace_to_markdown
-
-try:
-    import cv2
-except ImportError:  # pragma: no cover - optional runtime feature
-    cv2 = None
 
 try:
     import requests
@@ -75,7 +72,7 @@ except ImportError:  # pragma: no cover - optional runtime feature
     sr = None
 
 from PyQt6.QtCore import QSize, QStandardPaths, QStringListModel, QThread, QTimer, QUrl, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QDesktopServices
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon
 from PyQt6.QtWebEngineCore import (
     QWebEnginePage,
     QWebEngineProfile,
@@ -197,7 +194,7 @@ EASYLIST_URL = "https://easylist.to/easylist/easylist.txt"
 DEFAULT_HOMEPAGE = "https://www.google.com"
 DEFAULT_OPENAI_MODEL = os.environ.get("OCTOBROWSE_OPENAI_MODEL", "gpt-5.6-luna")
 OCTO_BROWSER_NAME = "Octo Browser"
-OCTO_BROWSER_VERSION = "3.2"
+OCTO_BROWSER_VERSION = __version__
 LEGACY_OCTO_BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) OctoBrowser/3.1 Chrome/126.0.0.0 Safari/537.36"
@@ -207,6 +204,12 @@ MAX_HISTORY_ITEMS = 500
 DOWNLOAD_PATH_ROLE = Qt.ItemDataRole.UserRole
 DOWNLOAD_REQUEST_ROLE = Qt.ItemDataRole.UserRole + 1
 DOWNLOAD_PRIVATE_ROLE = Qt.ItemDataRole.UserRole + 2
+
+
+def resource_path(relative_path: str) -> Path:
+    """Resolve an asset in both source checkouts and PyInstaller bundles."""
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return bundle_root / relative_path
 
 
 @dataclass
@@ -291,7 +294,7 @@ class SettingsStore:
         list[str],
         list[dict[str, str]],
         list[str],
-        list[str],
+        dict[str, Any],
         list[str],
         dict[str, dict[str, bool]],
         dict[str, dict[str, bool]],
@@ -351,7 +354,9 @@ class SettingsStore:
         bookmarks = self._unique_strings(data.get("bookmarks", []))
         notes = self._coerce_notes(data.get("notes", []))
         todos = self._unique_strings(data.get("todos", []))
-        session_tabs = self._unique_strings(data.get("session_tabs", []))
+        session_snapshot = normalize_session_snapshot(
+            data.get("session", data.get("session_tabs", []))
+        )
         reading_list = self._unique_strings(data.get("reading_list", []))
         site_permissions = self._coerce_site_permissions(data.get("site_permissions", {}))
         site_content = self._coerce_site_permissions(data.get("site_content", {}))
@@ -364,7 +369,7 @@ class SettingsStore:
             bookmarks,
             notes,
             todos,
-            session_tabs,
+            session_snapshot,
             reading_list,
             site_permissions,
             site_content,
@@ -379,7 +384,7 @@ class SettingsStore:
         bookmarks: list[str],
         notes: list[dict[str, str]],
         todos: list[str],
-        session_tabs: list[str],
+        session_snapshot: dict[str, Any] | list[Any],
         reading_list: list[str],
         site_permissions: dict[str, dict[str, bool]],
         site_content: dict[str, dict[str, bool]],
@@ -413,7 +418,7 @@ class SettingsStore:
             "bookmarks": bookmarks,
             "notes": notes,
             "todos": todos,
-            "session_tabs": session_tabs,
+            "session": normalize_session_snapshot(session_snapshot),
             "reading_list": reading_list,
             "site_permissions": site_permissions,
             "site_content": site_content,
@@ -795,6 +800,34 @@ class OpenAIWorker(QThread):
         return "\n".join(chunks)
 
 
+class SpeechWorker(QThread):
+    """Generate cloud speech without blocking the Qt event loop."""
+
+    ready = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.text = text
+
+    def run(self) -> None:
+        output_file = ""
+        try:
+            if gTTS is None:
+                raise RuntimeError("Install gTTS to use text-to-speech.")
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
+                output_file = temp_file.name
+            gTTS(self.text, lang="en", slow=False).save(output_file)
+            if self.isInterruptionRequested():
+                Path(output_file).unlink(missing_ok=True)
+                return
+            self.ready.emit(output_file)
+        except Exception as exc:
+            if output_file:
+                Path(output_file).unlink(missing_ok=True)
+            self.failed.emit(str(exc))
+
+
 class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
     """Single request interceptor handling ad blocking, HTTPS-only upgrades, and GPC.
 
@@ -1115,7 +1148,18 @@ class OctoWebPage(QWebEnginePage):
         is_main_frame: bool,
     ) -> bool:
         if is_main_frame and url.scheme().lower() == "octo":
-            self.browser_window.handle_octo_command(url.toString())
+            parent_view = self.parent()
+            internal_page = (
+                str(parent_view.property("internal_page") or "")
+                if isinstance(parent_view, QWebEngineView)
+                else ""
+            )
+            if can_dispatch_octo_command(
+                url.toString(), internal_page, self.url().toString()
+            ):
+                self.browser_window.handle_octo_command(url.toString())
+            else:
+                self.browser_window.set_status("Blocked an untrusted page from invoking an Octo command")
             return False
         return super().acceptNavigationRequest(url, navigation_type, is_main_frame)
 
@@ -1129,12 +1173,15 @@ class SettingsDialog(QDialog):
         layout = QFormLayout(self)
         self.homepage_edit = QLineEdit(settings.homepage)
         self.openai_key_edit = QLineEdit(settings.openai_api_key)
+        self.openai_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.openai_model_edit = QLineEdit(settings.openai_model)
         self.user_agent_edit = QLineEdit(settings.user_agent)
         self.user_agent_edit.setPlaceholderText("Native Qt Chromium identity (recommended)")
         self.weather_location_edit = QLineEdit(settings.weather_location)
         self.weather_key_edit = QLineEdit(settings.weather_api_key)
         self.news_key_edit = QLineEdit(settings.news_api_key)
+        self.weather_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.news_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
 
         self.search_engine_combo = QComboBox()
         for engine in SEARCH_ENGINES:
@@ -1329,7 +1376,10 @@ class LibrarySearchDialog(QDialog):
 class OctoBrowse(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(OCTO_BROWSER_NAME)
+        self.setWindowTitle(f"{OCTO_BROWSER_NAME} {OCTO_BROWSER_VERSION}")
+        icon_path = resource_path("assets/octobrowse.png")
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.setGeometry(100, 100, 1200, 800)
 
         self.store = SettingsStore()
@@ -1339,7 +1389,7 @@ class OctoBrowse(QMainWindow):
             self.bookmarks,
             self.notes,
             self.todos,
-            self.session_tabs,
+            self.session_snapshot,
             self.reading_list,
             self.site_permissions,
             self.site_content,
@@ -1369,16 +1419,20 @@ class OctoBrowse(QMainWindow):
 
         self.network_workers: list[ApiFetchWorker] = []
         self.ai_workers: list[OpenAIWorker] = []
+        self.speech_workers: list[SpeechWorker] = []
         self.ai_task_metadata: dict[str, dict[str, str]] = {}
         self.downloads: list[dict[str, str]] = []
         self.closed_tabs: list[dict[str, str]] = []
+        self.ephemeral_paths: set[Path] = set()
         self.private_profile: QWebEngineProfile | None = None
         self.profile = QWebEngineProfile.defaultProfile()
         self.native_user_agent = self.profile.httpUserAgent()
         self.apply_browser_identity(self.profile)
         self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
         self.apply_cookie_policy(self.profile)
-        self.profile.downloadRequested.connect(self.handle_download_requested)
+        self.profile.downloadRequested.connect(
+            lambda download: self.handle_download_requested(download, private=False)
+        )
         self.request_interceptor = OctoRequestInterceptor(AD_BLOCK_LIST)
         self.request_interceptor.ad_block_enabled = self.ad_block_enabled
         self.request_interceptor.https_only = self.settings.https_only
@@ -2081,6 +2135,8 @@ class OctoBrowse(QMainWindow):
             widget = self.tabs.widget(index)
             if not isinstance(widget, QWebEngineView) or widget.property("private"):
                 continue
+            if widget.property("ephemeral_path"):
+                continue
             url = widget.url().toString()
             if self.is_internal_url(url):
                 continue
@@ -2373,7 +2429,7 @@ li {{ margin: 7px 0; }}
                 "Tab navigation shortcuts (Ctrl+Tab, Ctrl+1-9) and per-tab audio mute",
                 "HTML5 fullscreen support for video players",
                 "Built-in PDF viewer",
-                "Session restore for standard tabs",
+                "Versioned session restore with tab order, duplicates, titles, pins, and active position",
                 "Render-process crash detection with automatic reload",
             ],
             "Workspace": [
@@ -2400,7 +2456,7 @@ li {{ margin: 7px 0; }}
                 "Save page HTML",
                 "View source",
                 "Screenshot saving",
-                "OpenCV upscaled screenshot preview",
+                "Native Qt upscaled screenshot preview with automatic temporary-file cleanup",
                 "Copy URL and Markdown link",
             ],
             "Privacy And Identity": [
@@ -2419,12 +2475,14 @@ li {{ margin: 7px 0; }}
                 "Expanded clear-browser-data controls",
                 "Native Qt Chromium identity with runtime and security-patch reporting",
                 "Private URLs redacted from standard overview and download history",
+                "Internal Octo command bridge restricted to generated application pages",
+                "Private download provenance supplied directly by the off-record profile",
             ],
             "AI And Voice": [
                 "Citation-grounded OpenAI page summaries with save-to-note",
                 "Query-relevant cited page assistant with dedicated input and output",
                 "Prompt-injection-aware context boundaries, store=False, and private-tab consent",
-                "Text-to-speech read aloud",
+                "Non-blocking cloud text-to-speech with per-use private-tab consent",
                 "SpeechRecognition voice commands",
             ],
             "Extensibility": [
@@ -2571,7 +2629,9 @@ code, pre {{
             self.apply_browser_identity(self.private_profile)
             self.install_privacy_script(self.private_profile)
             self.apply_cookie_policy(self.private_profile)
-            self.private_profile.downloadRequested.connect(self.handle_download_requested)
+            self.private_profile.downloadRequested.connect(
+                lambda download: self.handle_download_requested(download, private=True)
+            )
             self.private_profile.setUrlRequestInterceptor(self.request_interceptor)
         return self.private_profile
 
@@ -2740,34 +2800,56 @@ code, pre {{
         return browser
 
     def restore_startup_tabs(self) -> None:
-        restored = self.restore_saved_tabs(select_first=False)
+        restored = self.restore_saved_tabs()
         if not restored:
             self.add_tab(QUrl(self.settings.homepage), "Home", private=False)
-            self.tabs.setCurrentIndex(0)
 
-    def restore_saved_tabs(self, select_first: bool = True) -> int:
+    def restore_saved_tabs(self, _checked: bool = False) -> int:
+        snapshot = normalize_session_snapshot(self.session_snapshot)
+        first_index = self.tabs.count()
         restored = 0
-        for url in self.session_tabs[:8]:
-            if self.is_internal_url(url):
+        selected_restored = 0
+        source_active = int(snapshot.get("active_index", 0))
+        for source_index, tab in enumerate(snapshot["tabs"]):
+            url = str(tab.get("url", ""))
+            if not url or self.is_internal_url(url):
                 continue
-            self.add_tab(QUrl(url), "Restored", private=False)
+            browser = self.add_tab(
+                QUrl(url), str(tab.get("title") or "Restored"), private=False
+            )
+            browser.setProperty("pinned", bool(tab.get("pinned", False)))
+            self.update_tab_title(browser, str(tab.get("title") or url))
             restored += 1
-        if restored and not select_first:
-            self.tabs.setCurrentIndex(0)
-        if select_first:
+            if source_index <= source_active:
+                selected_restored = restored - 1
+        if restored:
+            self.tabs.setCurrentIndex(first_index + selected_restored)
             self.set_status(f"Restored {restored} tab{'s' if restored != 1 else ''}")
         return restored
 
-    def get_session_tabs(self) -> list[str]:
-        urls: list[str] = []
+    def get_session_snapshot(self) -> dict[str, Any]:
+        tabs: list[dict[str, Any]] = []
+        active_index = 0
+        current = self.tabs.currentWidget()
         for index in range(self.tabs.count()):
             widget = self.tabs.widget(index)
             if not isinstance(widget, QWebEngineView) or widget.property("private"):
                 continue
+            if widget.property("ephemeral_path"):
+                continue
             url = widget.url().toString()
-            if url and not self.is_internal_url(url) and url not in urls:
-                urls.append(url)
-        return urls[:12]
+            if not url or self.is_internal_url(url):
+                continue
+            if widget is current:
+                active_index = len(tabs)
+            tabs.append(
+                {
+                    "url": url,
+                    "title": str(widget.property("raw_title") or widget.page().title() or url),
+                    "pinned": bool(widget.property("pinned")),
+                }
+            )
+        return make_session_snapshot(tabs, active_index)
 
     def is_internal_url(self, url: str) -> bool:
         return classify_internal_url(url)
@@ -2800,11 +2882,17 @@ code, pre {{
 
     def close_tab(self, index: int) -> None:
         widget = self.tabs.widget(index)
-        if isinstance(widget, QWebEngineView) and not widget.property("private"):
+        if (
+            isinstance(widget, QWebEngineView)
+            and not widget.property("private")
+            and not widget.property("ephemeral_path")
+        ):
             url = widget.url().toString()
             if not self.is_internal_url(url):
                 self.closed_tabs.append({"url": url, "title": self.tabs.tabText(index) or "Closed Tab"})
                 self.closed_tabs = self.closed_tabs[-20:]
+        if isinstance(widget, QWebEngineView):
+            self.cleanup_browser_ephemeral(widget)
         if self.tabs.count() > 1:
             self.tabs.removeTab(index)
             if widget is not None:
@@ -2817,6 +2905,20 @@ code, pre {{
             self.open_dashboard()
         self.save_settings()
         self.update_status_badges()
+
+    def cleanup_browser_ephemeral(self, browser: QWebEngineView) -> None:
+        path = str(browser.property("ephemeral_path") or "")
+        if path:
+            browser.setProperty("ephemeral_path", "")
+            self.cleanup_ephemeral_path(path)
+
+    def cleanup_ephemeral_path(self, path: str | Path) -> None:
+        candidate = Path(path)
+        self.ephemeral_paths.discard(candidate)
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def reopen_closed_tab(self) -> None:
         if not self.closed_tabs:
@@ -2843,15 +2945,13 @@ code, pre {{
     def toggle_incognito_mode(self) -> None:
         self.incognito_mode = not self.incognito_mode
         if self.incognito_mode:
-            self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
             self.open_private_tab()
             QMessageBox.information(
                 self,
                 "Private Mode",
-                "Private mode is enabled. New tabs use an off-the-record profile and history is paused.",
+                "Private mode is enabled for new tabs. Existing standard tabs keep their normal profile.",
             )
         else:
-            self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
             QMessageBox.information(self, "Private Mode", "Private mode is disabled for new tabs.")
 
     def navigate_back(self) -> None:
@@ -3034,7 +3134,7 @@ code, pre {{
         reading_count = len(self.reading_list)
         blocked = self.request_interceptor.total_blocked()
         downloads_count = len(self.downloads)
-        saved_tabs_count = len(self.session_tabs)
+        saved_tabs_count = len(normalize_session_snapshot(self.session_snapshot)["tabs"])
         workspace_count = len(self.workspaces)
         weather = html.escape(self.weather_widget.text() if hasattr(self, "weather_widget") else "Weather unavailable")
         browser_identity = html.escape(
@@ -3527,30 +3627,35 @@ p {{ margin: 0 0 20px; }}
                 self.apply_dark_mode(browser)
 
     def upscale_page(self) -> None:
-        if cv2 is None:
-            QMessageBox.critical(self, "Upscale Page", "Install opencv-python to use page upscaling.")
-            return
         browser = self.current_browser()
         if not browser:
             return
-        screenshot_path = ""
+        upscaled_path = ""
         try:
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
-                screenshot_path = temp_file.name
-            browser.grab().save(screenshot_path)
-            image = cv2.imread(screenshot_path)
-            if image is None:
+            screenshot = browser.grab()
+            if screenshot.isNull():
                 raise ValueError("Screenshot capture failed.")
-            upscaled = cv2.resize(image, None, fx=2, fy=2, interpolation=cv2.INTER_LANCZOS4)
+            upscaled = screenshot.scaled(
+                screenshot.width() * 2,
+                screenshot.height() * 2,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
                 upscaled_path = temp_file.name
-            cv2.imwrite(upscaled_path, upscaled)
-            self.add_tab(QUrl.fromLocalFile(upscaled_path), "Upscaled", private=bool(browser.property("private")))
+            if not upscaled.save(upscaled_path, "PNG"):
+                raise OSError("Could not save the upscaled preview.")
+            preview = self.add_tab(
+                QUrl.fromLocalFile(upscaled_path),
+                "Upscaled Preview",
+                private=bool(browser.property("private")),
+            )
+            preview.setProperty("ephemeral_path", upscaled_path)
+            self.ephemeral_paths.add(Path(upscaled_path))
         except Exception as exc:
+            if upscaled_path:
+                self.cleanup_ephemeral_path(upscaled_path)
             QMessageBox.critical(self, "Upscale Page", f"Failed to upscale: {exc}")
-        finally:
-            if screenshot_path:
-                Path(screenshot_path).unlink(missing_ok=True)
 
     def save_screenshot(self) -> None:
         browser = self.current_browser()
@@ -3587,28 +3692,59 @@ p {{ margin: 0 0 20px; }}
             QMessageBox.critical(self, "Read Aloud", "Install gTTS to use text-to-speech.")
             return
         browser = self.current_browser()
-        if browser:
+        if browser and self.confirm_cloud_speech(browser):
+            self.set_status("Preparing speech without blocking browsing...")
             browser.page().toPlainText(lambda text: self.speak_text(text[:1500]))
+
+    def confirm_cloud_speech(self, browser: QWebEngineView) -> bool:
+        """Require explicit consent before private-page text is sent to gTTS."""
+        if not browser.property("private"):
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Send Private Page to Google Text-to-Speech?",
+            "Read Aloud uses the cloud-based Google Text-to-Speech service.\n\n"
+            f"Send up to 1,500 characters from:\n{browser.url().toString()}\n\n"
+            "The generated audio is kept only in a temporary file and removed automatically.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def speak_text(self, text: str) -> None:
         text = text.strip()
         if not text:
             QMessageBox.information(self, "Read Aloud", "There is no readable text on this page.")
             return
+        worker = SpeechWorker(text, self)
+        worker.ready.connect(self.handle_speech_ready)
+        worker.failed.connect(self.handle_speech_error)
+        worker.finished.connect(lambda worker=worker: self.cleanup_speech_worker(worker))
+        self.speech_workers.append(worker)
+        worker.start()
+
+    def handle_speech_ready(self, output_file: str) -> None:
+        self.ephemeral_paths.add(Path(output_file))
         try:
-            tts = gTTS(text, lang="en", slow=False)
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
-                output_file = temp_file.name
-            tts.save(output_file)
             if os.name == "nt":
                 os.startfile(output_file)  # type: ignore[attr-defined]
             elif sys.platform == "darwin":
                 subprocess.Popen(["afplay", output_file])
             else:
                 subprocess.Popen(["xdg-open", output_file])
-            QTimer.singleShot(15000, lambda path=output_file: Path(path).unlink(missing_ok=True))
+            QTimer.singleShot(60_000, lambda path=output_file: self.cleanup_ephemeral_path(path))
+            self.set_status("Read Aloud audio opened")
         except Exception as exc:
-            QMessageBox.critical(self, "Read Aloud", f"Text-to-speech failed: {exc}")
+            self.cleanup_ephemeral_path(output_file)
+            self.handle_speech_error(str(exc))
+
+    def handle_speech_error(self, error: str) -> None:
+        QMessageBox.critical(self, "Read Aloud", f"Text-to-speech failed: {error}")
+        self.set_status("Read Aloud failed")
+
+    def cleanup_speech_worker(self, worker: SpeechWorker) -> None:
+        if worker in self.speech_workers:
+            self.speech_workers.remove(worker)
 
     def toggle_ad_block(self) -> None:
         self.ad_block_enabled = not self.ad_block_enabled
@@ -3677,7 +3813,12 @@ p {{ margin: 0 0 20px; }}
     def ensure_openai_key(self) -> bool:
         if self.openai_api_key:
             return True
-        key, ok = QInputDialog.getText(self, "OpenAI API Key", "Enter your OpenAI API key:")
+        key, ok = QInputDialog.getText(
+            self,
+            "OpenAI API Key",
+            "Enter your OpenAI API key:",
+            QLineEdit.EchoMode.Password,
+        )
         if not ok or not key.strip():
             QMessageBox.critical(self, "OpenAI", "OpenAI API key is required for this feature.")
             return False
@@ -4004,7 +4145,7 @@ p {{ margin: 0 0 20px; }}
         if url:
             self.add_tab(QUrl(str(url)), item.text())
 
-    def handle_download_requested(self, download: Any) -> None:
+    def handle_download_requested(self, download: Any, private: bool) -> None:
         default_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
         suggested_name = download.downloadFileName() or "download"
         suggested_path = str(Path(default_dir) / suggested_name)
@@ -4021,14 +4162,7 @@ p {{ margin: 0 0 20px; }}
         item.setToolTip(str(target))
         item.setData(DOWNLOAD_PATH_ROLE, str(target))
         item.setData(DOWNLOAD_REQUEST_ROLE, download)
-        try:
-            private_download = bool(
-                self.private_profile is not None
-                and download.page().profile() is self.private_profile
-            )
-        except Exception:
-            private_download = False
-        item.setData(DOWNLOAD_PRIVATE_ROLE, private_download)
+        item.setData(DOWNLOAD_PRIVATE_ROLE, bool(private))
         self.downloads_sidebar.addItem(item)
         self.open_panel(self.downloads_sidebar, status=f"Downloading {target.name}")
         self.downloads.append({"file": str(target), "status": "downloading"})
@@ -4131,10 +4265,22 @@ p {{ margin: 0 0 20px; }}
         menu.exec(self.downloads_sidebar.mapToGlobal(position))
 
     def clear_download_list(self) -> None:
-        self.downloads_sidebar.clear()
+        active_count = 0
+        for index in reversed(range(self.downloads_sidebar.count())):
+            item = self.downloads_sidebar.item(index)
+            if item.data(DOWNLOAD_REQUEST_ROLE) is not None:
+                active_count += 1
+                continue
+            self.downloads_sidebar.takeItem(index)
         self.downloads_history.clear()
         self.save_settings()
-        self.set_status("Download list cleared")
+        if active_count:
+            self.set_status(
+                f"Cleared download history; kept {active_count} active download"
+                f"{'s' if active_count != 1 else ''}"
+            )
+        else:
+            self.set_status("Download list cleared")
 
     def toggle_fullscreen(self) -> None:
         if self.isFullScreen():
@@ -5028,14 +5174,14 @@ p {{ margin: 0 0 20px; }}
     def save_settings(self) -> None:
         self.settings.openai_api_key = self.openai_api_key
         self.settings.ad_block_enabled = self.ad_block_enabled
-        self.session_tabs = self.get_session_tabs()
+        self.session_snapshot = self.get_session_snapshot()
         try:
             self.store.save(
                 self.settings,
                 self.bookmarks,
                 self.notes,
                 self.todos,
-                self.session_tabs,
+                self.session_snapshot,
                 self.reading_list,
                 self.site_permissions,
                 self.site_content,
@@ -5094,7 +5240,12 @@ p {{ margin: 0 0 20px; }}
     def closeEvent(self, event: Any) -> None:
         self.hibernation_timer.stop()
         self.session_autosave_timer.stop()
-        workers = list(self.network_workers) + list(self.ai_workers) + list(self.filter_workers)
+        workers = (
+            list(self.network_workers)
+            + list(self.ai_workers)
+            + list(self.filter_workers)
+            + list(self.speech_workers)
+        )
         running = [worker for worker in workers if worker.isRunning()]
         if running:
             event.ignore()
@@ -5109,15 +5260,31 @@ p {{ margin: 0 0 20px; }}
             return
         self.save_settings()
         self.history_db.close()
+        for path in list(self.ephemeral_paths):
+            self.cleanup_ephemeral_path(path)
         super().closeEvent(event)
 
 
 def main() -> int:
-    app = QApplication(sys.argv)
+    if "--version" in sys.argv:
+        print(f"OctoBrowse {OCTO_BROWSER_VERSION}")
+        return 0
+    smoke_test = "--smoke-test" in sys.argv
+    if smoke_test:
+        QStandardPaths.setTestModeEnabled(True)
+    app_args = [argument for argument in sys.argv if argument != "--smoke-test"]
+    app = QApplication(app_args)
     app.setApplicationName(OCTO_BROWSER_NAME)
+    app.setApplicationDisplayName(OCTO_BROWSER_NAME)
+    app.setApplicationVersion(OCTO_BROWSER_VERSION)
     app.setOrganizationName("OctoBrowse")
+    icon_path = resource_path("assets/octobrowse.png")
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     browser = OctoBrowse()
     browser.show()
+    if smoke_test:
+        QTimer.singleShot(3_000, browser.close)
     return app.exec()
 
 

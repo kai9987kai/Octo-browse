@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "3.2"
+    [string]$Version = "3.3"
 )
 
 # FALLBACK installer builder (IExpress). The preferred installer is built by
@@ -13,7 +13,7 @@ $distDir = Join-Path $root "dist\OctoBrowse"
 $releaseDir = Join-Path $root "release"
 $payloadDir = Join-Path $releaseDir "installer_payload"
 $payloadZip = Join-Path $payloadDir "OctoBrowse.zip"
-$setupExe = Join-Path $releaseDir "OctoBrowse-$Version-Setup.exe"
+$setupExe = Join-Path $releaseDir "OctoBrowse-$Version-IExpress-Setup.exe"
 $sedPath = Join-Path $releaseDir "OctoBrowse-$Version-iexpress.sed"
 
 if (-not (Test-Path -LiteralPath (Join-Path $distDir "OctoBrowse.exe"))) {
@@ -66,6 +66,7 @@ install_octobrowse.cmd=
 $sed | Set-Content -LiteralPath $sedPath -Encoding ASCII
 
 & "$env:WINDIR\System32\iexpress.exe" /N /Q $sedPath
+if ($LASTEXITCODE -ne 0) { throw "IExpress failed with exit code $LASTEXITCODE" }
 Start-Sleep -Seconds 2
 Wait-Process -Name "iexpress", "makecab" -Timeout 600 -ErrorAction SilentlyContinue
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from octobrowse.urls import is_internal_url
+from octobrowse.urls import can_dispatch_octo_command, is_internal_url
 
 
 class UrlClassificationTests(unittest.TestCase):
@@ -21,7 +21,17 @@ class UrlClassificationTests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertFalse(is_internal_url(url))
 
+    def test_octo_bridge_requires_a_generated_internal_page(self) -> None:
+        internal = "https://octobrowse.local/"
+        self.assertTrue(can_dispatch_octo_command("octo:dashboard", "dashboard", internal))
+        self.assertFalse(can_dispatch_octo_command("octo:settings", "", internal))
+        self.assertFalse(
+            can_dispatch_octo_command("https://example.com", "dashboard", internal)
+        )
+        self.assertFalse(
+            can_dispatch_octo_command("octo:settings", "dashboard", "https://evil.test/")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
-

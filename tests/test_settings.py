@@ -59,6 +59,37 @@ class SettingsStoreTests(unittest.TestCase):
             self.assertEqual(loaded[0].hibernation_minutes, 15)
             self.assertEqual(loaded[-1][0]["name"], "Research")
 
+    def test_legacy_session_urls_migrate_to_versioned_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(
+                Path(temp_dir),
+                {"session_tabs": ["https://example.com", "https://example.com"]},
+            )
+
+            snapshot = store.load()[5]
+
+            self.assertEqual(snapshot["version"], 2)
+            self.assertEqual(len(snapshot["tabs"]), 2)
+            self.assertEqual(snapshot["tabs"][0]["url"], "https://example.com")
+
+    def test_save_uses_canonical_session_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = self.make_store(root, {})
+            session = {
+                "version": 2,
+                "tabs": [
+                    {"url": "https://example.com", "title": "Example", "pinned": True}
+                ],
+                "active_index": 0,
+            }
+
+            store.save(BrowserSettings(), [], [], [], session, [], {}, {}, [], {}, [])
+            payload = json.loads(store.path.read_text(encoding="utf-8"))
+
+            self.assertEqual(payload["session"], session)
+            self.assertNotIn("session_tabs", payload)
+
     def test_os_keyring_values_replace_plaintext_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
