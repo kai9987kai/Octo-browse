@@ -1214,7 +1214,12 @@ class OctoWebPage(QWebEnginePage):
             QWebEnginePage.NavigationType.NavigationTypeOther,
         }:
             parent_view = self.parent()
-            if isinstance(parent_view, QWebEngineView):
+            generated_load = bool(
+                isinstance(parent_view, QWebEngineView)
+                and parent_view.property("generated_navigation_pending")
+                and is_trusted_internal_url(url.toString())
+            )
+            if isinstance(parent_view, QWebEngineView) and not generated_load:
                 parent_view.setProperty("generated_page", False)
                 parent_view.setProperty("internal_page", "")
         return super().acceptNavigationRequest(url, navigation_type, is_main_frame)
@@ -1606,7 +1611,6 @@ class OctoBrowse(QMainWindow):
         self.create_toolbar()
         self.populate_sidebars()
         self.set_theme(self.settings.theme, persist=False)
-        self.open_dashboard()
         self.restore_startup_tabs()
 
         QTimer.singleShot(0, self.prune_nonpersistent_permission_records)
@@ -1662,8 +1666,19 @@ class OctoBrowse(QMainWindow):
         self.toolbar.addWidget(self.find_count_label)
 
         self._add_action("Find", "Find in Page (Ctrl+F)", self.toggle_find_bar, "Ctrl+F", QStyle.StandardPixmap.SP_FileDialogContentsView)
-        self._add_action("Prev", "Previous Find Match", self.find_previous)
-        self._add_action("Next", "Next Find Match", self.find_in_page)
+        self.find_previous_action = self._add_action(
+            "Prev", "Previous Find Match (Shift+F3)", self.find_previous, "Shift+F3"
+        )
+        self.find_next_action = self._add_action(
+            "Next", "Next Find Match (F3)", self.find_in_page, "F3"
+        )
+        self.find_navigation_widgets = [
+            self.toolbar.widgetForAction(self.find_previous_action),
+            self.toolbar.widgetForAction(self.find_next_action),
+        ]
+        for widget in self.find_navigation_widgets:
+            if widget is not None:
+                widget.hide()
         self._add_action("Cmd", "Command Palette (Ctrl+K)", self.open_command_palette, "Ctrl+K", QStyle.StandardPixmap.SP_ComputerIcon)
 
         theme_menu = QMenu("Themes", self)
@@ -1781,8 +1796,8 @@ class OctoBrowse(QMainWindow):
         self.workspace_rail.setObjectName("WorkspaceRail")
         self.workspace_rail.setMovable(False)
         self.workspace_rail.setOrientation(Qt.Orientation.Vertical)
-        self.workspace_rail.setIconSize(QSize(20, 20))
-        self.workspace_rail.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        self.workspace_rail.setIconSize(QSize(18, 18))
+        self.workspace_rail.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, self.workspace_rail)
 
         self._add_rail_action("Home", "Open dashboard", self.open_dashboard, QStyle.StandardPixmap.SP_DirHomeIcon)
@@ -3092,7 +3107,7 @@ code, pre {{
     def restore_startup_tabs(self) -> None:
         restored = self.restore_saved_tabs()
         if not restored:
-            self.add_tab(QUrl(self.settings.homepage), "Home", private=False)
+            self.open_dashboard()
 
     def restore_saved_tabs(self, _checked: bool = False) -> int:
         snapshot = normalize_session_snapshot(self.session_snapshot)
@@ -3322,6 +3337,9 @@ code, pre {{
     def toggle_find_bar(self) -> None:
         self.find_bar.setVisible(not self.find_bar.isVisible())
         self.find_count_label.setVisible(self.find_bar.isVisible())
+        for widget in self.find_navigation_widgets:
+            if widget is not None:
+                widget.setVisible(self.find_bar.isVisible())
         if self.find_bar.isVisible():
             self.find_bar.setFocus()
             self.find_bar.selectAll()
@@ -3406,6 +3424,7 @@ code, pre {{
                 existing = self.tabs.widget(index)
                 if isinstance(existing, QWebEngineView) and existing.property("internal_page") == internal_page:
                     existing.setProperty("generated_page", True)
+                    existing.setProperty("generated_navigation_pending", True)
                     self.tabs.setTabText(index, title)
                     self.tabs.setCurrentIndex(index)
                     existing.setHtml(html_text, QUrl("https://octobrowse.local/"))
@@ -3414,6 +3433,7 @@ code, pre {{
         browser.setProperty("private", private)
         browser.setProperty("pinned", False)
         browser.setProperty("generated_page", True)
+        browser.setProperty("generated_navigation_pending", True)
         browser.setProperty("internal_page", internal_page or "")
         browser.setPage(OctoWebPage(self, self.profile_for_tab(private), private, browser))
         index = self.tabs.addTab(browser, title)
@@ -3460,7 +3480,7 @@ main {{
 }}
 h1 {{ margin: 0 0 6px; font-size: 38px; }}
 .sub {{ color: #536174; margin-bottom: 24px; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 14px; }}
+.grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }}
 .actions {{ margin-top: 16px; display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 12px; }}
 .metric, .panel, .action {{
   background: #ffffff;
@@ -3514,7 +3534,7 @@ li {{ margin: 8px 0; }}
     <div class="panel"><h2>Bookmarks</h2>{bookmark_links}</div>
   </section>
   <section class="wide">
-    <div class="panel"><h2>Session</h2><p>{weather}</p><p>{notes_count} saved notes in this workspace.</p><p>{downloads_count} tracked downloads.</p><p>{blocked} requests blocked this session.</p><p>Identity: {browser_identity}</p></div>
+    <div class="panel"><h2>Session</h2><p>{weather}</p><p>{notes_count} saved research notes.</p><p>{downloads_count} tracked downloads.</p><p>{blocked} requests blocked this session.</p><p>Identity: {browser_identity}</p></div>
     <div class="panel"><h2>Shortcuts</h2><p>Ctrl+K command palette</p><p>Ctrl+F find in page</p><p>Ctrl+D bookmark</p><p>Ctrl+J downloads</p><p>Ctrl+Shift+T reopen tab</p></div>
   </section>
 </main>
@@ -3649,7 +3669,10 @@ p {{ margin: 0 0 20px; }}
         browser.setProperty("last_active", time.time())
         text = url.toString()
         self.url_bar.setText(text)
-        if not is_trusted_internal_url(text):
+        if (
+            not is_trusted_internal_url(text)
+            and not browser.property("generated_navigation_pending")
+        ):
             browser.setProperty("generated_page", False)
             browser.setProperty("internal_page", "")
         self.update_security_badge(url, browser)
@@ -3839,7 +3862,9 @@ p {{ margin: 0 0 20px; }}
             self.progress_bar.setVisible(progress < 100)
 
     def on_load_finished(self, browser: QWebEngineView) -> None:
+        browser.setProperty("generated_navigation_pending", False)
         if browser == self.current_browser():
+            self.update_security_badge(browser.url(), browser)
             self.progress_bar.hide()
             self.set_status("Ready")
             self.update_status_badges()
