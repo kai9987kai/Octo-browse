@@ -6,7 +6,7 @@ from octobrowse.version import __version__
 
 class VersionTests(unittest.TestCase):
     def test_main_uses_package_release_version(self) -> None:
-        self.assertEqual(__version__, "3.3")
+        self.assertEqual(__version__, "3.4")
         self.assertEqual(OCTO_BROWSER_VERSION, __version__)
 
 

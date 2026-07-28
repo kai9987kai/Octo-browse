@@ -32,9 +32,22 @@ Python automation.
   `navigator.globalPrivacyControl`, optional legacy DNT, and an optional strict
   third-party cookie/storage filter.
 - Per-site permission prompts (camera, microphone, location, notifications)
-  with remembered decisions and a Site Permissions manager (`octo:permissions`).
-- Connection security badge, find-in-page match counter, HTML5 fullscreen for
-  video players, built-in PDF viewer, and render-process crash auto-recovery.
+  now respect Qt's real permission lifetimes: persistent standard-profile
+  choices can be reviewed and reset, while camera, microphone, screen, and
+  private-tab choices are never written to OctoBrowse settings.
+- Clickable Site Trust Center with exact origin/profile state, honest HTTPS
+  wording, per-site tracker and popup counts, permission state, and shortcuts
+  to content controls. Gesture-driven new windows open as tabs while automatic
+  script popups are blocked.
+- A named persistent standard profile retains normal site logins, storage,
+  and cache across restarts. Private tabs remain isolated in a separate
+  off-the-record profile with separate privacy telemetry.
+- A non-executing Manifest V3 inspector audits extension folders and ZIPs for
+  required and optional API/host access plus content-script matches. It rejects
+  legacy manifests, unsafe ZIP paths, duplicate entries, and oversized packages
+  before any code can run.
+- Find-in-page match counter, HTML5 fullscreen for video players, built-in PDF
+  viewer, and render-process crash auto-recovery.
 - Cleaner browser chrome with a compact navigation toolbar, left workspace rail,
   full menu bar, status badges, a command palette (`Ctrl+K`), and in-page find
   (`Ctrl+F`).
@@ -48,8 +61,8 @@ Python automation.
 - Smart address commands: `octo:dashboard`, `octo:identity`, `octo:tabs`,
   `octo:features`, `octo:library`, `octo:downloads`, `octo:reading`,
   `octo:history`, `octo:bookmarks`, `octo:todos`, `octo:notes`,
-  `octo:permissions`, `octo:workspaces`, plus bang searches like `!yt`, `!gh`,
-  `!w`, `!maps`, `!news`, `!pypi`, and `!mdn`.
+  `octo:permissions`, `octo:extensions`, `octo:workspaces`, plus bang searches
+  like `!yt`, `!gh`, `!w`, `!maps`, `!news`, `!pypi`, and `!mdn`.
 - Address-bar autocomplete for Octo commands, bang searches, history,
   bookmarks, and reading list items.
 - Standard and private tabs. Private tabs use a separate off-the-record
@@ -69,12 +82,15 @@ Python automation.
   use, but arbitrary Python cannot be sandboxed in-process. Execution is off by
   default and requires explicit Developer Mode; only run code you trust. See
   `examples/page_word_count.py`.
+- `examples/mv3_hello` is a permission-free package for verifying the Manifest
+  V3 inspector without contacting the network.
 - SQLite-backed browsing history (one upsert per visit instead of rewriting a
   JSON blob), with automatic migration from the old format.
 - Download manager with pause/resume/cancel, open file/folder actions, and a
   persistent download history.
 - Per-site content controls: disable JavaScript or image loading for chosen
-  sites (Tools > Site Controls).
+  sites (Tools > Site Controls). Standard choices persist; private-tab choices
+  stay in memory and never enter the settings file.
 - Persistent settings, workspaces, bookmarks, notes, and todos stored as JSON
   under the platform app-data directory (history lives in `history.sqlite`);
   API keys use the OS credential vault through `keyring` when available.
@@ -85,13 +101,13 @@ Python automation.
 - Reopen recently closed tabs with `Ctrl+Shift+T`.
 - Download handling with a save prompt, progress state, and downloads panel.
 - Persistent reading list panel for pages to revisit later.
-- Target-blank and popup-style new-window requests open as normal Octo Browser
-  tabs.
+- User-initiated target-blank and popup-style requests open as normal tabs;
+  script-only popup requests are blocked per tab.
 - Sidebar panels for notes/chat, calendar, todos, history, news, bookmarks, and
   extension code.
 - Page tools: save page HTML, view source, open current page in a new tab,
   reader view, page insights, screenshot saving, upscaled screenshot preview,
-  zoom controls,
+  native PDF export, zoom controls,
   duplicate tab, copy URL, copy Markdown link, tab overview, browser identity,
   site info, custom user agent, themes, and fullscreen.
 - Native Qt WebEngine identity avoids contradictory User-Agent and Client Hint
@@ -108,7 +124,7 @@ Python automation.
 ## Requirements
 
 - Python 3.10+
-- PyQt6 and PyQt6-WebEngine
+- PyQt6 and PyQt6-WebEngine 6.8+ (modern permission APIs)
 - See `requirements.txt` for the full dependency list.
 
 Optional system/runtime notes:
@@ -216,8 +232,12 @@ a secure vault on that system.
   treated like running a local script.
 - The session password scratchpad is in-memory only. It is not a persistent
   password manager.
-- Private tabs isolate browser profile storage for new private tabs, but this
-  prototype should not be treated as a hardened privacy browser.
+- Private tabs share a separate off-the-record profile for the current app
+  session; none of that profile's storage is made persistent. This prototype
+  should not be treated as a hardened privacy browser.
+- The Manifest V3 inspector does not install or execute extension code. Native
+  extension runtime support remains disabled until the underlying Qt/PyQt
+  enablement path is stable on supported Windows builds.
 - Read Aloud uses Google Text-to-Speech. Standard pages are sent when the action
   is invoked; private pages require an explicit confirmation every time.
 - The filter engine implements a practical subset of Adblock Plus syntax;
@@ -232,7 +252,10 @@ a secure vault on that system.
 - `octobrowse/filtering.py` / `FilterParseWorker`: testable EasyList-subset
   parsing and indexed matching, parsed off the UI thread.
 - `octobrowse/ai_context.py`: source chunking, deterministic relevance
-  selection, citations, and untrusted-content prompt boundaries.
+  selection, bounded broad-page sampling, citations, and untrusted-content
+  prompt boundaries.
+- `octobrowse/extensions.py`: defensive, non-executing Manifest V3 directory/ZIP
+  inspection, normalization, size/path limits, and permission review.
 - `octobrowse/workspaces.py`: versioned workspace validation and Markdown
   export.
 - `octobrowse/urls.py`: exact internal URL trust-boundary classification.
@@ -252,8 +275,8 @@ a secure vault on that system.
 
 - Move bookmarks/notes/todos and captured article text to SQLite/FTS5.
 - Procedural cosmetic filters (`#?#`) and cosmetic exceptions (`#@#`).
-- Native Manifest V3 extension management on Qt 6.10+; keep Python automation
-  explicitly trusted.
+- Revisit native extension execution after Qt/PyQt provides a stable Windows
+  enablement path; retain provenance and permission review before activation.
 - Readability extraction, selection-anchored notes, and offline MHTML research
   snapshots.
 
@@ -262,6 +285,9 @@ a secure vault on that system.
 ```bash
 python -m unittest discover -s tests -v
 python -m py_compile main.py alpha.py
+python tests/live_ui_smoke.py
 ```
 
-GitHub Actions runs the same regression suite on Python 3.10 and 3.13.
+GitHub Actions runs the unit regression suite on Python 3.10 and 3.13. The
+live smoke additionally constructs both profile types and drives the real MV3
+inspector dialog against the bundled permission-free sample.

@@ -43,6 +43,12 @@ foreach ($excludedName in @("cv2", "numpy", "pocketsphinx", "pocketsphinx-data")
         throw "Excluded release payload '$excludedName' is still present."
     }
 }
+$sampleManifest = Get-ChildItem -LiteralPath $onedirRoot -Recurse -File -Filter "manifest.json" |
+    Where-Object { $_.FullName -like "*examples\mv3_hello\manifest.json" } |
+    Select-Object -First 1
+if (-not $sampleManifest) {
+    throw "Onedir payload is missing the bundled MV3 inspector sample."
+}
 if (Get-ChildItem -LiteralPath $onedirRoot -Recurse -File |
     Where-Object { $_.Name -match '\.debug\.' } |
     Select-Object -First 1) {
@@ -65,6 +71,7 @@ if (($portableListing -join "`n") -match '(?i)pocketsphinx-data') {
 }
 foreach ($module in @(
     "octobrowse.ai_context",
+    "octobrowse.extensions",
     "octobrowse.filtering",
     "octobrowse.session",
     "octobrowse.urls",
@@ -74,6 +81,9 @@ foreach ($module in @(
     if (($archiveListing -join "`n") -notmatch [regex]::Escape($module)) {
         throw "Frozen archive is missing application module: $module"
     }
+}
+if (($portableListing -join "`n") -notmatch 'examples[/\\]mv3_hello[/\\]manifest\.json') {
+    throw "Standalone payload is missing the bundled MV3 inspector sample."
 }
 
 function Invoke-SmokeTest {

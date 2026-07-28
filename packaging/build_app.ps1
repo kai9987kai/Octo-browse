@@ -64,6 +64,12 @@ foreach ($requiredName in @("QtWebEngineProcess.exe", "qtwebengine_resources.pak
         throw "Required QtWebEngine runtime file is missing: $requiredName"
     }
 }
+$sampleManifest = Get-ChildItem -LiteralPath $distApp -Recurse -File -Filter "manifest.json" |
+    Where-Object { $_.FullName -like "*examples\mv3_hello\manifest.json" } |
+    Select-Object -First 1
+if (-not $sampleManifest) {
+    throw "Bundled MV3 inspector sample is missing: examples\mv3_hello\manifest.json"
+}
 
 $files = Get-ChildItem -LiteralPath $distApp -Recurse -File
 $size = ($files | Measure-Object -Property Length -Sum).Sum

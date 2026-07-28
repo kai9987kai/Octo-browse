@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "3.3"
+    [string]$Version = "3.4"
 )
 
 # FALLBACK installer builder (IExpress). The preferred installer is built by

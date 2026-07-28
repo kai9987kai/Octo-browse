@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import unittest
 
 from octobrowse.ai_context import (
@@ -86,6 +87,49 @@ class SelectionTests(unittest.TestCase):
         )
         labels = [chunk.label for chunk in selected]
         self.assertEqual(labels, ["[S1]", "[S3]", "[S5]"])
+
+    def test_summary_sampling_is_deterministic_across_a_long_page(self) -> None:
+        chunks = [
+            SourceChunk(index, "Page", "https://example.test", f"Section {index}.")
+            for index in range(1, 18)
+        ]
+
+        first = select_context_chunks(
+            chunks,
+            mode="summary",
+            max_context_chars=4_000,
+            max_chunks=5,
+        )
+        second = select_context_chunks(
+            chunks,
+            mode="summary",
+            max_context_chars=4_000,
+            max_chunks=5,
+        )
+
+        expected = ["[S1]", "[S5]", "[S9]", "[S13]", "[S17]"]
+        self.assertEqual([chunk.label for chunk in first], expected)
+        self.assertEqual([chunk.label for chunk in second], expected)
+
+    def test_summary_sampling_stays_fast_as_page_chunk_count_grows(self) -> None:
+        chunks = [
+            SourceChunk(index, "Page", "https://example.test", "word " * 300)
+            for index in range(1, 501)
+        ]
+
+        started = time.perf_counter()
+        selected = select_context_chunks(
+            chunks,
+            mode="summary",
+            max_context_chars=MAX_CONTEXT_CHAR_BUDGET,
+            max_chunks=8,
+        )
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(selected), 8)
+        self.assertEqual(selected[0].label, "[S1]")
+        self.assertEqual(selected[-1].label, "[S500]")
 
     def test_selection_respects_rendered_character_budget(self) -> None:
         large = [SourceChunk(1, "Title", "https://example.test", "<&>" * 1_000)]

@@ -161,6 +161,7 @@ function Get-OctoPyInstallerArguments {
         "--icon", (Join-Path $Root "assets\octobrowse.ico"),
         "--version-file", $VersionFile,
         "--add-data", ((Join-Path $Root "assets") + ";assets"),
+        "--add-data", ((Join-Path $Root "examples\mv3_hello") + ";examples\mv3_hello"),
         "--additional-hooks-dir", (Join-Path $Root "packaging\hooks"),
         "--exclude-module", "cv2",
         "--exclude-module", "numpy",

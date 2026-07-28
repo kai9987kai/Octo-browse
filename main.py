@@ -34,8 +34,17 @@ from octobrowse.filtering import (
     resource_type_name,
 )
 from octobrowse.ai_context import build_qa_prompt, build_summary_prompt, split_page_text
+from octobrowse.extensions import (
+    ExtensionManifestError,
+    extension_review_text,
+    inspect_extension_source,
+)
 from octobrowse.session import make_session_snapshot, normalize_session_snapshot
-from octobrowse.urls import can_dispatch_octo_command, is_internal_url as classify_internal_url
+from octobrowse.urls import (
+    can_dispatch_octo_command,
+    is_internal_url as classify_internal_url,
+    is_trusted_internal_url,
+)
 from octobrowse.version import __version__
 from octobrowse.workspaces import make_workspace, normalize_workspaces, workspace_to_markdown
 
@@ -71,9 +80,19 @@ try:
 except ImportError:  # pragma: no cover - optional runtime feature
     sr = None
 
-from PyQt6.QtCore import QSize, QStandardPaths, QStringListModel, QThread, QTimer, QUrl, Qt, pyqtSignal
+from PyQt6.QtCore import (
+    QSize,
+    QStandardPaths,
+    QStringListModel,
+    QThread,
+    QTimer,
+    QUrl,
+    Qt,
+    pyqtSignal,
+)
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon
 from PyQt6.QtWebEngineCore import (
+    QWebEnginePermission,
     QWebEnginePage,
     QWebEngineProfile,
     QWebEngineScript,
@@ -839,6 +858,7 @@ class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
         super().__init__()
         self.block_list = {domain.lower() for domain in block_list}
         self.blocked_by_domain: Counter[str] = Counter()
+        self.blocked_by_first_party: dict[str, Counter[str]] = {}
         self.ad_block_enabled = False
         self.https_only = False
         self.gpc_enabled = True
@@ -862,12 +882,16 @@ class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
                 match = self._matching_domain(host)
                 if match:
                     self.blocked_by_domain[match] += 1
+                    self._record_site_block(first_party_host, match)
                     info.block(True)
                     return
                 if rules is not None and rules.should_block(
                     url.toString(), host, request_type, first_party_host
                 ):
                     self.blocked_by_domain[host or "pattern-rule"] += 1
+                    self._record_site_block(
+                        first_party_host, host or "pattern-rule"
+                    )
                     info.block(True)
                     return
         if self.https_only and url.scheme() == "http" and self._upgradable_host(host):
@@ -884,10 +908,29 @@ class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
 
     def reset_stats(self) -> None:
         self.blocked_by_domain.clear()
+        self.blocked_by_first_party.clear()
         self.https_upgrades = 0
 
     def total_blocked(self) -> int:
         return sum(self.blocked_by_domain.values())
+
+    def blocked_for_site(self, host: str) -> int:
+        return sum(self.blocked_by_first_party.get(host.lower(), {}).values())
+
+    def top_blocked_for_site(
+        self, host: str, limit: int = 5
+    ) -> list[tuple[str, int]]:
+        return self.blocked_by_first_party.get(
+            host.lower(), Counter()
+        ).most_common(limit)
+
+    def _record_site_block(self, first_party_host: str, blocked_host: str) -> None:
+        if not first_party_host:
+            return
+        counter = self.blocked_by_first_party.setdefault(
+            first_party_host, Counter()
+        )
+        counter[blocked_host] += 1
 
     def _matching_domain(self, host: str) -> str | None:
         return _domain_suffix_match(host, self.block_list)
@@ -1034,6 +1077,8 @@ class OctoPluginAPI:
         self._require("navigation")
         browser = self._browser.current_browser()
         if browser:
+            browser.setProperty("generated_page", False)
+            browser.setProperty("internal_page", "")
             browser.setUrl(self._browser.build_url(str(url)))
 
     def reload(self) -> None:
@@ -1137,9 +1182,12 @@ class OctoWebPage(QWebEnginePage):
         self.browser_window = browser_window
         self.private = private
 
-    def createWindow(self, _window_type: QWebEnginePage.WebWindowType) -> QWebEnginePage:
-        view = self.browser_window.add_tab(QUrl("about:blank"), "New Window", private=self.private)
-        return view.page()
+    def createWindow(
+        self, _window_type: QWebEnginePage.WebWindowType
+    ) -> QWebEnginePage | None:
+        # Let QWebEnginePage emit newWindowRequested so the window can enforce
+        # user-gesture popup policy before allocating another tab.
+        return None
 
     def acceptNavigationRequest(
         self,
@@ -1161,6 +1209,14 @@ class OctoWebPage(QWebEnginePage):
             else:
                 self.browser_window.set_status("Blocked an untrusted page from invoking an Octo command")
             return False
+        if is_main_frame and navigation_type not in {
+            QWebEnginePage.NavigationType.NavigationTypeReload,
+            QWebEnginePage.NavigationType.NavigationTypeOther,
+        }:
+            parent_view = self.parent()
+            if isinstance(parent_view, QWebEngineView):
+                parent_view.setProperty("generated_page", False)
+                parent_view.setProperty("internal_page", "")
         return super().acceptNavigationRequest(url, navigation_type, is_main_frame)
 
 
@@ -1397,6 +1453,7 @@ class OctoBrowse(QMainWindow):
             self.plugin_grants,
             self.workspaces,
         ) = self.store.load()
+        self.private_site_content: dict[str, dict[str, bool]] = {}
         self.openai_api_key = self.settings.openai_api_key
         self.plugins_dir = self.store.directory / "plugins"
 
@@ -1425,7 +1482,17 @@ class OctoBrowse(QMainWindow):
         self.closed_tabs: list[dict[str, str]] = []
         self.ephemeral_paths: set[Path] = set()
         self.private_profile: QWebEngineProfile | None = None
-        self.profile = QWebEngineProfile.defaultProfile()
+        self.private_request_interceptor: OctoRequestInterceptor | None = None
+        # Qt's default profile is off-the-record. A named profile is required
+        # for standard tabs to retain cookies, local storage, cache, and
+        # persistent permission decisions across restarts.
+        webengine_root = self.store.directory / "webengine"
+        webengine_root.mkdir(parents=True, exist_ok=True)
+        self.profile = QWebEngineProfile("OctoBrowse", self)
+        self.profile.setPersistentStoragePath(str(webengine_root / "storage"))
+        self.profile.setCachePath(str(webengine_root / "cache"))
+        if self.profile.isOffTheRecord():
+            raise RuntimeError("The standard browser profile must be persistent.")
         self.native_user_agent = self.profile.httpUserAgent()
         self.apply_browser_identity(self.profile)
         self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
@@ -1542,6 +1609,7 @@ class OctoBrowse(QMainWindow):
         self.open_dashboard()
         self.restore_startup_tabs()
 
+        QTimer.singleShot(0, self.prune_nonpersistent_permission_records)
         QTimer.singleShot(0, self.update_weather)
         QTimer.singleShot(0, self.update_news)
 
@@ -1560,9 +1628,10 @@ class OctoBrowse(QMainWindow):
         self._add_action("Reload", "Refresh (F5)", self.refresh_page, "F5", QStyle.StandardPixmap.SP_BrowserReload)
         self._add_action("Home", "Open Homepage", self.go_home, icon=QStyle.StandardPixmap.SP_DirHomeIcon)
 
-        self.security_badge = QLabel("Octo")
+        self.security_badge = QPushButton("Octo")
         self.security_badge.setObjectName("SecurityBadge")
-        self.security_badge.setToolTip("Connection security")
+        self.security_badge.setToolTip("Open site trust and privacy details")
+        self.security_badge.clicked.connect(self.show_site_info)
         self.toolbar.addWidget(self.security_badge)
 
         self.url_bar = QLineEdit()
@@ -1618,6 +1687,12 @@ class OctoBrowse(QMainWindow):
 
         tools_menu = QMenu("Tools", self)
         self._add_menu_action(tools_menu, "Privacy Report", "Show ad-block and privacy state", self.show_privacy_report)
+        self._add_menu_action(
+            tools_menu,
+            "Inspect MV3 Extension...",
+            "Review a Manifest V3 package without installing or running it",
+            self.open_extension_inspector,
+        )
         self._add_menu_action(tools_menu, "Site Permissions", "Review saved per-site permissions", self.open_site_permissions)
         self._add_menu_action(tools_menu, "Site Controls", "Per-site JavaScript and image toggles", self.open_site_controls)
         self._add_menu_action(tools_menu, "Update EasyList", "Download and apply the EasyList filter list", self.update_easylist)
@@ -1632,6 +1707,7 @@ class OctoBrowse(QMainWindow):
         self._add_menu_action(tools_menu, "Upscale Page", "Open a 2x screenshot preview", self.upscale_page)
         self._add_menu_action(tools_menu, "Read Aloud", "Read page text aloud", self.read_aloud)
         self._add_menu_action(tools_menu, "Save Screenshot", "Save current viewport as PNG", self.save_screenshot)
+        self._add_menu_action(tools_menu, "Save as PDF", "Print the current page to a PDF file", self.save_page_as_pdf, "Ctrl+Shift+P")
         self._add_menu_action(tools_menu, "Duplicate Tab", "Open current page again", self.duplicate_current_tab)
         self._add_menu_action(tools_menu, "Copy URL", "Copy current URL to clipboard", self.copy_current_url)
         self._add_menu_action(tools_menu, "Copy Markdown Link", "Copy current page as a Markdown link", self.copy_markdown_link)
@@ -1712,6 +1788,12 @@ class OctoBrowse(QMainWindow):
         self._add_rail_action("Home", "Open dashboard", self.open_dashboard, QStyle.StandardPixmap.SP_DirHomeIcon)
         self._add_rail_action("Search", "Search tabs and saved collections", self.open_library_search, QStyle.StandardPixmap.SP_FileDialogContentsView)
         self._add_rail_action("Spaces", "Open named research workspaces", self.open_workspace_manager, QStyle.StandardPixmap.SP_DirIcon)
+        self._add_rail_action(
+            "MV3 Audit",
+            "Inspect a Manifest V3 package without executing it",
+            self.open_extension_inspector,
+            QStyle.StandardPixmap.SP_ComputerIcon,
+        )
         self._add_rail_action("Audit", "Show implemented feature checklist", self.open_feature_audit, QStyle.StandardPixmap.SP_DialogApplyButton)
         self.workspace_rail.addSeparator()
         self._add_rail_action("Notes", "Show notes and AI chat", lambda: self.toggle_panel(self.notes_sidebar), QStyle.StandardPixmap.SP_FileIcon)
@@ -1749,6 +1831,7 @@ class OctoBrowse(QMainWindow):
         self._add_menu_action(file_menu, "Restore Saved Tabs", "Open tabs from the last saved session", self.restore_saved_tabs)
         self._add_menu_action(file_menu, "Reopen Closed Tab", "Restore the most recently closed tab", self.reopen_closed_tab, "Ctrl+Shift+T")
         self._add_menu_action(file_menu, "Save Page As...", "Save the current page as HTML", self.save_page)
+        self._add_menu_action(file_menu, "Save as PDF...", "Print the current page to PDF", self.save_page_as_pdf)
         self._add_menu_action(file_menu, "View Source", "View page source", self.view_page_source)
 
         view_menu = menu_bar.addMenu("View")
@@ -1784,6 +1867,20 @@ class OctoBrowse(QMainWindow):
         ai_menu = menu_bar.addMenu("AI")
         self._add_menu_action(ai_menu, "Summarize Page", "Summarize readable page text", self.summarize_page)
         self._add_menu_action(ai_menu, "Ask About Page", "Open page-aware chat", self.open_chatbot)
+
+        extensions_menu = menu_bar.addMenu("Extensions")
+        self._add_menu_action(
+            extensions_menu,
+            "Inspect Manifest V3 Package",
+            "Review extension metadata and permissions without executing code",
+            self.open_extension_inspector,
+        )
+        self._add_menu_action(
+            extensions_menu,
+            "Trusted Python Plugins",
+            "Manage local Python automation",
+            self.open_plugin_manager,
+        )
 
     def setup_status_bar(self) -> None:
         self.status_state = QLabel("Ready")
@@ -1905,7 +2002,7 @@ class OctoBrowse(QMainWindow):
                 border-radius: 5px;
                 background: {accent};
             }}
-            QLabel#WeatherBadge, QLabel#SecurityBadge, QLabel#FindCount {{
+            QLabel#WeatherBadge, QPushButton#SecurityBadge, QLabel#FindCount {{
                 padding: 3px 8px;
                 border: 1px solid {border};
                 border-radius: 7px;
@@ -1963,8 +2060,11 @@ class OctoBrowse(QMainWindow):
         private = bool(browser and browser.property("private"))
         zoom = browser.zoomFactor() if browser else 1.0
         self.status_privacy.setText("Private tab" if private else "Standard tab")
+        interceptor = self.request_interceptor_for_browser(browser)
         self.status_blocked.setText(
-            f"Ad block {'on' if self.ad_block_enabled else 'off'} | {self.request_interceptor.total_blocked()} blocked"
+            f"Shield {'on' if self.ad_block_enabled else 'off'} | "
+            f"{interceptor.total_blocked()} trackers | "
+            f"{int(browser.property('blocked_popups') or 0) if browser else 0} popups"
         )
         self.status_zoom.setText(f"Zoom {int(zoom * 100)}%")
 
@@ -1983,6 +2083,7 @@ class OctoBrowse(QMainWindow):
             BrowserCommand("Reader view", "clean readable page", self.open_reader_view),
             BrowserCommand("Page insights", "word count keywords", self.show_page_insights),
             BrowserCommand("Save screenshot", "PNG viewport", self.save_screenshot),
+            BrowserCommand("Save page as PDF", "print offline document Ctrl+Shift+P", self.save_page_as_pdf),
             BrowserCommand("Duplicate tab", "open current page again", self.duplicate_current_tab),
             BrowserCommand("Reopen closed tab", "Ctrl+Shift+T", self.reopen_closed_tab),
             BrowserCommand("Copy current URL", "clipboard", self.copy_current_url),
@@ -1997,6 +2098,11 @@ class OctoBrowse(QMainWindow):
             BrowserCommand("Privacy report", "blocked requests", self.show_privacy_report),
             BrowserCommand("Site permissions", "camera mic location decisions", self.open_site_permissions),
             BrowserCommand("Site controls", "per-site javascript images", self.open_site_controls),
+            BrowserCommand(
+                "Inspect MV3 extension package",
+                "manifest permissions host access ZIP safety",
+                self.open_extension_inspector,
+            ),
             BrowserCommand("Update EasyList", "download ad-block filter list", self.update_easylist),
             BrowserCommand("Load filter list", "import adblock rules file", self.load_filter_list_file),
             BrowserCommand("Hibernate background tabs", "free memory now", self.hibernate_background_tabs_now),
@@ -2045,6 +2151,7 @@ class OctoBrowse(QMainWindow):
             "octo:library",
             "octo:workspaces",
             "octo:permissions",
+            "octo:extensions",
             "octo:plugins",
             "octo:settings",
             "!ddg ",
@@ -2431,6 +2538,7 @@ li {{ margin: 7px 0; }}
                 "Built-in PDF viewer",
                 "Versioned session restore with tab order, duplicates, titles, pins, and active position",
                 "Render-process crash detection with automatic reload",
+                "Gesture-aware popup handling that blocks automatic script windows",
             ],
             "Workspace": [
                 "Dashboard first screen",
@@ -2456,6 +2564,7 @@ li {{ margin: 7px 0; }}
                 "Save page HTML",
                 "View source",
                 "Screenshot saving",
+                "Native PDF export with completion reporting",
                 "Native Qt upscaled screenshot preview with automatic temporary-file cleanup",
                 "Copy URL and Markdown link",
             ],
@@ -2471,6 +2580,8 @@ li {{ margin: 7px 0; }}
                 "Per-site permission prompts for camera, microphone, location, and notifications",
                 "Connection security badge in the toolbar",
                 "Private/off-the-record tabs",
+                "Persistent named standard profile with durable logins, cache, and site storage",
+                "Qt-native permission lifetimes with private decisions kept off disk",
                 "Global private mode history pause",
                 "Expanded clear-browser-data controls",
                 "Native Qt Chromium identity with runtime and security-patch reporting",
@@ -2486,6 +2597,8 @@ li {{ margin: 7px 0; }}
                 "SpeechRecognition voice commands",
             ],
             "Extensibility": [
+                "Non-executing Manifest V3 package and permission inspector",
+                "Bounded ZIP validation with unsafe-path and oversized-package rejection",
                 "Trusted Python plugin API with manifest-declared intended capabilities",
                 "Python automation disabled by default behind explicit Developer Mode",
                 "Reduced-builtins and full-access trusted extension execution paths",
@@ -2499,17 +2612,118 @@ li {{ margin: 7px 0; }}
         if not browser:
             return
         url = browser.url()
+        url_text = url.toString()
+        private = bool(browser.property("private"))
+        profile = self.private_profile if private else self.profile
+        host = url.host().lower()
+        scheme = url.scheme().lower()
+        if browser.property("generated_page") and is_trusted_internal_url(url_text):
+            connection = "Trusted OctoBrowse-generated page"
+        elif scheme == "https":
+            connection = (
+                "HTTPS encrypted. Encryption does not prove the site itself is trustworthy."
+            )
+        elif scheme == "http":
+            connection = "Unencrypted HTTP connection"
+        elif scheme == "chrome-extension":
+            connection = "Installed browser-extension page"
+        elif scheme in {"about", "data", "file"}:
+            connection = "Local or embedded content (not a trusted OctoBrowse page)"
+        else:
+            connection = f"Non-web scheme: {scheme or 'unknown'}"
+
+        permission_lines: list[str] = []
+        if profile is not None:
+            try:
+                for permission in profile.listPermissionsForOrigin(url):
+                    name = getattr(
+                        permission.permissionType(),
+                        "name",
+                        str(permission.permissionType()),
+                    )
+                    state = getattr(
+                        permission.state(), "name", "unknown"
+                    ).lower()
+                    permission_lines.append(f"{name}: {state}")
+            except Exception:
+                pass
+        preferences = self.site_content_for_browser(browser).get(host, {})
+        interceptor = self.request_interceptor_for_browser(browser)
+        site_blocked = interceptor.blocked_for_site(host)
+        top_blocked = interceptor.top_blocked_for_site(host)
         lines = [
             f"URL: {url.toString()}",
-            f"Scheme: {url.scheme() or 'unknown'}",
+            f"Connection: {connection}",
             f"Host: {url.host() or 'local page'}",
-            f"Private tab: {'yes' if browser.property('private') else 'no'}",
+            f"Profile: {'private, off-the-record' if private else 'standard, persistent'}",
             f"Zoom: {int(browser.zoomFactor() * 100)}%",
             f"Ad block: {'on' if self.ad_block_enabled else 'off'}",
-            f"Blocked this session: {self.request_interceptor.total_blocked()}",
-            f"HTTP user agent: {self.profile.httpUserAgent()}",
+            f"Blocked for this site: {site_blocked}",
+            f"Automatic popups blocked on this tab: {int(browser.property('blocked_popups') or 0)}",
+            f"JavaScript: {'allowed' if preferences.get('javascript', True) else 'blocked'}",
+            f"Images: {'allowed' if preferences.get('images', True) else 'blocked'}",
+            f"Third-party cookies/storage: {'blocked' if self.settings.block_third_party_cookies else 'allowed'}",
         ]
-        QMessageBox.information(self, "Site Info", "\n".join(lines))
+        if top_blocked:
+            lines.append(
+                "Top blocked: "
+                + ", ".join(
+                    f"{domain} ({count})" for domain, count in top_blocked
+                )
+            )
+        lines.append(
+            "Permissions: "
+            + (
+                ", ".join(permission_lines)
+                if permission_lines
+                else "none stored"
+            )
+        )
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Site Trust Center")
+        dialog.resize(650, 360)
+        layout = QVBoxLayout(dialog)
+        summary = QPlainTextEdit("\n".join(lines))
+        summary.setReadOnly(True)
+        layout.addWidget(summary)
+        buttons = QHBoxLayout()
+        controls_button = QPushButton("Site Controls...")
+        reset_permissions_button = QPushButton("Reset Site Permissions")
+        privacy_button = QPushButton("Session Privacy Report")
+        close_button = QPushButton("Close")
+        for button in (
+            controls_button,
+            reset_permissions_button,
+            privacy_button,
+            close_button,
+        ):
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+
+        def reset_site_permissions() -> None:
+            if profile is not None:
+                try:
+                    for permission in profile.listPermissionsForOrigin(url):
+                        permission.reset()
+                except Exception:
+                    pass
+            origin = self._permission_key(url)
+            if not private:
+                self.site_permissions.pop(origin, None)
+                self.save_settings()
+            self.set_status(f"Reset permissions for {origin}")
+            dialog.accept()
+
+        controls_button.clicked.connect(
+            lambda: (dialog.accept(), self.open_site_controls())
+        )
+        reset_permissions_button.clicked.connect(reset_site_permissions)
+        privacy_button.clicked.connect(
+            lambda: (dialog.accept(), self.show_privacy_report())
+        )
+        close_button.clicked.connect(dialog.accept)
+        dialog.exec()
 
     def open_browser_identity_page(self) -> None:
         user_agent = html.escape(self.profile.httpUserAgent())
@@ -2626,14 +2840,46 @@ code, pre {{
             return self.profile
         if self.private_profile is None:
             self.private_profile = QWebEngineProfile(self)
+            if not self.private_profile.isOffTheRecord():
+                raise RuntimeError("Private tabs require an off-the-record profile.")
             self.apply_browser_identity(self.private_profile)
             self.install_privacy_script(self.private_profile)
             self.apply_cookie_policy(self.private_profile)
             self.private_profile.downloadRequested.connect(
                 lambda download: self.handle_download_requested(download, private=True)
             )
-            self.private_profile.setUrlRequestInterceptor(self.request_interceptor)
+            self.private_request_interceptor = OctoRequestInterceptor(
+                AD_BLOCK_LIST
+            )
+            self.private_request_interceptor.filter_rules = (
+                self.request_interceptor.filter_rules
+            )
+            self.private_profile.setUrlRequestInterceptor(
+                self.private_request_interceptor
+            )
+            self.apply_privacy_settings()
         return self.private_profile
+
+    def request_interceptor_for_browser(
+        self, browser: QWebEngineView | None = None
+    ) -> OctoRequestInterceptor:
+        target = browser or self.current_browser()
+        if (
+            target is not None
+            and target.property("private")
+            and self.private_request_interceptor is not None
+        ):
+            return self.private_request_interceptor
+        return self.request_interceptor
+
+    def site_content_for_browser(
+        self, browser: QWebEngineView | None = None
+    ) -> dict[str, dict[str, bool]]:
+        """Return persistent or private-session content controls for a tab."""
+        target = browser or self.current_browser()
+        if target is not None and target.property("private"):
+            return self.private_site_content
+        return self.site_content
 
     def apply_browser_identity(self, profile: QWebEngineProfile) -> None:
         user_agent = self.settings.user_agent or self.native_user_agent
@@ -2679,10 +2925,14 @@ code, pre {{
 
     def apply_privacy_settings(self) -> None:
         """Push the current privacy toggles into the always-installed interceptor."""
-        self.request_interceptor.ad_block_enabled = self.ad_block_enabled
-        self.request_interceptor.https_only = self.settings.https_only
-        self.request_interceptor.gpc_enabled = self.settings.gpc_enabled
-        self.request_interceptor.dnt_enabled = self.settings.dnt_enabled
+        interceptors = [self.request_interceptor]
+        if self.private_request_interceptor is not None:
+            interceptors.append(self.private_request_interceptor)
+        for interceptor in interceptors:
+            interceptor.ad_block_enabled = self.ad_block_enabled
+            interceptor.https_only = self.settings.https_only
+            interceptor.gpc_enabled = self.settings.gpc_enabled
+            interceptor.dnt_enabled = self.settings.dnt_enabled
         self.install_privacy_script(self.profile)
         self.apply_cookie_policy(self.profile)
         if self.private_profile is not None:
@@ -2700,6 +2950,8 @@ code, pre {{
                     continue
         if not texts:
             self.request_interceptor.filter_rules = None
+            if self.private_request_interceptor is not None:
+                self.private_request_interceptor.filter_rules = None
             return
         worker = FilterParseWorker(texts, self)
         worker.parsed.connect(self.handle_filter_rules_parsed)
@@ -2715,6 +2967,8 @@ code, pre {{
         if not isinstance(rules, FilterRuleSet):
             return
         self.request_interceptor.filter_rules = rules
+        if self.private_request_interceptor is not None:
+            self.private_request_interceptor.filter_rules = rules
         self.set_status(
             f"Filter lists loaded: {rules.rule_count} rules "
             f"({len(rules.blocked_domains)} domains, {rules.skipped_count} unsupported skipped)"
@@ -2759,7 +3013,7 @@ code, pre {{
         for attr_name, value in (
             ("FullScreenSupportEnabled", True),
             ("PdfViewerEnabled", True),
-            ("PluginsEnabled", True),
+            ("PluginsEnabled", False),
             ("ScrollAnimatorEnabled", True),
         ):
             attr = getattr(QWebEngineSettings.WebAttribute, attr_name, None)
@@ -2775,26 +3029,62 @@ code, pre {{
         page.renderProcessTerminated.connect(
             lambda status, _code, browser=browser: self.handle_render_crash(browser, status)
         )
+        page.pdfPrintingFinished.connect(self.handle_pdf_printed)
+        page.newWindowRequested.connect(
+            lambda request, browser=browser: self.handle_new_window_request(
+                browser, request
+            )
+        )
         if hasattr(page, "permissionRequested"):  # Qt 6.8+
-            page.permissionRequested.connect(self.handle_permission_request)
+            page.permissionRequested.connect(
+                lambda permission, page=page: self.handle_permission_request(
+                    page, permission
+                )
+            )
         elif hasattr(page, "featurePermissionRequested"):
             page.featurePermissionRequested.connect(
                 lambda origin, feature, page=page: self.handle_feature_permission(page, origin, feature)
             )
+
+    def handle_new_window_request(
+        self, source_browser: QWebEngineView, request: Any
+    ) -> None:
+        """Open gesture-driven windows as tabs and block script-only popups."""
+        if not request.isUserInitiated():
+            blocked_for_tab = int(source_browser.property("blocked_popups") or 0) + 1
+            source_browser.setProperty("blocked_popups", blocked_for_tab)
+            self.set_status(
+                f"Blocked {blocked_for_tab} automatic popup"
+                f"{'s' if blocked_for_tab != 1 else ''} on this tab"
+            )
+            self.update_status_badges()
+            return
+
+        previous_index = self.tabs.currentIndex()
+        is_private = bool(source_browser.property("private"))
+        target = self.add_tab(
+            QUrl("about:blank"), "New Tab", private=is_private
+        )
+        request.openIn(target.page())
+        destination = getattr(request.destination(), "name", "")
+        if destination == "InNewBackgroundTab" and previous_index >= 0:
+            self.tabs.setCurrentIndex(previous_index)
 
     def add_tab(self, url: QUrl, title: str, private: bool | None = None) -> QWebEngineView:
         is_private = self.incognito_mode if private is None else private
         browser = QWebEngineView()
         browser.setProperty("private", is_private)
         browser.setProperty("pinned", False)
+        browser.setProperty("generated_page", False)
+        browser.setProperty("internal_page", "")
         browser.setPage(OctoWebPage(self, self.profile_for_tab(is_private), is_private, browser))
-        browser.load(url)
 
         display_title = f"Private - {title}" if is_private else title
         index = self.tabs.addTab(browser, display_title)
         self.tabs.setCurrentIndex(index)
 
         self._wire_browser(browser)
+        browser.load(url)
         self.update_status_badges()
         self.set_status("Opened private tab" if is_private else "Opened tab")
         return browser
@@ -2914,11 +3204,15 @@ code, pre {{
 
     def cleanup_ephemeral_path(self, path: str | Path) -> None:
         candidate = Path(path)
-        self.ephemeral_paths.discard(candidate)
         try:
             candidate.unlink(missing_ok=True)
         except OSError:
-            pass
+            # Windows media and WebEngine processes can briefly hold generated
+            # files open. Keep tracking the path so shutdown can retry instead
+            # of silently forgetting sensitive speech/screenshot artifacts.
+            self.ephemeral_paths.add(candidate)
+            return
+        self.ephemeral_paths.discard(candidate)
 
     def reopen_closed_tab(self) -> None:
         if not self.closed_tabs:
@@ -2934,7 +3228,7 @@ code, pre {{
             return
         self.wake_browser(browser)
         self.url_bar.setText(browser.url().toString())
-        self.update_security_badge(browser.url())
+        self.update_security_badge(browser.url(), browser)
         self.progress_bar.hide()
         self.update_status_badges()
         self.set_status("Ready")
@@ -2973,6 +3267,8 @@ code, pre {{
     def go_home(self) -> None:
         browser = self.current_browser()
         if browser:
+            browser.setProperty("generated_page", False)
+            browser.setProperty("internal_page", "")
             browser.setUrl(self.build_url(self.settings.homepage))
 
     def navigate_to_url(self) -> None:
@@ -2983,6 +3279,8 @@ code, pre {{
             return
         browser = self.current_browser()
         if browser:
+            browser.setProperty("generated_page", False)
+            browser.setProperty("internal_page", "")
             browser.setUrl(self.build_url(url_text))
             self.set_status("Navigating")
 
@@ -3010,6 +3308,7 @@ code, pre {{
             "tasks": lambda: self.toggle_panel(self.todo_sidebar),
             "notes": lambda: self.toggle_panel(self.notes_sidebar),
             "permissions": self.open_site_permissions,
+            "extensions": self.open_extension_inspector,
             "plugins": self.open_plugin_manager,
             "settings": self.open_settings,
         }
@@ -3106,19 +3405,21 @@ code, pre {{
             for index in range(self.tabs.count()):
                 existing = self.tabs.widget(index)
                 if isinstance(existing, QWebEngineView) and existing.property("internal_page") == internal_page:
-                    existing.setHtml(html_text, QUrl("https://octobrowse.local/"))
+                    existing.setProperty("generated_page", True)
                     self.tabs.setTabText(index, title)
                     self.tabs.setCurrentIndex(index)
+                    existing.setHtml(html_text, QUrl("https://octobrowse.local/"))
                     return
         browser = QWebEngineView()
         browser.setProperty("private", private)
         browser.setProperty("pinned", False)
+        browser.setProperty("generated_page", True)
         browser.setProperty("internal_page", internal_page or "")
         browser.setPage(OctoWebPage(self, self.profile_for_tab(private), private, browser))
-        browser.setHtml(html_text, QUrl("https://octobrowse.local/"))
         index = self.tabs.addTab(browser, title)
         self.tabs.setCurrentIndex(index)
         self._wire_browser(browser)
+        browser.setHtml(html_text, QUrl("https://octobrowse.local/"))
         self.update_status_badges()
 
     def open_dashboard(self) -> None:
@@ -3196,6 +3497,7 @@ li {{ margin: 8px 0; }}
     <a class="metric" href="octo:reading">Reading<strong>{reading_count}</strong></a>
     <a class="metric" href="octo:tabs">Saved Tabs<strong>{saved_tabs_count}</strong></a>
     <a class="metric" href="octo:workspaces">Workspaces<strong>{workspace_count}</strong></a>
+    <a class="metric" href="octo:extensions">MV3 Safety<strong>Audit</strong></a>
   </section>
   <section class="actions">
     <a class="action" href="octo:features"><strong>Feature Audit</strong><span>Verify the old and new capability set.</span></a>
@@ -3204,6 +3506,7 @@ li {{ margin: 8px 0; }}
     <a class="action" href="octo:identity"><strong>Browser Identity</strong><span>Inspect Octo Browser user agent and navigator values.</span></a>
     <a class="action" href="octo:tabs"><strong>Tab Overview</strong><span>Review ordinary tabs without exposing private browsing.</span></a>
     <a class="action" href="octo:downloads"><strong>Downloads</strong><span>Open download progress and completed files.</span></a>
+    <a class="action" href="octo:extensions"><strong>Extension Inspector</strong><span>Audit Manifest V3 packages without installing or executing them.</span></a>
     <a class="action" href="octo:settings"><strong>Settings</strong><span>Manage homepage, keys, model, weather, and news.</span></a>
   </section>
   <section class="wide">
@@ -3289,9 +3592,15 @@ p {{ margin: 0 0 20px; }}
         browser = self.current_browser()
         if not browser:
             return
-        browser.page().toPlainText(lambda text: self.display_page_insights(text, browser.url().toString()))
+        url = browser.url().toString()
+        blocked = self.request_interceptor_for_browser(browser).total_blocked()
+        browser.page().toPlainText(
+            lambda text, url=url, blocked=blocked: self.display_page_insights(
+                text, url, blocked
+            )
+        )
 
-    def display_page_insights(self, text: str, url: str) -> None:
+    def display_page_insights(self, text: str, url: str, blocked: int = 0) -> None:
         cleaned = self.clean_page_text(text)
         words = cleaned.split()
         minutes = max(1, round(len(words) / 220)) if words else 0
@@ -3301,7 +3610,7 @@ p {{ margin: 0 0 20px; }}
             f"Words: {len(words)}",
             f"Estimated read time: {minutes} min",
             f"Top terms: {keywords}",
-            f"Ad-blocked requests this session: {self.request_interceptor.total_blocked()}",
+            f"Ad-blocked requests for this profile: {blocked}",
         ]
         QMessageBox.information(self, "Page Insights", "\n".join(lines))
 
@@ -3340,27 +3649,53 @@ p {{ margin: 0 0 20px; }}
         browser.setProperty("last_active", time.time())
         text = url.toString()
         self.url_bar.setText(text)
-        self.update_security_badge(url)
+        if not is_trusted_internal_url(text):
+            browser.setProperty("generated_page", False)
+            browser.setProperty("internal_page", "")
+        self.update_security_badge(url, browser)
         if not self.incognito_mode and not browser.property("private") and not self.is_internal_url(text):
             self.add_to_history(text)
         self.update_status_badges()
 
-    def update_security_badge(self, url: QUrl) -> None:
+    def update_security_badge(
+        self, url: QUrl, browser: QWebEngineView | None = None
+    ) -> None:
         if not hasattr(self, "security_badge"):
             return
+        target = browser or self.current_browser()
         scheme = url.scheme().lower()
-        if self.is_internal_url(url.toString()):
+        if (
+            target is not None
+            and target.property("generated_page")
+            and is_trusted_internal_url(url.toString())
+        ):
             self.security_badge.setText("Octo")
-            self.security_badge.setToolTip("Internal OctoBrowse page")
+            self.security_badge.setToolTip(
+                "Trusted OctoBrowse page - open Site Trust Center"
+            )
         elif scheme == "https":
             self.security_badge.setText("\U0001F512")
-            self.security_badge.setToolTip("Connection uses HTTPS")
+            self.security_badge.setToolTip(
+                "HTTPS encrypted - open Site Trust Center"
+            )
         elif scheme == "http":
-            self.security_badge.setText("⚠ http")
-            self.security_badge.setToolTip("Connection is not encrypted")
+            self.security_badge.setText("HTTP")
+            self.security_badge.setToolTip(
+                "Connection is not encrypted - open Site Trust Center"
+            )
+        elif scheme in {"about", "data", "file"}:
+            self.security_badge.setText("Local")
+            self.security_badge.setToolTip(
+                "Local or embedded content; not a trusted OctoBrowse page"
+            )
+        elif scheme == "chrome-extension":
+            self.security_badge.setText("Ext")
+            self.security_badge.setToolTip("Installed browser extension page")
         else:
             self.security_badge.setText(scheme or "?")
-            self.security_badge.setToolTip(f"Scheme: {scheme or 'unknown'}")
+            self.security_badge.setToolTip(
+                f"Scheme: {scheme or 'unknown'} - open Site Trust Center"
+            )
 
     def _make_history_item(self, entry: dict[str, Any]) -> QListWidgetItem:
         title = str(entry.get("title") or "").strip()
@@ -3487,7 +3822,10 @@ p {{ margin: 0 0 20px; }}
                 widget.page().runJavaScript(clear_storage)
         self.site_permissions.clear()
         self.site_content.clear()
+        self.private_site_content.clear()
         self.request_interceptor.reset_stats()
+        if self.private_request_interceptor is not None:
+            self.private_request_interceptor.reset_stats()
         self.save_settings()
         QMessageBox.information(
             self,
@@ -3755,8 +4093,20 @@ p {{ margin: 0 0 20px; }}
         QMessageBox.information(self, "Ad Block", f"Ad block {status}.")
 
     def show_privacy_report(self) -> None:
-        blocked = self.request_interceptor.total_blocked()
-        top_domains = self.request_interceptor.blocked_by_domain.most_common(8)
+        browser = self.current_browser()
+        interceptor = self.request_interceptor_for_browser(browser)
+        private = bool(browser and browser.property("private"))
+        profile = self.private_profile if private else self.profile
+        blocked = interceptor.total_blocked()
+        top_domains = interceptor.blocked_by_domain.most_common(8)
+        try:
+            saved_permissions = len(profile.listAllPermissions()) if profile else 0
+        except Exception:
+            saved_permissions = (
+                0
+                if private
+                else sum(len(features) for features in self.site_permissions.values())
+            )
         rules = self.request_interceptor.filter_rules
         filter_summary = (
             f"{rules.rule_count} rules ({len(rules.blocked_domains)} domains, {rules.skipped_count} skipped)"
@@ -3765,15 +4115,21 @@ p {{ margin: 0 0 20px; }}
         )
         lines = [
             f"Ad block: {'on' if self.ad_block_enabled else 'off'}",
-            f"Blocked requests this session: {blocked}",
+            f"Profile: {'private, off-the-record' if private else 'standard, persistent'}",
+            f"Blocked requests for this profile: {blocked}",
             f"Filter lists: {filter_summary}",
-            f"Site content overrides: {len(self.site_content)}",
+            f"Site content overrides for this profile: "
+            f"{len(self.site_content_for_browser(browser))}",
             f"HTTPS-only mode: {'on' if self.settings.https_only else 'off'}",
-            f"HTTPS upgrades this session: {self.request_interceptor.https_upgrades}",
+            f"HTTPS upgrades for this profile: {interceptor.https_upgrades}",
             f"Global Privacy Control: {'on' if self.settings.gpc_enabled else 'off'}",
             f"Legacy Do Not Track: {'on' if self.settings.dnt_enabled else 'off'}",
             f"Third-party cookies/storage: {'blocked' if self.settings.block_third_party_cookies else 'allowed'}",
-            f"Saved site permissions: {sum(len(features) for features in self.site_permissions.values())}",
+            f"Saved persistent site permissions: {saved_permissions}",
+            f"Automatic popups blocked on current tab: "
+            f"{int(browser.property('blocked_popups') or 0) if browser else 0}",
+            f"Active profile storage: "
+            f"{'off-the-record' if profile is None or profile.isOffTheRecord() else 'persistent'}",
             f"History entries: {len(self.history)}",
             f"Bookmarks: {len(self.bookmarks)}",
             f"Current tab: {'private' if self.current_browser() and self.current_browser().property('private') else 'standard'}",
@@ -4368,32 +4724,85 @@ p {{ margin: 0 0 20px; }}
             return f"{origin.scheme()}://{origin.host()}:{origin.port()}"
         return f"{origin.scheme()}://{origin.host()}"
 
-    def _decide_permission(self, origin: QUrl, feature_name: str) -> bool:
+    @staticmethod
+    def _permission_is_persistent(permission_type: Any) -> bool:
+        try:
+            return bool(QWebEnginePermission.isPersistent(permission_type))
+        except (AttributeError, TypeError):
+            return False
+
+    def prune_nonpersistent_permission_records(self) -> None:
+        """Drop legacy JSON grants that Qt defines as page-lifetime only."""
+        changed = False
+        for origin, features in list(self.site_permissions.items()):
+            for feature_name in list(features):
+                permission_type = getattr(
+                    QWebEnginePermission.PermissionType,
+                    feature_name,
+                    None,
+                )
+                if permission_type is not None and not self._permission_is_persistent(
+                    permission_type
+                ):
+                    features.pop(feature_name, None)
+                    changed = True
+            if not features:
+                self.site_permissions.pop(origin, None)
+        if changed:
+            self.save_settings()
+
+    def _decide_permission(
+        self,
+        origin: QUrl,
+        feature_name: str,
+        *,
+        remember: bool,
+    ) -> bool:
         key = self._permission_key(origin)
-        stored = self.site_permissions.get(key, {})
-        if feature_name in stored:
-            return stored[feature_name]
+        if remember:
+            stored = self.site_permissions.get(key, {})
+            if feature_name in stored:
+                return stored[feature_name]
         label = feature_name.replace("MediaAudioVideoCapture", "camera and microphone")
         label = label.replace("MediaAudioCapture", "microphone").replace("MediaVideoCapture", "camera")
         label = label.replace("DesktopAudioVideoCapture", "screen and audio capture")
         label = label.replace("DesktopVideoCapture", "screen capture")
+        lifetime = (
+            "This decision is remembered for this site."
+            if remember
+            else "This decision lasts only for the current page."
+        )
         answer = QMessageBox.question(
             self,
             "Site Permission",
-            f"{key} wants to use: {label}\n\nAllow? Your choice is remembered for this site.",
+            f"{key} wants to use: {label}\n\n{lifetime}\n\nAllow?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         allowed = answer == QMessageBox.StandardButton.Yes
-        self.site_permissions.setdefault(key, {})[feature_name] = allowed
-        self.save_settings()
+        if remember:
+            self.site_permissions.setdefault(key, {})[feature_name] = allowed
+            self.save_settings()
         return allowed
 
-    def handle_permission_request(self, permission: Any) -> None:
+    def handle_permission_request(
+        self, page: QWebEnginePage, permission: Any
+    ) -> None:
         """Qt 6.8+ unified permission API."""
         try:
-            feature_name = getattr(permission.permissionType(), "name", str(permission.permissionType()))
-            if self._decide_permission(permission.origin(), feature_name):
+            permission_type = permission.permissionType()
+            feature_name = getattr(permission_type, "name", str(permission_type))
+            parent_view = page.parent()
+            private = bool(
+                isinstance(parent_view, QWebEngineView)
+                and parent_view.property("private")
+            )
+            remember = (
+                not private and self._permission_is_persistent(permission_type)
+            )
+            if self._decide_permission(
+                permission.origin(), feature_name, remember=remember
+            ):
                 permission.grant()
             else:
                 permission.deny()
@@ -4405,7 +4814,7 @@ p {{ margin: 0 0 20px; }}
         feature_name = getattr(feature, "name", str(feature))
         policy = (
             QWebEnginePage.PermissionPolicy.PermissionGrantedByUser
-            if self._decide_permission(origin, feature_name)
+            if self._decide_permission(origin, feature_name, remember=False)
             else QWebEnginePage.PermissionPolicy.PermissionDeniedByUser
         )
         page.setFeaturePermission(origin, feature, policy)
@@ -4415,15 +4824,48 @@ p {{ margin: 0 0 20px; }}
         dialog.setWindowTitle("Site Permissions")
         dialog.resize(560, 400)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("Saved per-site permission decisions. Double-click an entry to remove it."))
+        layout.addWidget(
+            QLabel(
+                "Persistent standard-profile decisions. Camera, microphone, "
+                "screen, and private-tab choices are intentionally not saved. "
+                "Double-click an entry to reset it."
+            )
+        )
         permissions_list = QListWidget()
+        native_permissions: dict[tuple[str, str], Any] = {}
 
         def refresh() -> None:
             permissions_list.clear()
+            native_permissions.clear()
+            try:
+                for permission in self.profile.listAllPermissions():
+                    permission_type = permission.permissionType()
+                    feature_name = getattr(
+                        permission_type, "name", str(permission_type)
+                    )
+                    origin = self._permission_key(permission.origin())
+                    state = getattr(permission.state(), "name", "unknown").lower()
+                    key = (origin, feature_name)
+                    native_permissions[key] = permission
+                    item = QListWidgetItem(
+                        f"{origin} - {feature_name}: {state}"
+                    )
+                    item.setData(
+                        Qt.ItemDataRole.UserRole,
+                        ("native", origin, feature_name),
+                    )
+                    permissions_list.addItem(item)
+            except Exception:
+                pass
             for origin, features in sorted(self.site_permissions.items()):
                 for feature_name, allowed in sorted(features.items()):
+                    if (origin, feature_name) in native_permissions:
+                        continue
                     item = QListWidgetItem(f"{origin} - {feature_name}: {'allowed' if allowed else 'blocked'}")
-                    item.setData(Qt.ItemDataRole.UserRole, (origin, feature_name))
+                    item.setData(
+                        Qt.ItemDataRole.UserRole,
+                        ("legacy", origin, feature_name),
+                    )
                     permissions_list.addItem(item)
             if not permissions_list.count():
                 permissions_list.addItem(QListWidgetItem("No saved site permissions."))
@@ -4432,7 +4874,11 @@ p {{ margin: 0 0 20px; }}
             data = item.data(Qt.ItemDataRole.UserRole)
             if not data:
                 return
-            origin, feature_name = data
+            source, origin, feature_name = data
+            if source == "native":
+                permission = native_permissions.get((origin, feature_name))
+                if permission is not None:
+                    permission.reset()
             self.site_permissions.get(origin, {}).pop(feature_name, None)
             if not self.site_permissions.get(origin):
                 self.site_permissions.pop(origin, None)
@@ -4444,6 +4890,11 @@ p {{ margin: 0 0 20px; }}
         clear_btn = QPushButton("Clear All")
 
         def clear_all() -> None:
+            try:
+                for permission in self.profile.listAllPermissions():
+                    permission.reset()
+            except Exception:
+                pass
             self.site_permissions.clear()
             self.save_settings()
             refresh()
@@ -4456,7 +4907,7 @@ p {{ margin: 0 0 20px; }}
     def apply_site_content(self, browser: QWebEngineView, url: QUrl) -> None:
         """Apply per-site JavaScript/image preferences before the page renders."""
         host = url.host().lower()
-        prefs = self.site_content.get(host, {})
+        prefs = self.site_content_for_browser(browser).get(host, {})
         settings = browser.settings()
         settings.setAttribute(
             QWebEngineSettings.WebAttribute.JavascriptEnabled, bool(prefs.get("javascript", True))
@@ -4473,12 +4924,24 @@ p {{ margin: 0 0 20px; }}
         if not host or self.is_internal_url(browser.url().toString()):
             QMessageBox.information(self, "Site Controls", "Open a website tab to set per-site controls.")
             return
-        prefs = self.site_content.get(host, {})
+        private = bool(browser.property("private"))
+        content_settings = self.site_content_for_browser(browser)
+        prefs = content_settings.get(host, {})
 
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Site Controls - {host}")
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel(f"Content controls for {host} (reload the page to fully apply):"))
+        lifetime = (
+            "Private-session controls stay in memory and are never saved to disk."
+            if private
+            else "Standard-profile controls persist across restarts."
+        )
+        layout.addWidget(
+            QLabel(
+                f"Content controls for {host} (reload the page to fully apply):\n"
+                f"{lifetime}"
+            )
+        )
         javascript_check = QCheckBox("Allow JavaScript")
         javascript_check.setChecked(bool(prefs.get("javascript", True)))
         images_check = QCheckBox("Load images")
@@ -4493,15 +4956,115 @@ p {{ margin: 0 0 20px; }}
 
         new_prefs = {"javascript": javascript_check.isChecked(), "images": images_check.isChecked()}
         if all(new_prefs.values()):
-            self.site_content.pop(host, None)
+            content_settings.pop(host, None)
         else:
-            self.site_content[host] = new_prefs
+            content_settings[host] = new_prefs
         for index in range(self.tabs.count()):
             widget = self.tabs.widget(index)
-            if isinstance(widget, QWebEngineView) and widget.url().host().lower() == host:
+            if (
+                isinstance(widget, QWebEngineView)
+                and bool(widget.property("private")) == private
+                and widget.url().host().lower() == host
+            ):
                 self.apply_site_content(widget, widget.url())
-        self.save_settings()
-        self.set_status(f"Site controls saved for {host}")
+        if not private:
+            self.save_settings()
+        self.set_status(
+            f"Site controls {'held for this private session' if private else 'saved'} "
+            f"for {host}"
+        )
+
+    def open_extension_inspector(self) -> None:
+        """Review a Manifest V3 package without loading or executing it."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manifest V3 Extension Inspector")
+        dialog.resize(760, 520)
+        layout = QVBoxLayout(dialog)
+
+        introduction = QLabel(
+            "Inspect an unpacked Manifest V3 folder or ZIP before trusting it. "
+            "OctoBrowse reads only manifest metadata: it does not install, "
+            "extract, load, enable, or execute the extension."
+        )
+        introduction.setWordWrap(True)
+        layout.addWidget(introduction)
+
+        output = QPlainTextEdit()
+        output.setReadOnly(True)
+        output.setPlainText(
+            "Choose a folder, ZIP archive, or the bundled sample to review "
+            "declared permissions and site access."
+        )
+        layout.addWidget(output)
+
+        buttons = QHBoxLayout()
+        folder_button = QPushButton("Inspect Folder...")
+        zip_button = QPushButton("Inspect ZIP...")
+        sample_button = QPushButton("Inspect Sample")
+        close_button = QPushButton("Close")
+        for button in (
+            folder_button,
+            zip_button,
+            sample_button,
+            close_button,
+        ):
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+
+        def inspect_path(path: str | Path) -> None:
+            try:
+                manifest = inspect_extension_source(path)
+            except ExtensionManifestError as exc:
+                output.setPlainText(
+                    "Extension inspection failed.\n\n"
+                    f"{exc}\n\n"
+                    "No extension code was loaded or executed."
+                )
+                self.set_status("Extension inspection failed")
+                return
+
+            description = manifest.description or "No description provided."
+            package_label = (
+                "ZIP archive"
+                if manifest.package_type == "zip"
+                else "unpacked folder"
+            )
+            output.setPlainText(
+                f"{extension_review_text(manifest)}\n\n"
+                f"Description: {description}\n"
+                f"Manifest version: {manifest.manifest_version}\n"
+                f"Package: {package_label}\n"
+                f"Source: {manifest.source}\n\n"
+                "Safety: metadata only. OctoBrowse did not install, extract, "
+                "load, enable, or execute this extension."
+            )
+            self.set_status(f"Inspected extension manifest: {manifest.name}")
+
+        def choose_folder() -> None:
+            path = QFileDialog.getExistingDirectory(
+                dialog,
+                "Select an unpacked Manifest V3 extension",
+            )
+            if path:
+                inspect_path(path)
+
+        def choose_zip() -> None:
+            path, _selected_filter = QFileDialog.getOpenFileName(
+                dialog,
+                "Select a Manifest V3 extension ZIP",
+                "",
+                "ZIP archives (*.zip)",
+            )
+            if path:
+                inspect_path(path)
+
+        folder_button.clicked.connect(choose_folder)
+        zip_button.clicked.connect(choose_zip)
+        sample_button.clicked.connect(
+            lambda: inspect_path(resource_path("examples/mv3_hello"))
+        )
+        close_button.clicked.connect(dialog.accept)
+        dialog.exec()
 
     def _read_plugin_manifest(self, path: Path) -> dict[str, Any] | None:
         """Extract MANIFEST from a plugin file without executing any of its code."""
@@ -4829,6 +5392,10 @@ p {{ margin: 0 0 20px; }}
         save_action.triggered.connect(self.save_page)
         menu.addAction(save_action)
 
+        pdf_action = QAction("Save as PDF...", self)
+        pdf_action.triggered.connect(self.save_page_as_pdf)
+        menu.addAction(pdf_action)
+
         view_source_action = QAction("View Page Source", self)
         view_source_action.triggered.connect(self.view_page_source)
         menu.addAction(view_source_action)
@@ -4858,6 +5425,39 @@ p {{ margin: 0 0 20px; }}
         file_path, _ = QFileDialog.getSaveFileName(self, "Save Page As", "", "HTML Files (*.html)")
         if file_path:
             browser.page().toHtml(lambda html: self.write_html(file_path, html))
+
+    def save_page_as_pdf(self) -> None:
+        browser = self.current_browser()
+        if not browser:
+            return
+        default_name = re.sub(
+            r'[<>:"/\\|?*]+',
+            "_",
+            browser.page().title() or "OctoBrowse page",
+        ).strip(" ._")
+        file_path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Page as PDF",
+            f"{default_name or 'OctoBrowse page'}.pdf",
+            "PDF Documents (*.pdf)",
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith(".pdf"):
+            file_path = f"{file_path}.pdf"
+        browser.page().printToPdf(file_path)
+        self.set_status("Printing page to PDF...")
+
+    def handle_pdf_printed(self, file_path: str, success: bool) -> None:
+        if success:
+            self.set_status(f"Saved PDF: {file_path}")
+        else:
+            QMessageBox.warning(
+                self,
+                "Save as PDF",
+                f"Could not save the PDF to:\n{file_path}",
+            )
+            self.set_status("PDF export failed")
 
     def write_html(self, file_path: str, html: str) -> None:
         try:
@@ -5284,6 +5884,8 @@ def main() -> int:
     browser = OctoBrowse()
     browser.show()
     if smoke_test:
+        # Exercise both profile constructors in the release smoke path.
+        browser.profile_for_tab(True)
         QTimer.singleShot(3_000, browser.close)
     return app.exec()
 
