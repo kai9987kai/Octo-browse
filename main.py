@@ -39,6 +39,13 @@ from octobrowse.extensions import (
     extension_review_text,
     inspect_extension_source,
 )
+from octobrowse.library_index import LibraryIndex
+from octobrowse.research import (
+    make_research_note,
+    normalize_research_notes,
+    research_note_to_markdown,
+    workspace_research_to_markdown,
+)
 from octobrowse.session import make_session_snapshot, normalize_session_snapshot
 from octobrowse.urls import (
     can_dispatch_octo_command,
@@ -401,7 +408,7 @@ class SettingsStore:
         self,
         settings: BrowserSettings,
         bookmarks: list[str],
-        notes: list[dict[str, str]],
+        notes: list[dict[str, Any]],
         todos: list[str],
         session_snapshot: dict[str, Any] | list[Any],
         reading_list: list[str],
@@ -435,7 +442,7 @@ class SettingsStore:
             "hibernation_minutes": settings.hibernation_minutes,
             "python_automation_enabled": settings.python_automation_enabled,
             "bookmarks": bookmarks,
-            "notes": notes,
+            "notes": normalize_research_notes(notes),
             "todos": todos,
             "session": normalize_session_snapshot(session_snapshot),
             "reading_list": reading_list,
@@ -573,22 +580,8 @@ class SettingsStore:
         return result
 
     @staticmethod
-    def _coerce_notes(values: Any) -> list[dict[str, str]]:
-        result: list[dict[str, str]] = []
-        if not isinstance(values, list):
-            return result
-        for item in values:
-            if isinstance(item, dict):
-                url = str(item.get("url", "")).strip()
-                note = str(item.get("note", "")).strip()
-            elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                url = str(item[0]).strip()
-                note = str(item[1]).strip()
-            else:
-                continue
-            if url and note:
-                result.append({"url": url, "note": note})
-        return result
+    def _coerce_notes(values: Any) -> list[dict[str, Any]]:
+        return normalize_research_notes(values)
 
 
 class HistoryDatabase:
@@ -1125,10 +1118,19 @@ class OctoPluginAPI:
         if not note:
             return
         browser = self._browser.current_browser()
-        url = browser.url().toString() if browser else "plugin"
-        self._browser.notes.append({"url": url, "note": note})
-        self._browser.notes_sidebar.append(f"Note for {url}:\n{note}\n")
-        self._browser.save_settings()
+        url = browser.url().toString() if browser else ""
+        title = (
+            browser.page().title()
+            if browser
+            else f"{self.plugin_name} plugin note"
+        )
+        self._browser.save_research_note(
+            url=url,
+            title=title,
+            body=note,
+            kind="plugin",
+            source_private=bool(browser and browser.property("private")),
+        )
 
     def add_todo(self, text: str) -> None:
         self._require("notes")
@@ -1378,7 +1380,7 @@ class LibrarySearchDialog(QDialog):
     def __init__(self, parent: "OctoBrowse") -> None:
         super().__init__(parent)
         self.browser = parent
-        self.entries = parent.library_entries()
+        indexed_count = parent.rebuild_library_index()
         self.setWindowTitle("Library Search")
         self.setModal(True)
         self.resize(700, 500)
@@ -1387,9 +1389,15 @@ class LibrarySearchDialog(QDialog):
         title = QLabel("Search everything")
         title.setObjectName("PaletteTitle")
         layout.addWidget(title)
+        search_mode = "FTS5 indexed search" if parent.library_index.fts_enabled else "indexed fallback search"
+        self.index_status = QLabel(f"{indexed_count} items · {search_mode}")
+        self.index_status.setObjectName("LibraryIndexStatus")
+        layout.addWidget(self.index_status)
 
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search tabs, history, bookmarks, reading list, notes, and tasks...")
+        self.search.setPlaceholderText(
+            "Search tabs, history, bookmarks, reading list, notes, tasks, and workspaces..."
+        )
         self.search.textChanged.connect(self.filter_entries)
         self.search.returnPressed.connect(self.open_selected)
         layout.addWidget(self.search)
@@ -1402,36 +1410,50 @@ class LibrarySearchDialog(QDialog):
         self.search.setFocus()
 
     def filter_entries(self, query: str) -> None:
-        tokens = [token for token in query.lower().split() if token]
         self.results.clear()
-        for index, entry in enumerate(self.entries):
-            haystack = f"{entry['kind']} {entry['title']} {entry.get('url', '')}".lower()
-            if all(token in haystack for token in tokens):
-                item = QListWidgetItem(self.format_entry(entry))
-                if entry.get("url"):
-                    item.setToolTip(entry["url"])
-                item.setData(Qt.ItemDataRole.UserRole, index)
-                self.results.addItem(item)
+        for result in self.browser.library_index.search(query, limit=60):
+            entry = {
+                "kind": result.kind,
+                "title": result.title,
+                "url": result.url,
+                "snippet": result.snippet,
+                "source_id": result.source_id,
+            }
+            item = QListWidgetItem(self.format_entry(entry))
+            tooltip_parts = [part for part in (entry.get("url"), entry.get("snippet")) if part]
+            if tooltip_parts:
+                item.setToolTip("\n\n".join(tooltip_parts))
+            item.setData(Qt.ItemDataRole.UserRole, entry)
+            self.results.addItem(item)
         if self.results.count():
             self.results.setCurrentRow(0)
+        self.index_status.setText(
+            f"{self.results.count()} result{'s' if self.results.count() != 1 else ''} · "
+            f"{'FTS5' if self.browser.library_index.fts_enabled else 'fallback'} index"
+        )
 
     def format_entry(self, entry: dict[str, Any]) -> str:
         title = str(entry.get("title") or entry.get("url") or "Untitled").replace("\n", " ").strip()
-        url = str(entry.get("url") or "").replace("\n", " ").strip()
-        if len(title) > 90:
-            title = f"{title[:87]}..."
-        if url and len(url) > 86:
-            url = f"{url[:83]}..."
-        suffix = f"  -  {url}" if url and url != title else ""
-        return f"{entry['kind']}: {title}{suffix}"
+        snippet = str(entry.get("snippet") or "").replace("\n", " ").strip()
+        if len(title) > 96:
+            title = f"{title[:93]}..."
+        if snippet and snippet != title:
+            if len(snippet) > 150:
+                snippet = f"{snippet[:147]}..."
+            return f"{str(entry['kind']).upper()}  ·  {title}\n{snippet}"
+        return f"{str(entry['kind']).upper()}  ·  {title}"
 
     def open_selected(self) -> None:
         item = self.results.currentItem()
         if not item:
             return
-        entry = self.entries[item.data(Qt.ItemDataRole.UserRole)]
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(entry, dict):
+            return
         self.accept()
-        self.browser.open_library_entry(entry)
+        self.browser.open_library_entry(
+            self.browser.library_entry_for_result(entry)
+        )
 
 
 class OctoBrowse(QMainWindow):
@@ -1469,20 +1491,21 @@ class OctoBrowse(QMainWindow):
             self.history_db.import_entries(legacy_history)
             self.history = self.history_db.load()
         self._history_index: dict[str, dict[str, Any]] = {entry["url"]: entry for entry in self.history}
+        self.library_index = LibraryIndex(self.store.directory / "library.sqlite")
+        self._library_routes: dict[str, dict[str, Any]] = {}
 
         self.dark_mode = self.settings.theme == "dark"
         self.ad_block_enabled = self.settings.ad_block_enabled
         self.incognito_mode = False
         self.password_manager = PasswordManager()
         self.voice_recognizer = sr.Recognizer() if sr is not None else None
-        self.chat_mode = False
         self.vpn_enabled = False
         self.default_user_agent = ""
 
         self.network_workers: list[ApiFetchWorker] = []
         self.ai_workers: list[OpenAIWorker] = []
         self.speech_workers: list[SpeechWorker] = []
-        self.ai_task_metadata: dict[str, dict[str, str]] = {}
+        self.ai_task_metadata: dict[str, dict[str, Any]] = {}
         self.downloads: list[dict[str, str]] = []
         self.closed_tabs: list[dict[str, str]] = []
         self.ephemeral_paths: set[Path] = set()
@@ -1535,9 +1558,15 @@ class OctoBrowse(QMainWindow):
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self.tabs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tabs.customContextMenuRequested.connect(self.show_context_menu)
+        self._active_browser: QWebEngineView | None = None
 
-        self.notes_sidebar = QTextEdit()
-        self.notes_sidebar.setPlaceholderText("Notes and AI chat")
+        self.notes_sidebar = QListWidget()
+        self.notes_sidebar.setToolTip("Saved research notes")
+        self.notes_sidebar.itemDoubleClicked.connect(
+            lambda item: self.open_research_note(str(item.data(Qt.ItemDataRole.UserRole) or ""))
+        )
+        self.notes_sidebar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.notes_sidebar.customContextMenuRequested.connect(self.show_notes_context_menu)
         self.notes_sidebar.hide()
 
         self.calendar_sidebar = QCalendarWidget()
@@ -1689,7 +1718,12 @@ class OctoBrowse(QMainWindow):
         self.toolbar.addAction(theme_menu.menuAction())
 
         panels_menu = QMenu("Panels", self)
-        self._add_menu_action(panels_menu, "Notes", "Show notes and AI chat", lambda: self.toggle_panel(self.notes_sidebar))
+        self._add_menu_action(
+            panels_menu,
+            "Research Notes",
+            "Show saved research notes",
+            lambda: self.toggle_panel(self.notes_sidebar),
+        )
         self._add_menu_action(panels_menu, "Calendar", "Show calendar", lambda: self.toggle_panel(self.calendar_sidebar))
         self._add_menu_action(panels_menu, "Todo", "Show todo list", lambda: self.toggle_panel(self.todo_sidebar))
         self._add_menu_action(panels_menu, "History", "Show history", lambda: self.toggle_panel(self.history_sidebar), "Ctrl+H")
@@ -1811,7 +1845,12 @@ class OctoBrowse(QMainWindow):
         )
         self._add_rail_action("Audit", "Show implemented feature checklist", self.open_feature_audit, QStyle.StandardPixmap.SP_DialogApplyButton)
         self.workspace_rail.addSeparator()
-        self._add_rail_action("Notes", "Show notes and AI chat", lambda: self.toggle_panel(self.notes_sidebar), QStyle.StandardPixmap.SP_FileIcon)
+        self._add_rail_action(
+            "Notes",
+            "Show saved research notes",
+            lambda: self.toggle_panel(self.notes_sidebar),
+            QStyle.StandardPixmap.SP_FileIcon,
+        )
         self._add_rail_action("Tasks", "Show todo list", lambda: self.toggle_panel(self.todo_sidebar), QStyle.StandardPixmap.SP_DialogYesButton)
         self._add_rail_action("History", "Show history", lambda: self.toggle_panel(self.history_sidebar), QStyle.StandardPixmap.SP_FileDialogDetailedView)
         self._add_rail_action("News", "Show news", lambda: self.toggle_panel(self.news_sidebar), QStyle.StandardPixmap.SP_MessageBoxInformation)
@@ -1872,6 +1911,13 @@ class OctoBrowse(QMainWindow):
         self._add_menu_action(data_menu, "Add Bookmark", "Bookmark current page", self.add_bookmark)
         self._add_menu_action(data_menu, "Add to Reading List", "Save current page for later", self.add_to_reading_list)
         self._add_menu_action(data_menu, "Add Note", "Attach a note to the current page", self.add_note_for_page)
+        self._add_menu_action(
+            data_menu,
+            "Capture Selection as Note",
+            "Save selected text with its source and your commentary",
+            self.capture_selection_as_note,
+            "Ctrl+Alt+N",
+        )
         self._add_menu_action(data_menu, "Add Task", "Add a todo item", self.add_todo_item)
         self._add_menu_action(data_menu, "Research Workspaces", "Save, restore, and export tab workspaces", self.open_workspace_manager)
         self._add_menu_action(data_menu, "Save Tabs as Workspace", "Capture ordinary tabs", self.save_current_workspace)
@@ -2127,6 +2173,11 @@ class OctoBrowse(QMainWindow):
             BrowserCommand("Previous tab", "Ctrl+Shift+Tab", self.previous_tab),
             BrowserCommand("Add bookmark", "Ctrl+D", self.add_bookmark),
             BrowserCommand("Add to reading list", "read later", self.add_to_reading_list),
+            BrowserCommand(
+                "Capture selection as note",
+                "quoted research note Ctrl+Alt+N",
+                self.capture_selection_as_note,
+            ),
             BrowserCommand("Show bookmarks", "panel", self.toggle_bookmarks),
             BrowserCommand("Show history", "panel", lambda: self.toggle_panel(self.history_sidebar)),
             BrowserCommand("Show notes", "panel", lambda: self.toggle_panel(self.notes_sidebar)),
@@ -2137,7 +2188,7 @@ class OctoBrowse(QMainWindow):
             BrowserCommand("Show extensions", "panel", self.toggle_extensions),
             BrowserCommand("Plugin manager", "permissioned plugins", self.open_plugin_manager),
             BrowserCommand("Run trusted extension", "full Python access", self.run_trusted_extension),
-            BrowserCommand("Add note", "current page", self.add_note_for_page),
+            BrowserCommand("Add note", "current page research note", self.add_note_for_page),
             BrowserCommand("Add task", "todo", self.add_todo_item),
             BrowserCommand("Read aloud", "text to speech", self.read_aloud),
             BrowserCommand("Upscale page", "image preview", self.upscale_page),
@@ -2150,6 +2201,30 @@ class OctoBrowse(QMainWindow):
 
     def open_library_search(self) -> None:
         LibrarySearchDialog(self).exec()
+
+    def rebuild_library_index(self) -> int:
+        """Atomically refresh searchable browser metadata without private tabs."""
+        records: list[dict[str, str]] = []
+        routes: dict[str, dict[str, Any]] = {}
+        for index, entry in enumerate(self.library_entries()):
+            route_id = f"route:{index}"
+            routes[route_id] = dict(entry)
+            records.append(
+                {
+                    "kind": str(entry.get("kind", "Library")),
+                    "title": str(entry.get("title", "")),
+                    "url": str(entry.get("url", "")),
+                    "snippet": str(entry.get("snippet", "")),
+                    "source_id": route_id,
+                }
+            )
+        count = self.library_index.rebuild(records=records)
+        self._library_routes = routes
+        return count
+
+    def library_entry_for_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        route = self._library_routes.get(str(result.get("source_id", "")))
+        return dict(route) if route is not None else dict(result)
 
     def address_suggestions(self) -> list[str]:
         commands = [
@@ -2199,15 +2274,23 @@ class OctoBrowse(QMainWindow):
         entries: list[dict[str, Any]] = []
         for index in range(self.tabs.count()):
             widget = self.tabs.widget(index)
-            if isinstance(widget, QWebEngineView):
-                entries.append(
-                    {
-                        "kind": "Tab",
-                        "title": self.tabs.tabText(index),
-                        "url": widget.url().toString(),
-                        "tab_index": index,
-                    }
-                )
+            if not isinstance(widget, QWebEngineView):
+                continue
+            url = widget.url().toString()
+            if (
+                widget.property("private")
+                or widget.property("ephemeral_path")
+                or self.is_internal_url(url)
+            ):
+                continue
+            entries.append(
+                {
+                    "kind": "Tab",
+                    "title": self.tabs.tabText(index),
+                    "url": url,
+                    "tab_index": index,
+                }
+            )
         for entry in reversed(self.history[-120:]):
             entries.append({"kind": "History", "title": entry.get("title") or entry["url"], "url": entry["url"]})
         for url in self.bookmarks:
@@ -2215,20 +2298,45 @@ class OctoBrowse(QMainWindow):
         for url in self.reading_list:
             entries.append({"kind": "Reading", "title": url, "url": url})
         for note in self.notes:
-            entries.append({"kind": "Note", "title": note.get("note", ""), "url": note.get("url", "")})
+            title = str(note.get("title") or note.get("url") or "Research note")
+            searchable = "\n".join(
+                part
+                for part in (
+                    str(note.get("quote", "")),
+                    str(note.get("body", "")),
+                )
+                if part
+            )
+            entries.append(
+                {
+                    "kind": "Note",
+                    "title": title,
+                    "url": note.get("url", ""),
+                    "snippet": searchable,
+                    "note_id": note.get("id", ""),
+                }
+            )
         for todo in self.todos:
-            entries.append({"kind": "Task", "title": todo})
+            entries.append({"kind": "Task", "title": todo, "snippet": todo})
         for workspace in self.workspaces:
+            tab_summary = " | ".join(
+                str(tab.get("title") or tab.get("url") or "")
+                for tab in workspace.get("tabs", [])
+            )
             entries.append(
                 {
                     "kind": "Workspace",
                     "title": workspace["name"],
+                    "snippet": tab_summary,
                     "workspace_id": workspace["id"],
                 }
             )
         return entries
 
     def open_library_entry(self, entry: dict[str, Any]) -> None:
+        if entry.get("note_id"):
+            self.open_research_note(str(entry["note_id"]))
+            return
         if "tab_index" in entry:
             self.tabs.setCurrentIndex(int(entry["tab_index"]))
             return
@@ -2365,6 +2473,27 @@ class OctoBrowse(QMainWindow):
         except (OSError, ValueError) as exc:
             QMessageBox.critical(self, "Export Workspace", str(exc))
 
+    def export_workspace_research(self, workspace: dict[str, Any]) -> None:
+        default_name = re.sub(
+            r"[^A-Za-z0-9._ -]+",
+            "_",
+            str(workspace.get("name", "workspace")),
+        )
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Research Pack",
+            f"{default_name}-research.md",
+            "Markdown Files (*.md)",
+        )
+        if not file_path:
+            return
+        try:
+            markdown = workspace_research_to_markdown(workspace, self.notes)
+            Path(file_path).write_text(markdown, encoding="utf-8")
+            self.set_status(f"Exported research pack to {file_path}")
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Export Research Pack", str(exc))
+
     def open_workspace_manager(self) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Research Workspaces")
@@ -2426,12 +2555,18 @@ class OctoBrowse(QMainWindow):
         open_button = QPushButton("Open Alongside")
         replace_button = QPushButton("Replace Ordinary Tabs")
         export_button = QPushButton("Export Markdown")
+        research_button = QPushButton("Export Research Pack")
         delete_button = QPushButton("Delete")
         close_button = QPushButton("Close")
         save_button.clicked.connect(lambda: (self.save_current_workspace(), refresh()))
         open_button.clicked.connect(lambda: open_selected(False))
         replace_button.clicked.connect(lambda: open_selected(True))
         export_button.clicked.connect(lambda: self.export_workspace(selected()) if selected() else None)
+        research_button.clicked.connect(
+            lambda: self.export_workspace_research(selected())
+            if selected()
+            else None
+        )
         delete_button.clicked.connect(delete_selected)
         close_button.clicked.connect(dialog.accept)
         for button in (
@@ -2439,6 +2574,7 @@ class OctoBrowse(QMainWindow):
             open_button,
             replace_button,
             export_button,
+            research_button,
             delete_button,
             close_button,
         ):
@@ -2558,19 +2694,22 @@ li {{ margin: 7px 0; }}
             "Workspace": [
                 "Dashboard first screen",
                 "Command palette",
-                "Unified library search",
+                "Transactional SQLite/FTS5 library search with safe fallback",
                 "Left workspace rail and focused side panels",
                 "Tab overview",
-                "Named research workspaces with restore, pinned state, and Markdown export",
-                "Pinned tabs and activity-safe hibernation using Qt's recommended lifecycle state",
+                "Named research workspaces with restore, pinned state, Markdown, and research-pack export",
+                "Pinned tabs and true background-age hibernation using Qt's recommended lifecycle state",
                 "Crash-resilient 30-second session autosave",
                 "Find-in-page with live match counter",
+                "Per-tab load, progress, and failure state across tab switches",
             ],
             "Collections": [
                 "SQLite-backed history with titles, visit counts, and context actions",
                 "Bookmarks with context actions",
                 "Persistent reading list",
-                "Notes and todos",
+                "Versioned selection-anchored research notes with Markdown export",
+                "Private and internal-page note persistence blocked across every write path",
+                "Todos",
                 "Download manager with pause/resume/cancel and persistent download history",
             ],
             "Page Tools": [
@@ -2605,7 +2744,7 @@ li {{ margin: 7px 0; }}
                 "Private download provenance supplied directly by the off-record profile",
             ],
             "AI And Voice": [
-                "Citation-grounded OpenAI page summaries with save-to-note",
+                "Citation-grounded OpenAI page summaries with privacy-aware save-to-note",
                 "Query-relevant cited page assistant with dedicated input and output",
                 "Prompt-injection-aware context boundaries, store=False, and private-tab consent",
                 "Non-blocking cloud text-to-speech with per-use private-tab consent",
@@ -2843,8 +2982,7 @@ code, pre {{
             self.reading_sidebar.addItem(QListWidgetItem(url))
         for todo in self.todos:
             self.todo_sidebar.addItem(QListWidgetItem(todo))
-        for note in self.notes:
-            self.notes_sidebar.append(f"Note for {note['url']}:\n{note['note']}\n")
+        self.refresh_notes_sidebar()
 
     def current_browser(self) -> QWebEngineView | None:
         widget = self.tabs.currentWidget()
@@ -3023,6 +3161,10 @@ code, pre {{
     def _wire_browser(self, browser: QWebEngineView) -> None:
         """Connections and engine settings shared by every tab."""
         browser.setProperty("last_active", time.time())
+        browser.setProperty("background_since", 0.0)
+        browser.setProperty("loading", False)
+        browser.setProperty("load_progress", 0)
+        browser.setProperty("load_ok", True)
         page = browser.page()
         settings = browser.settings()
         for attr_name, value in (
@@ -3037,8 +3179,9 @@ code, pre {{
 
         browser.urlChanged.connect(lambda new_url, browser=browser: self.update_url_bar(new_url, browser))
         browser.urlChanged.connect(lambda new_url, browser=browser: self.apply_site_content(browser, new_url))
+        browser.loadStarted.connect(lambda browser=browser: self.on_load_started(browser))
         browser.loadProgress.connect(lambda progress, browser=browser: self.update_progress_bar(progress, browser))
-        browser.loadFinished.connect(lambda _ok, browser=browser: self.on_load_finished(browser))
+        browser.loadFinished.connect(lambda ok, browser=browser: self.on_load_finished(browser, ok))
         browser.titleChanged.connect(lambda page_title, browser=browser: self.update_tab_title(browser, page_title))
         page.fullScreenRequested.connect(self.handle_fullscreen_request)
         page.renderProcessTerminated.connect(
@@ -3241,12 +3384,25 @@ code, pre {{
         browser = self.current_browser()
         if not browser:
             return
+        now = time.time()
+        previous = self._active_browser
+        if previous is not None and previous is not browser:
+            previous.setProperty("background_since", now)
+        self._active_browser = browser
         self.wake_browser(browser)
         self.url_bar.setText(browser.url().toString())
         self.update_security_badge(browser.url(), browser)
-        self.progress_bar.hide()
+        progress = int(browser.property("load_progress") or 0)
+        loading = bool(browser.property("loading"))
+        self.progress_bar.setValue(progress)
+        self.progress_bar.setVisible(loading)
         self.update_status_badges()
-        self.set_status("Ready")
+        if loading:
+            self.set_status(f"Loading… {progress}%")
+        elif not bool(browser.property("load_ok")):
+            self.set_status("Page failed to load — reload to retry")
+        else:
+            self.set_status("Ready")
 
     def open_private_tab(self) -> None:
         self.add_tab(QUrl(self.settings.homepage), "Private", private=True)
@@ -3664,20 +3820,20 @@ p {{ margin: 0 0 20px; }}
         return [word for word, _count in counts.most_common(limit)]
 
     def update_url_bar(self, url: QUrl, browser: QWebEngineView) -> None:
-        if browser != self.current_browser():
-            return
-        browser.setProperty("last_active", time.time())
         text = url.toString()
-        self.url_bar.setText(text)
         if (
             not is_trusted_internal_url(text)
             and not browser.property("generated_navigation_pending")
         ):
             browser.setProperty("generated_page", False)
             browser.setProperty("internal_page", "")
-        self.update_security_badge(url, browser)
         if not self.incognito_mode and not browser.property("private") and not self.is_internal_url(text):
             self.add_to_history(text)
+        if browser != self.current_browser():
+            return
+        browser.setProperty("last_active", time.time())
+        self.url_bar.setText(text)
+        self.update_security_badge(url, browser)
         self.update_status_badges()
 
     def update_security_badge(
@@ -3857,16 +4013,28 @@ p {{ margin: 0 0 20px; }}
         )
 
     def update_progress_bar(self, progress: int, browser: QWebEngineView) -> None:
+        browser.setProperty("load_progress", progress)
         if browser == self.current_browser():
             self.progress_bar.setValue(progress)
             self.progress_bar.setVisible(progress < 100)
 
-    def on_load_finished(self, browser: QWebEngineView) -> None:
+    def on_load_started(self, browser: QWebEngineView) -> None:
+        browser.setProperty("loading", True)
+        browser.setProperty("load_progress", 0)
+        if browser == self.current_browser():
+            self.progress_bar.setValue(0)
+            self.progress_bar.show()
+            self.set_status("Loading…")
+
+    def on_load_finished(self, browser: QWebEngineView, ok: bool = True) -> None:
+        browser.setProperty("loading", False)
+        browser.setProperty("load_progress", 100 if ok else int(browser.property("load_progress") or 0))
+        browser.setProperty("load_ok", bool(ok))
         browser.setProperty("generated_navigation_pending", False)
         if browser == self.current_browser():
             self.update_security_badge(browser.url(), browser)
             self.progress_bar.hide()
-            self.set_status("Ready")
+            self.set_status("Ready" if ok else "Page failed to load — reload to retry")
             self.update_status_badges()
         if self.dark_mode:
             self.apply_dark_mode(browser)
@@ -4171,9 +4339,15 @@ p {{ margin: 0 0 20px; }}
         if browser and self.confirm_cloud_ai(browser):
             title = browser.page().title() or self.tabs.tabText(self.tabs.currentIndex())
             url = browser.url().toString()
+            source_private = bool(browser.property("private"))
             self.set_status("Preparing cited page summary...")
             browser.page().toPlainText(
-                lambda text, title=title, url=url: self.generate_summary(text, title, url)
+                lambda text, title=title, url=url, source_private=source_private: self.generate_summary(
+                    text,
+                    title,
+                    url,
+                    source_private=source_private,
+                )
             )
 
     def confirm_cloud_ai(self, browser: QWebEngineView) -> bool:
@@ -4208,14 +4382,26 @@ p {{ margin: 0 0 20px; }}
         self.save_settings()
         return True
 
-    def generate_summary(self, text: str, title: str, url: str) -> None:
+    def generate_summary(
+        self,
+        text: str,
+        title: str,
+        url: str,
+        *,
+        source_private: bool = False,
+    ) -> None:
         chunks = split_page_text(text, title=title, url=url)
         if not chunks:
             QMessageBox.information(self, "Summary", "There is no readable text on this page.")
             return
         prompt = build_summary_prompt(chunks)
         self.start_openai_worker(
-            "summary", prompt, max_output_tokens=520, source_url=url, source_title=title
+            "summary",
+            prompt,
+            max_output_tokens=520,
+            source_url=url,
+            source_title=title,
+            source_private=source_private,
         )
 
     def open_chatbot(self) -> None:
@@ -4311,12 +4497,14 @@ p {{ margin: 0 0 20px; }}
         max_output_tokens: int,
         source_url: str = "",
         source_title: str = "",
+        source_private: bool = False,
     ) -> None:
         task_id = f"{task}:{time.time_ns()}"
         self.ai_task_metadata[task_id] = {
             "kind": task,
             "source_url": source_url,
             "source_title": source_title,
+            "source_private": source_private,
         }
         worker = OpenAIWorker(
             task=task_id,
@@ -4346,10 +4534,22 @@ p {{ margin: 0 0 20px; }}
             if output is not None:
                 output.appendPlainText(f"AI:\n{text}\n")
         else:
-            self.show_ai_summary(text, metadata.get("source_url", ""))
+            self.show_ai_summary(
+                text,
+                str(metadata.get("source_url", "")),
+                str(metadata.get("source_title", "")),
+                source_private=bool(metadata.get("source_private", False)),
+            )
         self.set_status("AI response complete")
 
-    def show_ai_summary(self, text: str, source_url: str = "") -> None:
+    def show_ai_summary(
+        self,
+        text: str,
+        source_url: str = "",
+        source_title: str = "",
+        *,
+        source_private: bool = False,
+    ) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Cited Page Summary")
         dialog.resize(700, 520)
@@ -4363,13 +4563,27 @@ p {{ margin: 0 0 20px; }}
         close_button = QPushButton("Close")
         copy_button.clicked.connect(lambda: QApplication.clipboard().setText(text))
 
+        can_save = self.research_source_is_persistable(
+            source_url,
+            source_private=source_private,
+            show_message=False,
+        )
+        note_button.setEnabled(can_save)
+        if not can_save:
+            note_button.setToolTip(
+                "Private and internal page content is never persisted as a research note."
+            )
+
         def save_note() -> None:
-            url = source_url or "ai-summary"
-            self.notes.append({"url": url, "note": text[:12_000]})
-            self.notes_sidebar.append(f"Note for {url}:\n{text}\n")
-            self.save_settings()
-            self.set_status("Saved AI summary as note")
-            dialog.accept()
+            saved = self.save_research_note(
+                url=source_url,
+                title=source_title or source_url or "AI page summary",
+                body=text,
+                kind="ai-summary",
+                source_private=source_private,
+            )
+            if saved is not None:
+                dialog.accept()
 
         note_button.clicked.connect(save_note)
         close_button.clicked.connect(dialog.accept)
@@ -4711,8 +4925,11 @@ p {{ margin: 0 0 20px; }}
                 continue
             if self.is_internal_url(widget.url().toString()) or widget.property("pinned"):
                 continue
-            last_active = float(widget.property("last_active") or 0)
-            if now - last_active < threshold:
+            background_since = float(widget.property("background_since") or 0)
+            if not force and background_since <= 0:
+                widget.setProperty("background_since", now)
+                continue
+            if not force and now - background_since < threshold:
                 continue
             page = widget.page()
             try:
@@ -4738,6 +4955,7 @@ p {{ margin: 0 0 20px; }}
 
     def wake_browser(self, browser: QWebEngineView) -> None:
         browser.setProperty("last_active", time.time())
+        browser.setProperty("background_since", 0.0)
         try:
             if browser.page().lifecycleState() != QWebEnginePage.LifecycleState.Active:
                 browser.page().setLifecycleState(QWebEnginePage.LifecycleState.Active)
@@ -5441,6 +5659,10 @@ p {{ margin: 0 0 20px; }}
         bookmark_action.triggered.connect(self.add_bookmark)
         menu.addAction(bookmark_action)
 
+        capture_action = QAction("Capture Selection as Note", self)
+        capture_action.triggered.connect(self.capture_selection_as_note)
+        menu.addAction(capture_action)
+
         menu.exec(self.tabs.mapToGlobal(position))
 
     def save_page(self) -> None:
@@ -5618,18 +5840,332 @@ p {{ margin: 0 0 20px; }}
         except Exception as exc:
             QMessageBox.critical(self, "Trusted Extension", f"Failed to run extension: {exc}")
 
+    def research_note_by_id(self, note_id: str) -> dict[str, Any] | None:
+        return next(
+            (note for note in self.notes if str(note.get("id", "")) == note_id),
+            None,
+        )
+
+    def refresh_notes_sidebar(self, selected_id: str = "") -> None:
+        self.notes_sidebar.clear()
+        selected_item: QListWidgetItem | None = None
+        for note in sorted(
+            self.notes,
+            key=lambda item: float(item.get("updated_at", 0)),
+            reverse=True,
+        ):
+            title = str(note.get("title") or note.get("url") or "Research note")
+            preview = str(note.get("body") or note.get("quote") or "")
+            preview = " ".join(preview.split())
+            if len(preview) > 110:
+                preview = f"{preview[:107]}..."
+            label = title if not preview else f"{title}\n{preview}"
+            item = QListWidgetItem(label)
+            note_id = str(note.get("id", ""))
+            item.setData(Qt.ItemDataRole.UserRole, note_id)
+            tooltip = "\n".join(
+                part
+                for part in (
+                    str(note.get("url", "")),
+                    str(note.get("quote", "")),
+                )
+                if part
+            )
+            if tooltip:
+                item.setToolTip(tooltip)
+            self.notes_sidebar.addItem(item)
+            if note_id == selected_id:
+                selected_item = item
+        if selected_item is not None:
+            self.notes_sidebar.setCurrentItem(selected_item)
+
+    def research_source_is_persistable(
+        self,
+        url: str,
+        *,
+        source_private: bool = False,
+        show_message: bool = True,
+    ) -> bool:
+        reason = ""
+        if source_private:
+            reason = "Private-tab content cannot be saved to persistent research notes."
+        elif url and self.is_internal_url(url):
+            reason = "Internal browser pages cannot be saved as persistent research notes."
+        if not reason:
+            return True
+        self.set_status(reason)
+        if show_message:
+            QMessageBox.information(self, "Research Notes", reason)
+        return False
+
+    def save_research_note(
+        self,
+        *,
+        url: str,
+        title: str,
+        quote: str = "",
+        body: str = "",
+        kind: str = "page",
+        source_private: bool = False,
+        note_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Central persistence path for manual, AI, and plugin research notes."""
+        if not self.research_source_is_persistable(
+            url, source_private=source_private
+        ):
+            return None
+        try:
+            note = make_research_note(
+                url,
+                title,
+                quote,
+                body,
+                kind=kind,
+                note_id=note_id,
+            )
+        except ValueError as exc:
+            QMessageBox.information(self, "Research Notes", str(exc))
+            return None
+
+        existing_index = next(
+            (
+                index
+                for index, existing in enumerate(self.notes)
+                if str(existing.get("id", "")) == str(note_id or "")
+            ),
+            None,
+        )
+        if existing_index is None:
+            self.notes.append(note)
+            status = "Saved research note"
+        else:
+            note["created_at"] = float(
+                self.notes[existing_index].get("created_at", note["created_at"])
+            )
+            self.notes[existing_index] = note
+            status = "Updated research note"
+        self.notes = normalize_research_notes(self.notes)
+        self.refresh_notes_sidebar(str(note["id"]))
+        self.save_settings()
+        self.set_status(status)
+        return self.research_note_by_id(str(note["id"]))
+
     def add_note_for_page(self) -> None:
-        self.chat_mode = False
         browser = self.current_browser()
         if not browser:
             return
-        note, ok = QInputDialog.getText(self, "Add Note", "Enter your note:")
-        if ok and note.strip():
-            url = browser.url().toString()
-            entry = {"url": url, "note": note.strip()}
-            self.notes.append(entry)
-            self.notes_sidebar.append(f"Note for {url}:\n{entry['note']}\n")
-            self.save_settings()
+        self.open_research_capture_dialog(browser, quote="")
+
+    def capture_selection_as_note(self) -> None:
+        browser = self.current_browser()
+        if not browser:
+            return
+        quote = browser.page().selectedText().strip()
+        self.open_research_capture_dialog(browser, quote=quote)
+
+    def open_research_capture_dialog(
+        self,
+        browser: QWebEngineView | None,
+        *,
+        quote: str,
+        existing_note: dict[str, Any] | None = None,
+    ) -> None:
+        editing = existing_note is not None
+        if editing:
+            source_url = str(existing_note.get("url", ""))
+            source_title = str(existing_note.get("title", ""))
+            source_private = False
+            quote = str(existing_note.get("quote", ""))
+            body_text = str(existing_note.get("body", ""))
+        else:
+            if browser is None:
+                return
+            source_url = browser.url().toString()
+            source_title = (
+                browser.page().title()
+                or self.tabs.tabText(self.tabs.indexOf(browser)).replace("Private - ", "")
+                or source_url
+            )
+            source_private = bool(browser.property("private"))
+            body_text = ""
+            if not self.research_source_is_persistable(
+                source_url, source_private=source_private
+            ):
+                return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Research Note" if editing else "Capture Research Note")
+        dialog.resize(680, 560)
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        title_input = QLineEdit(source_title)
+        source_input = QLineEdit(source_url)
+        source_input.setReadOnly(True)
+        form.addRow("Title:", title_input)
+        form.addRow("Source:", source_input)
+        layout.addLayout(form)
+
+        layout.addWidget(QLabel("Selected quote"))
+        quote_input = QPlainTextEdit(quote)
+        quote_input.setReadOnly(True)
+        quote_input.setPlaceholderText("No text selected — this will be a page note.")
+        quote_input.setMaximumHeight(150)
+        layout.addWidget(quote_input)
+        layout.addWidget(QLabel("Your notes"))
+        body_input = QPlainTextEdit(body_text)
+        body_input.setPlaceholderText("Add context, interpretation, or next steps...")
+        layout.addWidget(body_input)
+
+        buttons = QHBoxLayout()
+        save_button = QPushButton("Update Note" if editing else "Save Note")
+        cancel_button = QPushButton("Cancel")
+
+        def save_capture() -> None:
+            saved = self.save_research_note(
+                url=source_url,
+                title=title_input.text(),
+                quote=quote_input.toPlainText(),
+                body=body_input.toPlainText(),
+                kind=str(existing_note.get("kind", "page")) if editing else "selection" if quote else "page",
+                source_private=source_private,
+                note_id=str(existing_note.get("id", "")) if editing else None,
+            )
+            if saved is not None:
+                dialog.accept()
+                self.open_panel(
+                    self.notes_sidebar,
+                    status="Research note saved",
+                )
+
+        save_button.clicked.connect(save_capture)
+        cancel_button.clicked.connect(dialog.reject)
+        buttons.addStretch(1)
+        buttons.addWidget(save_button)
+        buttons.addWidget(cancel_button)
+        layout.addLayout(buttons)
+        body_input.setFocus()
+        dialog.exec()
+
+    def open_research_note(self, note_id: str) -> None:
+        note = self.research_note_by_id(note_id)
+        if note is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(str(note.get("title") or "Research Note"))
+        dialog.resize(720, 560)
+        layout = QVBoxLayout(dialog)
+        source = str(note.get("url", ""))
+        if source:
+            source_label = QLineEdit(source)
+            source_label.setReadOnly(True)
+            layout.addWidget(source_label)
+        content = QPlainTextEdit()
+        content.setReadOnly(True)
+        content.setPlainText(
+            "\n\n".join(
+                section
+                for section in (
+                    f"Quoted text\n\n{note.get('quote', '')}" if note.get("quote") else "",
+                    f"Notes\n\n{note.get('body', '')}" if note.get("body") else "",
+                )
+                if section
+            )
+        )
+        layout.addWidget(content)
+        buttons = QHBoxLayout()
+        open_button = QPushButton("Open Source")
+        edit_button = QPushButton("Edit")
+        copy_button = QPushButton("Copy Markdown")
+        delete_button = QPushButton("Delete")
+        close_button = QPushButton("Close")
+        open_button.setEnabled(bool(source))
+        open_button.clicked.connect(
+            lambda: self.add_tab(QUrl(source), "Research Source", private=False)
+        )
+        edit_button.clicked.connect(
+            lambda: (
+                dialog.accept(),
+                self.open_research_capture_dialog(
+                    None,
+                    quote=str(note.get("quote", "")),
+                    existing_note=note,
+                ),
+            )
+        )
+        copy_button.clicked.connect(lambda: self.copy_research_note_markdown(note_id))
+        delete_button.clicked.connect(
+            lambda: dialog.accept() if self.delete_research_note(note_id) else None
+        )
+        close_button.clicked.connect(dialog.accept)
+        for button in (
+            open_button,
+            edit_button,
+            copy_button,
+            delete_button,
+            close_button,
+        ):
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        dialog.exec()
+
+    def copy_research_note_markdown(self, note_id: str) -> None:
+        note = self.research_note_by_id(note_id)
+        if note is None:
+            return
+        QApplication.clipboard().setText(research_note_to_markdown(note))
+        self.set_status("Copied research note as Markdown")
+
+    def delete_research_note(self, note_id: str) -> bool:
+        note = self.research_note_by_id(note_id)
+        if note is None:
+            return False
+        answer = QMessageBox.question(
+            self,
+            "Delete Research Note",
+            f"Delete '{note.get('title') or 'Research note'}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self.notes = [
+            item for item in self.notes if str(item.get("id", "")) != note_id
+        ]
+        self.refresh_notes_sidebar()
+        self.save_settings()
+        self.set_status("Deleted research note")
+        return True
+
+    def show_notes_context_menu(self, position: Any) -> None:
+        item = self.notes_sidebar.itemAt(position)
+        if item is None:
+            return
+        note_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        note = self.research_note_by_id(note_id)
+        if note is None:
+            return
+        menu = QMenu(self)
+        view_action = menu.addAction("View Note")
+        source_action = menu.addAction("Open Source")
+        edit_action = menu.addAction("Edit")
+        copy_action = menu.addAction("Copy Markdown")
+        delete_action = menu.addAction("Delete")
+        source_action.setEnabled(bool(note.get("url")))
+        selected = menu.exec(self.notes_sidebar.mapToGlobal(position))
+        if selected is view_action:
+            self.open_research_note(note_id)
+        elif selected is source_action:
+            self.add_tab(QUrl(str(note["url"])), "Research Source", private=False)
+        elif selected is edit_action:
+            self.open_research_capture_dialog(
+                None,
+                quote=str(note.get("quote", "")),
+                existing_note=note,
+            )
+        elif selected is copy_action:
+            self.copy_research_note_markdown(note_id)
+        elif selected is delete_action:
+            self.delete_research_note(note_id)
 
     def add_todo_item(self) -> None:
         task, ok = QInputDialog.getText(self, "Add Task", "Enter a task:")
@@ -5853,12 +6389,6 @@ p {{ margin: 0 0 20px; }}
             self.zoom_in()
         elif event.key() == Qt.Key.Key_Minus and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             self.zoom_out()
-        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.notes_sidebar.hasFocus() and self.chat_mode:
-            query = self.notes_sidebar.toPlainText().splitlines()[-1] if self.notes_sidebar.toPlainText() else ""
-            if query.strip():
-                self.process_chatbot_query(query)
-            else:
-                super().keyPressEvent(event)
         else:
             super().keyPressEvent(event)
 
@@ -5885,6 +6415,7 @@ p {{ margin: 0 0 20px; }}
             return
         self.save_settings()
         self.history_db.close()
+        self.library_index.close()
         for path in list(self.ephemeral_paths):
             self.cleanup_ephemeral_path(path)
         super().closeEvent(event)

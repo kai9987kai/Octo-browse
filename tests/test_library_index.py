@@ -16,6 +16,27 @@ from octobrowse.library_index import (
 
 
 class LibraryIndexTests(unittest.TestCase):
+    def test_structured_research_note_indexes_title_quote_and_body(self) -> None:
+        with LibraryIndex(":memory:") as index:
+            count = index.rebuild(
+                notes=[
+                    {
+                        "id": "note-structured",
+                        "url": "https://example.test/research",
+                        "title": "Browser lifecycle research",
+                        "quote": "Background tabs need explicit timing.",
+                        "body": "Track when the tab leaves the foreground.",
+                    }
+                ]
+            )
+
+            self.assertEqual(count, 1)
+            quote_match = index.search("explicit timing")[0]
+            body_match = index.search("leaves foreground")[0]
+            self.assertEqual(quote_match.title, "Browser lifecycle research")
+            self.assertEqual(quote_match.source_id, "note-structured")
+            self.assertEqual(body_match.source_id, "note-structured")
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)

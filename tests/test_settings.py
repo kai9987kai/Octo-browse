@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from main import BrowserSettings, SettingsStore
+from octobrowse.research import make_research_note
 
 
 class FakeCredentials:
@@ -71,6 +72,57 @@ class SettingsStoreTests(unittest.TestCase):
             self.assertEqual(snapshot["version"], 2)
             self.assertEqual(len(snapshot["tabs"]), 2)
             self.assertEqual(snapshot["tabs"][0]["url"], "https://example.com")
+
+    def test_legacy_notes_migrate_to_versioned_research_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(
+                Path(temp_dir),
+                {
+                    "notes": [
+                        {
+                            "url": "https://example.com/source",
+                            "note": "Legacy observation",
+                        }
+                    ]
+                },
+            )
+
+            note = store.load()[3][0]
+
+            self.assertEqual(note["version"], 1)
+            self.assertEqual(note["url"], "https://example.com/source")
+            self.assertEqual(note["body"], "Legacy observation")
+            self.assertTrue(note["id"].startswith("note-"))
+
+    def test_structured_research_note_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = self.make_store(root, {})
+            note = make_research_note(
+                "https://example.com/source",
+                "Example source",
+                "Quoted evidence",
+                "My interpretation",
+                now=123.0,
+                note_id="note-round-trip",
+            )
+
+            store.save(
+                BrowserSettings(),
+                [],
+                [note],
+                [],
+                [],
+                [],
+                {},
+                {},
+                [],
+                {},
+                [],
+            )
+            loaded_note = store.load()[3][0]
+
+            self.assertEqual(loaded_note, note)
 
     def test_save_uses_canonical_session_record(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

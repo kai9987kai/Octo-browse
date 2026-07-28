@@ -192,16 +192,21 @@ def build_library_records(
             break
         if not isinstance(value, Mapping):
             continue
-        note = _clean_text(
-            value.get("note", value.get("text", "")),
+        quote = _clean_text(value.get("quote", ""), MAX_INDEXED_TEXT_CHARS)
+        body = _clean_text(
+            value.get("body", value.get("note", value.get("text", ""))),
             MAX_INDEXED_TEXT_CHARS,
         )
-        if not note:
+        note = " ".join(part for part in (quote, body) if part)[
+            :MAX_INDEXED_TEXT_CHARS
+        ]
+        title = value.get("title") or body or quote
+        if not note or not title:
             continue
         append(
             _record(
                 "Note",
-                note,
+                title,
                 url=value.get("url"),
                 snippet=note,
                 source_id=value.get("id", value.get("url", "")),
