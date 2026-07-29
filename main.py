@@ -33,7 +33,12 @@ from octobrowse.filtering import (
     domain_suffix_match as _domain_suffix_match,
     resource_type_name,
 )
-from octobrowse.ai_context import build_qa_prompt, build_summary_prompt, split_page_text
+from octobrowse.ai_context import (
+    build_qa_prompt,
+    build_summary_prompt,
+    clean_page_text as normalize_plain_text,
+    split_page_text,
+)
 from octobrowse.extensions import (
     ExtensionManifestError,
     extension_review_text,
@@ -46,7 +51,18 @@ from octobrowse.research import (
     research_note_to_markdown,
     workspace_research_to_markdown,
 )
+from octobrowse.readability import (
+    READABLE_PAGE_SCRIPT,
+    ReadablePage,
+    normalize_readable_page,
+)
 from octobrowse.session import make_session_snapshot, normalize_session_snapshot
+from octobrowse.snapshots import (
+    SnapshotVerification,
+    snapshot_filename,
+    verify_snapshot_bundle,
+    write_snapshot_manifest,
+)
 from octobrowse.urls import (
     can_dispatch_octo_command,
     is_internal_url as classify_internal_url,
@@ -99,6 +115,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon
 from PyQt6.QtWebEngineCore import (
+    QWebEngineDownloadRequest,
     QWebEnginePermission,
     QWebEnginePage,
     QWebEngineProfile,
@@ -230,6 +247,7 @@ MAX_HISTORY_ITEMS = 500
 DOWNLOAD_PATH_ROLE = Qt.ItemDataRole.UserRole
 DOWNLOAD_REQUEST_ROLE = Qt.ItemDataRole.UserRole + 1
 DOWNLOAD_PRIVATE_ROLE = Qt.ItemDataRole.UserRole + 2
+DOWNLOAD_SNAPSHOT_ROLE = Qt.ItemDataRole.UserRole + 3
 
 
 def resource_path(relative_path: str) -> Path:
@@ -840,6 +858,50 @@ class SpeechWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class SnapshotManifestWorker(QThread):
+    """Hash a completed MHTML archive without blocking the browser UI."""
+
+    completed = pyqtSignal(str, str)
+    failed = pyqtSignal(str, str)
+
+    def __init__(
+        self,
+        archive_path: str,
+        metadata: dict[str, Any],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.archive_path = archive_path
+        self.metadata = dict(metadata)
+
+    def run(self) -> None:
+        try:
+            manifest_path = write_snapshot_manifest(
+                self.archive_path,
+                **self.metadata,
+            )
+            self.completed.emit(self.archive_path, str(manifest_path))
+        except Exception as exc:
+            self.failed.emit(self.archive_path, str(exc))
+
+
+class SnapshotVerificationWorker(QThread):
+    """Verify large snapshot archives away from the Qt event loop."""
+
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, selected_path: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.selected_path = selected_path
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(verify_snapshot_bundle(self.selected_path))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
     """Single request interceptor handling ad blocking, HTTPS-only upgrades, and GPC.
 
@@ -1219,7 +1281,6 @@ class OctoWebPage(QWebEnginePage):
             generated_load = bool(
                 isinstance(parent_view, QWebEngineView)
                 and parent_view.property("generated_navigation_pending")
-                and is_trusted_internal_url(url.toString())
             )
             if isinstance(parent_view, QWebEngineView) and not generated_load:
                 parent_view.setProperty("generated_page", False)
@@ -1505,6 +1566,9 @@ class OctoBrowse(QMainWindow):
         self.network_workers: list[ApiFetchWorker] = []
         self.ai_workers: list[OpenAIWorker] = []
         self.speech_workers: list[SpeechWorker] = []
+        self.snapshot_workers: list[QThread] = []
+        self.pending_snapshot_saves: dict[str, dict[str, Any]] = {}
+        self.snapshot_targets_in_progress: set[str] = set()
         self.ai_task_metadata: dict[str, dict[str, Any]] = {}
         self.downloads: list[dict[str, str]] = []
         self.closed_tabs: list[dict[str, str]] = []
@@ -1701,13 +1765,12 @@ class OctoBrowse(QMainWindow):
         self.find_next_action = self._add_action(
             "Next", "Next Find Match (F3)", self.find_in_page, "F3"
         )
-        self.find_navigation_widgets = [
-            self.toolbar.widgetForAction(self.find_previous_action),
-            self.toolbar.widgetForAction(self.find_next_action),
+        self.find_navigation_actions = [
+            self.find_previous_action,
+            self.find_next_action,
         ]
-        for widget in self.find_navigation_widgets:
-            if widget is not None:
-                widget.hide()
+        for action in self.find_navigation_actions:
+            action.setVisible(False)
         self._add_action("Cmd", "Command Palette (Ctrl+K)", self.open_command_palette, "Ctrl+K", QStyle.StandardPixmap.SP_ComputerIcon)
 
         theme_menu = QMenu("Themes", self)
@@ -1756,6 +1819,18 @@ class OctoBrowse(QMainWindow):
         self._add_menu_action(tools_menu, "Upscale Page", "Open a 2x screenshot preview", self.upscale_page)
         self._add_menu_action(tools_menu, "Read Aloud", "Read page text aloud", self.read_aloud)
         self._add_menu_action(tools_menu, "Save Screenshot", "Save current viewport as PNG", self.save_screenshot)
+        self._add_menu_action(
+            tools_menu,
+            "Save Verified Offline Snapshot",
+            "Save a complete MHTML page with SHA-256 provenance",
+            self.save_offline_snapshot,
+        )
+        self._add_menu_action(
+            tools_menu,
+            "Verify Offline Snapshot",
+            "Check a saved MHTML page against its provenance sidecar",
+            self.verify_offline_snapshot,
+        )
         self._add_menu_action(tools_menu, "Save as PDF", "Print the current page to a PDF file", self.save_page_as_pdf, "Ctrl+Shift+P")
         self._add_menu_action(tools_menu, "Duplicate Tab", "Open current page again", self.duplicate_current_tab)
         self._add_menu_action(tools_menu, "Copy URL", "Copy current URL to clipboard", self.copy_current_url)
@@ -1884,7 +1959,20 @@ class OctoBrowse(QMainWindow):
         self._add_menu_action(file_menu, "Dashboard", "Open the OctoBrowse dashboard", self.open_dashboard)
         self._add_menu_action(file_menu, "Restore Saved Tabs", "Open tabs from the last saved session", self.restore_saved_tabs)
         self._add_menu_action(file_menu, "Reopen Closed Tab", "Restore the most recently closed tab", self.reopen_closed_tab, "Ctrl+Shift+T")
-        self._add_menu_action(file_menu, "Save Page As...", "Save the current page as HTML", self.save_page)
+        self._add_menu_action(file_menu, "Save Page HTML...", "Save the current page HTML without resources", self.save_page)
+        self._add_menu_action(
+            file_menu,
+            "Save Verified Offline Snapshot...",
+            "Save the complete current page as MHTML with provenance",
+            self.save_offline_snapshot,
+            "Ctrl+Shift+S",
+        )
+        self._add_menu_action(
+            file_menu,
+            "Verify Offline Snapshot...",
+            "Verify an MHTML archive and its SHA-256 provenance sidecar",
+            self.verify_offline_snapshot,
+        )
         self._add_menu_action(file_menu, "Save as PDF...", "Print the current page to PDF", self.save_page_as_pdf)
         self._add_menu_action(file_menu, "View Source", "View page source", self.view_page_source)
 
@@ -2018,13 +2106,14 @@ class OctoBrowse(QMainWindow):
                 border-right: 1px solid {border};
             }}
             QToolBar#WorkspaceRail QToolButton {{
-                min-width: 92px;
-                max-width: 106px;
-                min-height: 54px;
-                padding: 6px 4px;
+                min-width: 98px;
+                max-width: 118px;
+                min-height: 30px;
+                padding: 3px 7px;
                 border: 1px solid transparent;
                 border-radius: 7px;
                 color: {text};
+                text-align: left;
             }}
             QToolBar#WorkspaceRail QToolButton:pressed {{
                 background: {accent};
@@ -2102,6 +2191,10 @@ class OctoBrowse(QMainWindow):
                 font-weight: 600;
                 color: {text};
             }}
+            QLabel#LibraryIndexStatus {{
+                color: {subtle};
+                padding-bottom: 4px;
+            }}
             """
         self.refresh_app_stylesheet()
 
@@ -2144,6 +2237,16 @@ class OctoBrowse(QMainWindow):
             BrowserCommand("Reader view", "clean readable page", self.open_reader_view),
             BrowserCommand("Page insights", "word count keywords", self.show_page_insights),
             BrowserCommand("Save screenshot", "PNG viewport", self.save_screenshot),
+            BrowserCommand(
+                "Save verified offline snapshot",
+                "MHTML complete page SHA-256 provenance Ctrl+Shift+S",
+                self.save_offline_snapshot,
+            ),
+            BrowserCommand(
+                "Verify offline snapshot",
+                "MHTML integrity provenance SHA-256",
+                self.verify_offline_snapshot,
+            ),
             BrowserCommand("Save page as PDF", "print offline document Ctrl+Shift+P", self.save_page_as_pdf),
             BrowserCommand("Duplicate tab", "open current page again", self.duplicate_current_tab),
             BrowserCommand("Reopen closed tab", "Ctrl+Shift+T", self.reopen_closed_tab),
@@ -2713,9 +2816,10 @@ li {{ margin: 7px 0; }}
                 "Download manager with pause/resume/cancel and persistent download history",
             ],
             "Page Tools": [
-                "Reader view",
-                "Page insights",
+                "Bounded semantic article extraction in an isolated JavaScript world",
+                "Reader view and page insights use article-focused text with safe fallback",
                 "Save page HTML",
+                "Complete offline MHTML snapshots with SHA-256 provenance and verification",
                 "View source",
                 "Screenshot saving",
                 "Native PDF export with completion reporting",
@@ -2744,10 +2848,10 @@ li {{ margin: 7px 0; }}
                 "Private download provenance supplied directly by the off-record profile",
             ],
             "AI And Voice": [
-                "Citation-grounded OpenAI page summaries with privacy-aware save-to-note",
-                "Query-relevant cited page assistant with dedicated input and output",
+                "Citation-grounded OpenAI summaries over article-focused text with privacy-aware save-to-note",
+                "Query-relevant cited page assistant over shared readable content",
                 "Prompt-injection-aware context boundaries, store=False, and private-tab consent",
-                "Non-blocking cloud text-to-speech with per-use private-tab consent",
+                "Non-blocking article-focused cloud text-to-speech with per-use private-tab consent",
                 "SpeechRecognition voice commands",
             ],
             "Extensibility": [
@@ -3165,6 +3269,7 @@ code, pre {{
         browser.setProperty("loading", False)
         browser.setProperty("load_progress", 0)
         browser.setProperty("load_ok", True)
+        browser.setProperty("document_generation", 0)
         page = browser.page()
         settings = browser.settings()
         for attr_name, value in (
@@ -3493,9 +3598,8 @@ code, pre {{
     def toggle_find_bar(self) -> None:
         self.find_bar.setVisible(not self.find_bar.isVisible())
         self.find_count_label.setVisible(self.find_bar.isVisible())
-        for widget in self.find_navigation_widgets:
-            if widget is not None:
-                widget.setVisible(self.find_bar.isVisible())
+        for action in self.find_navigation_actions:
+            action.setVisible(self.find_bar.isVisible())
         if self.find_bar.isVisible():
             self.find_bar.setFocus()
             self.find_bar.selectAll()
@@ -3581,6 +3685,8 @@ code, pre {{
                 if isinstance(existing, QWebEngineView) and existing.property("internal_page") == internal_page:
                     existing.setProperty("generated_page", True)
                     existing.setProperty("generated_navigation_pending", True)
+                    existing.setProperty("loading", True)
+                    existing.setProperty("load_progress", 0)
                     self.tabs.setTabText(index, title)
                     self.tabs.setCurrentIndex(index)
                     existing.setHtml(html_text, QUrl("https://octobrowse.local/"))
@@ -3595,6 +3701,7 @@ code, pre {{
         index = self.tabs.addTab(browser, title)
         self.tabs.setCurrentIndex(index)
         self._wire_browser(browser)
+        browser.setProperty("loading", True)
         browser.setHtml(html_text, QUrl("https://octobrowse.local/"))
         self.update_status_badges()
 
@@ -3713,23 +3820,129 @@ li {{ margin: 8px 0; }}
             items.append(f'<li><a href="{safe_url}">{label}</a></li>')
         return f"<ul>{''.join(items)}</ul>"
 
+    def extract_readable_page(
+        self,
+        browser: QWebEngineView,
+        callback: Any,
+    ) -> None:
+        """Extract bounded article text from the current, unchanged document."""
+
+        try:
+            source_page = browser.page()
+            source_url = browser.url().toString()
+            tab_index = self.tabs.indexOf(browser)
+            fallback_title = (
+                source_page.title()
+                or (self.tabs.tabText(tab_index) if tab_index >= 0 else "")
+                or source_url
+            )
+            source_generation = int(
+                browser.property("document_generation") or 0
+            )
+        except RuntimeError:
+            return
+
+        def document_is_current() -> bool:
+            try:
+                return (
+                    browser.page() is source_page
+                    and browser.url().toString() == source_url
+                    and int(browser.property("document_generation") or 0)
+                    == source_generation
+                )
+            except RuntimeError:
+                return False
+
+        def deliver(value: Any) -> None:
+            if not document_is_current():
+                try:
+                    self.set_status("Page changed; content action cancelled")
+                except RuntimeError:
+                    pass
+                return
+            readable = normalize_readable_page(
+                value,
+                fallback_title=fallback_title,
+                source_url=source_url,
+            )
+            if readable.text:
+                callback(readable)
+                return
+
+            def deliver_plain_text(text: str) -> None:
+                if not document_is_current():
+                    try:
+                        self.set_status("Page changed; content action cancelled")
+                    except RuntimeError:
+                        pass
+                    return
+                callback(
+                    normalize_readable_page(
+                        {
+                            "text": text,
+                            "method": "fallback:plain-text",
+                        },
+                        fallback_title=fallback_title,
+                        source_url=source_url,
+                    )
+                )
+
+            try:
+                source_page.toPlainText(deliver_plain_text)
+            except RuntimeError:
+                return
+
+        try:
+            source_page.runJavaScript(
+                READABLE_PAGE_SCRIPT,
+                QWebEngineScript.ScriptWorldId.ApplicationWorld.value,
+                deliver,
+            )
+        except RuntimeError:
+            return
+
     def open_reader_view(self) -> None:
         browser = self.current_browser()
         if not browser:
             return
-        browser.page().toPlainText(lambda text: self.show_reader_tab(text, browser.url().toString(), bool(browser.property("private"))))
+        private = bool(browser.property("private"))
+        self.set_status("Extracting article content...")
+        self.extract_readable_page(
+            browser,
+            lambda readable, private=private: self.show_reader_tab(
+                readable,
+                private,
+            ),
+        )
 
-    def show_reader_tab(self, text: str, url: str, private: bool) -> None:
-        cleaned = self.clean_page_text(text)
+    def show_reader_tab(self, readable: ReadablePage, private: bool) -> None:
+        cleaned = self.clean_page_text(readable.text)
         if not cleaned:
             QMessageBox.information(self, "Reader View", "There is no readable text on this page.")
             return
         words = cleaned.split()
         minutes = max(1, round(len(words) / 220))
-        paragraphs = [paragraph for paragraph in cleaned.split("\n\n") if paragraph.strip()][:80]
+        paragraphs = [
+            paragraph
+            for paragraph in cleaned.split("\n\n")
+            if paragraph.strip()
+        ]
         body = "\n".join(f"<p>{html.escape(paragraph)}</p>" for paragraph in paragraphs)
-        keywords = html.escape(", ".join(self.extract_keywords(cleaned, limit=8)))
-        safe_url = html.escape(url)
+        keywords = ", ".join(self.extract_keywords(cleaned, limit=8))
+        safe_url = html.escape(readable.url)
+        title = html.escape(readable.title or "Reader View")
+        details = [
+            detail
+            for detail in (
+                readable.byline,
+                readable.site_name,
+                f"{len(words)} words",
+                f"about {minutes} min",
+                keywords,
+            )
+            if detail
+        ]
+        safe_details = " | ".join(html.escape(detail) for detail in details)
         reader_html = f"""<!doctype html>
 <html>
 <head>
@@ -3756,13 +3969,19 @@ p {{ margin: 0 0 20px; }}
 </head>
 <body>
 <article>
-  <h1>Reader View</h1>
-  <div class="meta">{len(words)} words | about {minutes} min | {keywords}<br>{safe_url}</div>
+  <h1>{title}</h1>
+  <div class="meta">{safe_details}<br>{safe_url}</div>
   {body}
 </article>
 </body>
 </html>"""
-        self.add_html_tab(reader_html, "Reader View", private=private)
+        tab_title = f"Reader - {readable.title}" if readable.title else "Reader View"
+        self.add_html_tab(reader_html, tab_title[:80], private=private)
+        self.set_status(
+            "Reader View opened with article-focused text"
+            if readable.method.startswith("semantic:")
+            else "Reader View opened with full-page fallback text"
+        )
 
     def show_page_insights(self) -> None:
         browser = self.current_browser()
@@ -3770,19 +3989,34 @@ p {{ margin: 0 0 20px; }}
             return
         url = browser.url().toString()
         blocked = self.request_interceptor_for_browser(browser).total_blocked()
-        browser.page().toPlainText(
-            lambda text, url=url, blocked=blocked: self.display_page_insights(
-                text, url, blocked
+        self.set_status("Extracting article insights...")
+        self.extract_readable_page(
+            browser,
+            lambda readable, url=url, blocked=blocked: self.display_page_insights(
+                readable,
+                url,
+                blocked,
             )
         )
 
-    def display_page_insights(self, text: str, url: str, blocked: int = 0) -> None:
-        cleaned = self.clean_page_text(text)
+    def display_page_insights(
+        self,
+        readable: ReadablePage,
+        url: str,
+        blocked: int = 0,
+    ) -> None:
+        cleaned = self.clean_page_text(readable.text)
         words = cleaned.split()
         minutes = max(1, round(len(words) / 220)) if words else 0
         keywords = ", ".join(self.extract_keywords(cleaned, limit=10)) or "None"
+        extraction = (
+            "Article-focused"
+            if readable.method.startswith("semantic:")
+            else "Full-page fallback"
+        )
         lines = [
             f"URL: {url}",
+            f"Content mode: {extraction}",
             f"Words: {len(words)}",
             f"Estimated read time: {minutes} min",
             f"Top terms: {keywords}",
@@ -3791,18 +4025,7 @@ p {{ margin: 0 0 20px; }}
         QMessageBox.information(self, "Page Insights", "\n".join(lines))
 
     def clean_page_text(self, text: str) -> str:
-        lines = [line.strip() for line in text.splitlines()]
-        blocks: list[str] = []
-        buffer: list[str] = []
-        for line in lines:
-            if line:
-                buffer.append(line)
-            elif buffer:
-                blocks.append(" ".join(buffer))
-                buffer = []
-        if buffer:
-            blocks.append(" ".join(buffer))
-        return "\n\n".join(blocks)
+        return normalize_plain_text(text)
 
     def extract_keywords(self, text: str, limit: int = 8) -> list[str]:
         stop_words = {
@@ -3827,7 +4050,7 @@ p {{ margin: 0 0 20px; }}
         ):
             browser.setProperty("generated_page", False)
             browser.setProperty("internal_page", "")
-        if not self.incognito_mode and not browser.property("private") and not self.is_internal_url(text):
+        if not browser.property("private") and not self.is_internal_url(text):
             self.add_to_history(text)
         if browser != self.current_browser():
             return
@@ -4021,6 +4244,10 @@ p {{ margin: 0 0 20px; }}
     def on_load_started(self, browser: QWebEngineView) -> None:
         browser.setProperty("loading", True)
         browser.setProperty("load_progress", 0)
+        browser.setProperty(
+            "document_generation",
+            int(browser.property("document_generation") or 0) + 1,
+        )
         if browser == self.current_browser():
             self.progress_bar.setValue(0)
             self.progress_bar.show()
@@ -4030,6 +4257,11 @@ p {{ margin: 0 0 20px; }}
         browser.setProperty("loading", False)
         browser.setProperty("load_progress", 100 if ok else int(browser.property("load_progress") or 0))
         browser.setProperty("load_ok", bool(ok))
+        if browser.property("generated_page") and not is_trusted_internal_url(
+            browser.url().toString()
+        ):
+            browser.setProperty("generated_page", False)
+            browser.setProperty("internal_page", "")
         browser.setProperty("generated_navigation_pending", False)
         if browser == self.current_browser():
             self.update_security_badge(browser.url(), browser)
@@ -4224,8 +4456,11 @@ p {{ margin: 0 0 20px; }}
             return
         browser = self.current_browser()
         if browser and self.confirm_cloud_speech(browser):
-            self.set_status("Preparing speech without blocking browsing...")
-            browser.page().toPlainText(lambda text: self.speak_text(text[:1500]))
+            self.set_status("Extracting article text for speech...")
+            self.extract_readable_page(
+                browser,
+                lambda readable: self.speak_text(readable.text[:1500]),
+            )
 
     def confirm_cloud_speech(self, browser: QWebEngineView) -> bool:
         """Require explicit consent before private-page text is sent to gTTS."""
@@ -4276,6 +4511,8 @@ p {{ margin: 0 0 20px; }}
     def cleanup_speech_worker(self, worker: SpeechWorker) -> None:
         if worker in self.speech_workers:
             self.speech_workers.remove(worker)
+        worker.text = ""
+        worker.deleteLater()
 
     def toggle_ad_block(self) -> None:
         self.ad_block_enabled = not self.ad_block_enabled
@@ -4337,15 +4574,14 @@ p {{ margin: 0 0 20px; }}
             return
         browser = self.current_browser()
         if browser and self.confirm_cloud_ai(browser):
-            title = browser.page().title() or self.tabs.tabText(self.tabs.currentIndex())
-            url = browser.url().toString()
             source_private = bool(browser.property("private"))
-            self.set_status("Preparing cited page summary...")
-            browser.page().toPlainText(
-                lambda text, title=title, url=url, source_private=source_private: self.generate_summary(
-                    text,
-                    title,
-                    url,
+            self.set_status("Extracting article text for a cited summary...")
+            self.extract_readable_page(
+                browser,
+                lambda readable, source_private=source_private: self.generate_summary(
+                    readable.text,
+                    readable.title,
+                    readable.url,
                     source_private=source_private,
                 )
             )
@@ -4467,14 +4703,16 @@ p {{ margin: 0 0 20px; }}
             return
         browser = self.current_browser()
         if browser and self.confirm_cloud_ai(browser):
-            title = browser.page().title() or self.tabs.tabText(self.tabs.currentIndex())
-            url = browser.url().toString()
             output = getattr(self, "page_chat_output", None)
             if output is not None:
                 output.appendPlainText("OctoBrowse: selecting relevant source passages...\n")
-            browser.page().toPlainText(
-                lambda text, query=query, title=title, url=url: self.generate_chatbot_response(
-                    query, text, title, url
+            self.extract_readable_page(
+                browser,
+                lambda readable, query=query: self.generate_chatbot_response(
+                    query,
+                    readable.text,
+                    readable.title,
+                    readable.url,
                 )
             )
 
@@ -4525,6 +4763,11 @@ p {{ margin: 0 0 20px; }}
     def cleanup_ai_worker(self, worker: OpenAIWorker) -> None:
         if worker in self.ai_workers:
             self.ai_workers.remove(worker)
+        self.ai_task_metadata.pop(worker.task, None)
+        worker.api_key = ""
+        worker.instructions = ""
+        worker.input_text = ""
+        worker.deleteLater()
 
     def handle_openai_result(self, task: str, text: str) -> None:
         metadata = self.ai_task_metadata.pop(task, {})
@@ -4741,25 +4984,88 @@ p {{ margin: 0 0 20px; }}
             self.add_tab(QUrl(str(url)), item.text())
 
     def handle_download_requested(self, download: Any, private: bool) -> None:
-        default_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
-        suggested_name = download.downloadFileName() or "download"
-        suggested_path = str(Path(default_dir) / suggested_name)
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save Download", suggested_path)
-        if not file_path:
+        snapshot_request: dict[str, Any] | None = None
+        try:
+            is_save_page = bool(download.isSavePageDownload())
+        except Exception:
+            is_save_page = False
+        try:
+            source_page = download.page()
+            snapshot_token = (
+                str(source_page.property("pending_snapshot_token") or "")
+                if source_page is not None
+                else ""
+            )
+        except Exception:
+            source_page = None
+            snapshot_token = ""
+        if (
+            is_save_page
+            and snapshot_token
+            and snapshot_token in self.pending_snapshot_saves
+        ):
+            snapshot_request = self.pending_snapshot_saves.pop(snapshot_token)
+            try:
+                if source_page is not None:
+                    source_page.setProperty("pending_snapshot_token", "")
+            except RuntimeError:
+                pass
+            snapshot_request.pop("source_page", None)
+            if bool(snapshot_request.get("private_capture")) != bool(private):
+                self.finish_snapshot_target(snapshot_request)
+                download.cancel()
+                self.set_status(
+                    "Snapshot cancelled because its profile provenance changed"
+                )
+                return
+            target = Path(str(snapshot_request["path"]))
+            try:
+                download.setSavePageFormat(
+                    QWebEngineDownloadRequest.SavePageFormat.MimeHtmlSaveFormat
+                )
+            except Exception:
+                pass
+        elif is_save_page:
+            # OctoBrowse only starts SavePage downloads through the verified
+            # snapshot path. A late request from a closed/expired page must
+            # fail closed instead of becoming an unverified generic download.
             download.cancel()
-            self.set_status("Download cancelled")
+            self.set_status("Unmatched page-save request cancelled")
             return
+        else:
+            default_dir = (
+                QStandardPaths.writableLocation(
+                    QStandardPaths.StandardLocation.DownloadLocation
+                )
+                or str(Path.home())
+            )
+            suggested_name = download.downloadFileName() or "download"
+            suggested_path = str(Path(default_dir) / suggested_name)
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Download",
+                suggested_path,
+            )
+            if not file_path:
+                download.cancel()
+                self.set_status("Download cancelled")
+                return
+            target = Path(file_path)
 
-        target = Path(file_path)
         download.setDownloadDirectory(str(target.parent))
         download.setDownloadFileName(target.name)
-        item = QListWidgetItem(f"Downloading: {target.name}")
+        activity = "Saving snapshot" if snapshot_request is not None else "Downloading"
+        item = QListWidgetItem(f"{activity}: {target.name}")
         item.setToolTip(str(target))
         item.setData(DOWNLOAD_PATH_ROLE, str(target))
         item.setData(DOWNLOAD_REQUEST_ROLE, download)
         item.setData(DOWNLOAD_PRIVATE_ROLE, bool(private))
+        item.setData(DOWNLOAD_SNAPSHOT_ROLE, snapshot_request)
         self.downloads_sidebar.addItem(item)
-        self.open_panel(self.downloads_sidebar, status=f"Downloading {target.name}")
+        self.open_panel(
+            self.downloads_sidebar,
+            status=f"{activity} {target.name}",
+        )
         self.downloads.append({"file": str(target), "status": "downloading"})
 
         try:
@@ -4783,10 +5089,15 @@ p {{ margin: 0 0 20px; }}
     def update_download_state(self, download: Any, item: QListWidgetItem) -> None:
         state_name = getattr(download.state(), "name", str(download.state()))
         filename = download.downloadFileName() or "download"
+        snapshot_request = item.data(DOWNLOAD_SNAPSHOT_ROLE)
         finished_status: str | None = None
         if "Completed" in state_name:
-            item.setText(f"Complete: {filename}")
-            self.set_status(f"Downloaded {filename}")
+            if isinstance(snapshot_request, dict):
+                item.setText(f"Creating provenance: {filename}")
+                self.set_status(f"Hashing offline snapshot: {filename}")
+            else:
+                item.setText(f"Complete: {filename}")
+                self.set_status(f"Downloaded {filename}")
             finished_status = "complete"
         elif "Cancelled" in state_name:
             item.setText(f"Cancelled: {filename}")
@@ -4798,8 +5109,13 @@ p {{ margin: 0 0 20px; }}
             finished_status = "failed"
         if finished_status is not None:
             item.setData(DOWNLOAD_REQUEST_ROLE, None)
+            item.setData(DOWNLOAD_SNAPSHOT_ROLE, None)
             file_path = str(item.data(DOWNLOAD_PATH_ROLE) or filename)
             self.downloads = [record for record in self.downloads if record.get("file") != file_path]
+            if finished_status == "complete" and isinstance(snapshot_request, dict):
+                self.create_snapshot_manifest(file_path, snapshot_request, item)
+            elif isinstance(snapshot_request, dict):
+                self.finish_snapshot_target(snapshot_request)
             try:
                 source_url = download.url().toString()
             except Exception:
@@ -4815,6 +5131,104 @@ p {{ margin: 0 0 20px; }}
                 )
                 self.downloads_history = self.downloads_history[-100:]
             self.save_settings()
+            try:
+                download.deleteLater()
+            except RuntimeError:
+                pass
+
+    def create_snapshot_manifest(
+        self,
+        archive_path: str,
+        request: dict[str, Any],
+        item: QListWidgetItem,
+    ) -> None:
+        metadata = {
+            key: request.get(key)
+            for key in (
+                "source_url",
+                "source_title",
+                "captured_at",
+                "private_capture",
+                "octobrowse_version",
+                "chromium_version",
+            )
+        }
+        worker: SnapshotManifestWorker | None = None
+        try:
+            worker = SnapshotManifestWorker(archive_path, metadata, self)
+            worker.completed.connect(
+                lambda archive, manifest, item=item, request=request: self.snapshot_manifest_created(
+                    archive,
+                    manifest,
+                    item,
+                    request,
+                )
+            )
+            worker.failed.connect(
+                lambda archive, error, item=item, request=request: self.snapshot_manifest_failed(
+                    archive,
+                    error,
+                    item,
+                    request,
+                )
+            )
+            worker.finished.connect(
+                lambda worker=worker: self.finish_snapshot_worker(worker)
+            )
+            self.snapshot_workers.append(worker)
+            worker.start()
+        except Exception as exc:
+            if worker is not None:
+                if worker in self.snapshot_workers:
+                    self.snapshot_workers.remove(worker)
+                worker.deleteLater()
+            self.snapshot_manifest_failed(
+                archive_path,
+                str(exc),
+                item,
+                request,
+            )
+
+    def snapshot_manifest_created(
+        self,
+        archive_path: str,
+        manifest_path: str,
+        item: QListWidgetItem,
+        request: dict[str, Any],
+    ) -> None:
+        self.finish_snapshot_target(request)
+        try:
+            item.setText(f"Verified snapshot: {Path(archive_path).name}")
+            item.setToolTip(
+                f"{archive_path}\nProvenance: {manifest_path}"
+            )
+        except RuntimeError:
+            pass
+        self.set_status(
+            f"Saved verified offline snapshot: {Path(archive_path).name}"
+        )
+
+    def snapshot_manifest_failed(
+        self,
+        archive_path: str,
+        error: str,
+        item: QListWidgetItem,
+        request: dict[str, Any],
+    ) -> None:
+        self.finish_snapshot_target(request)
+        try:
+            item.setText(
+                f"Snapshot saved; provenance failed: {Path(archive_path).name}"
+            )
+        except RuntimeError:
+            pass
+        self.set_status("Snapshot saved, but provenance generation failed")
+        QMessageBox.warning(
+            self,
+            "Snapshot Provenance Failed",
+            "The MHTML archive was saved, but its integrity sidecar could not "
+            f"be created:\n{error}",
+        )
 
     def show_downloads_context_menu(self, position: Any) -> None:
         item = self.downloads_sidebar.itemAt(position)
@@ -5635,6 +6049,10 @@ p {{ margin: 0 0 20px; }}
         save_action.triggered.connect(self.save_page)
         menu.addAction(save_action)
 
+        snapshot_action = QAction("Save Verified Offline Snapshot...", self)
+        snapshot_action.triggered.connect(self.save_offline_snapshot)
+        menu.addAction(snapshot_action)
+
         pdf_action = QAction("Save as PDF...", self)
         pdf_action.triggered.connect(self.save_page_as_pdf)
         menu.addAction(pdf_action)
@@ -5664,6 +6082,252 @@ p {{ margin: 0 0 20px; }}
         menu.addAction(capture_action)
 
         menu.exec(self.tabs.mapToGlobal(position))
+
+    def save_offline_snapshot(self) -> None:
+        browser = self.current_browser()
+        if not browser:
+            return
+        private_capture = bool(browser.property("private"))
+        if private_capture:
+            answer = QMessageBox.warning(
+                self,
+                "Save Private Page Offline",
+                "This explicit export writes the private page, its resources, "
+                "title, and source URL to disk. OctoBrowse will not add it to "
+                "standard download history. The archive may contain signed-in "
+                "or otherwise sensitive page content.\n\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self.set_status("Private snapshot cancelled")
+                return
+
+        default_dir = (
+            QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.DocumentsLocation
+            )
+            or str(Path.home())
+        )
+        default_name = snapshot_filename(
+            browser.page().title()
+            or self.tabs.tabText(self.tabs.indexOf(browser))
+        )
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Verified Offline Snapshot",
+            str(Path(default_dir) / default_name),
+            "MHTML Web Archives (*.mhtml *.mht)",
+        )
+        if not file_path:
+            return
+        if Path(file_path).suffix.lower() not in {".mhtml", ".mht"}:
+            file_path = f"{file_path}.mhtml"
+        self.start_offline_snapshot(browser, file_path)
+
+    def start_offline_snapshot(
+        self,
+        browser: QWebEngineView,
+        file_path: str,
+    ) -> None:
+        """Start Qt's asynchronous complete-page MHTML save."""
+
+        target = Path(file_path)
+        if not target.parent.is_dir():
+            QMessageBox.warning(
+                self,
+                "Save Offline Snapshot",
+                f"The destination folder does not exist:\n{target.parent}",
+            )
+            return
+        target_key = os.path.normcase(str(target.resolve(strict=False)))
+        if target_key in self.snapshot_targets_in_progress:
+            QMessageBox.information(
+                self,
+                "Save Offline Snapshot",
+                "A snapshot is already being saved to that destination.",
+            )
+            return
+        try:
+            source_page = browser.page()
+            existing_token = str(
+                source_page.property("pending_snapshot_token") or ""
+            )
+        except RuntimeError:
+            return
+        if existing_token and existing_token in self.pending_snapshot_saves:
+            QMessageBox.information(
+                self,
+                "Save Offline Snapshot",
+                "This page already has a snapshot request in progress.",
+            )
+            return
+        snapshot_token = f"snapshot-{time.time_ns()}-{id(source_page)}"
+        request = {
+            "path": str(target),
+            "target_key": target_key,
+            "source_url": browser.url().toString(),
+            "source_title": (
+                source_page.title()
+                or self.tabs.tabText(self.tabs.indexOf(browser))
+                or target.stem
+            ),
+            "captured_at": time.time(),
+            "private_capture": bool(browser.property("private")),
+            "octobrowse_version": OCTO_BROWSER_VERSION,
+            "chromium_version": qWebEngineChromiumVersion(),
+            "snapshot_token": snapshot_token,
+            "source_page": source_page,
+        }
+        source_page.setProperty("pending_snapshot_token", snapshot_token)
+        self.pending_snapshot_saves[snapshot_token] = request
+        self.snapshot_targets_in_progress.add(target_key)
+        source_page.destroyed.connect(
+            lambda _object=None, token=snapshot_token: self.cancel_pending_snapshot(
+                token
+            )
+        )
+        try:
+            source_page.save(
+                str(target),
+                QWebEngineDownloadRequest.SavePageFormat.MimeHtmlSaveFormat,
+            )
+        except Exception as exc:
+            self.pending_snapshot_saves.pop(snapshot_token, None)
+            self.finish_snapshot_target(request)
+            try:
+                source_page.setProperty("pending_snapshot_token", "")
+            except RuntimeError:
+                pass
+            QMessageBox.critical(
+                self,
+                "Save Offline Snapshot",
+                f"Could not start the snapshot: {exc}",
+            )
+            return
+        QTimer.singleShot(
+            30_000,
+            lambda token=snapshot_token: self.expire_pending_snapshot(token),
+        )
+        self.set_status(f"Saving offline snapshot: {target.name}")
+
+    def expire_pending_snapshot(self, snapshot_token: str) -> None:
+        request = self.pending_snapshot_saves.pop(snapshot_token, None)
+        if request is None:
+            return
+        source_page = request.get("source_page")
+        try:
+            if source_page is not None:
+                source_page.setProperty("pending_snapshot_token", "")
+        except RuntimeError:
+            pass
+        self.finish_snapshot_target(request)
+        self.set_status("Offline snapshot request timed out")
+
+    def cancel_pending_snapshot(self, snapshot_token: str) -> None:
+        request = self.pending_snapshot_saves.pop(snapshot_token, None)
+        if request is None:
+            return
+        self.finish_snapshot_target(request)
+        try:
+            self.set_status("Offline snapshot cancelled because its page closed")
+        except RuntimeError:
+            pass
+
+    def finish_snapshot_target(self, request: dict[str, Any]) -> None:
+        request.pop("source_page", None)
+        target_key = request.get("target_key")
+        if isinstance(target_key, str):
+            self.snapshot_targets_in_progress.discard(target_key)
+
+    def verify_offline_snapshot(self) -> None:
+        default_dir = (
+            QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.DocumentsLocation
+            )
+            or str(Path.home())
+        )
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Verify Offline Snapshot",
+            default_dir,
+            "Offline Snapshots (*.mhtml *.mht *.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+        worker = SnapshotVerificationWorker(file_path, self)
+        worker.completed.connect(self.show_snapshot_verification)
+        worker.failed.connect(self.show_snapshot_verification_error)
+        worker.finished.connect(
+            lambda worker=worker: self.finish_snapshot_worker(worker)
+        )
+        self.snapshot_workers.append(worker)
+        worker.start()
+        self.set_status(f"Verifying snapshot: {Path(file_path).name}")
+
+    def show_snapshot_verification(self, result: SnapshotVerification) -> None:
+        if not isinstance(result, SnapshotVerification):
+            QMessageBox.warning(
+                self,
+                "Verify Offline Snapshot",
+                "Snapshot verification returned an invalid result.",
+            )
+            return
+        if not result.valid:
+            QMessageBox.warning(
+                self,
+                "Snapshot Integrity Failed",
+                result.reason,
+            )
+            self.set_status("Snapshot integrity check failed")
+            return
+
+        manifest = result.manifest if isinstance(result.manifest, dict) else {}
+        archive_value = manifest.get("archive")
+        source_value = manifest.get("source")
+        capture_value = manifest.get("capture")
+        archive_record = archive_value if isinstance(archive_value, dict) else {}
+        source = source_value if isinstance(source_value, dict) else {}
+        capture = capture_value if isinstance(capture_value, dict) else {}
+        title = str(source.get("title") or "Untitled snapshot")[:512]
+        source_url = str(source.get("url") or "")[:2048]
+        digest = str(archive_record.get("sha256") or "")
+        captured_at = str(capture.get("created_at") or "")
+        details = [
+            result.reason,
+            "This checks the archive against its adjacent sidecar; it is not a digital signature.",
+            "",
+            f"Title: {title}",
+        ]
+        if source_url:
+            details.append(f"Source: {source_url}")
+        if captured_at:
+            details.append(f"Captured: {captured_at}")
+        details.extend(
+            [
+                f"Archive: {result.archive_path.name if result.archive_path else ''}",
+                f"SHA-256: {digest}",
+            ]
+        )
+        QMessageBox.information(
+            self,
+            "Snapshot Integrity Verified",
+            "\n".join(details),
+        )
+        self.set_status("Snapshot integrity verified")
+
+    def show_snapshot_verification_error(self, error: str) -> None:
+        QMessageBox.warning(
+            self,
+            "Snapshot Verification Failed",
+            f"The snapshot could not be verified:\n{str(error)[:2000]}",
+        )
+        self.set_status("Snapshot verification failed")
+
+    def finish_snapshot_worker(self, worker: QThread) -> None:
+        if worker in self.snapshot_workers:
+            self.snapshot_workers.remove(worker)
+        worker.deleteLater()
 
     def save_page(self) -> None:
         browser = self.current_browser()
@@ -6082,16 +6746,19 @@ p {{ margin: 0 0 20px; }}
         open_button.clicked.connect(
             lambda: self.add_tab(QUrl(source), "Research Source", private=False)
         )
-        edit_button.clicked.connect(
-            lambda: (
-                dialog.accept(),
-                self.open_research_capture_dialog(
+
+        def edit_note() -> None:
+            dialog.accept()
+            QTimer.singleShot(
+                0,
+                lambda: self.open_research_capture_dialog(
                     None,
                     quote=str(note.get("quote", "")),
                     existing_note=note,
                 ),
             )
-        )
+
+        edit_button.clicked.connect(edit_note)
         copy_button.clicked.connect(lambda: self.copy_research_note_markdown(note_id))
         delete_button.clicked.connect(
             lambda: dialog.accept() if self.delete_research_note(note_id) else None
@@ -6400,6 +7067,7 @@ p {{ margin: 0 0 20px; }}
             + list(self.ai_workers)
             + list(self.filter_workers)
             + list(self.speech_workers)
+            + list(self.snapshot_workers)
         )
         running = [worker for worker in workers if worker.isRunning()]
         if running:

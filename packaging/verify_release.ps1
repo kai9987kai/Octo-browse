@@ -73,7 +73,11 @@ foreach ($module in @(
     "octobrowse.ai_context",
     "octobrowse.extensions",
     "octobrowse.filtering",
+    "octobrowse.library_index",
+    "octobrowse.readability",
+    "octobrowse.research",
     "octobrowse.session",
+    "octobrowse.snapshots",
     "octobrowse.urls",
     "octobrowse.version",
     "octobrowse.workspaces"

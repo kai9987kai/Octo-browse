@@ -33,6 +33,42 @@ and stronger separation between standard and private sessions.
   second on the development machine.
 - **More honest internal identity:** only exact OctoBrowse-generated pages
   receive the trusted application badge.
+- **Research Capture:** save a page or selected quotation with source metadata
+  and commentary, then view, edit, delete, copy as Markdown, or export matching
+  notes with a named workspace. Legacy notes migrate automatically.
+- **Private-by-construction notes:** one shared write path prevents private-tab
+  and internal-page content from being persisted by manual capture, AI
+  summaries, or trusted plugins.
+- **Indexed Library Search:** a transactional SQLite/FTS5 index now searches
+  ordinary tabs and all saved collections, including research quotes,
+  commentary, and workspace contents, with deterministic ranking and a safe
+  fallback when FTS5 is unavailable.
+- **Calmer startup and chrome:** a fresh session opens one dashboard, the
+  workspace rail is denser, and find-navigation controls appear only while
+  find-in-page is active.
+- **More accurate tab lifecycle:** tabs retain their own loading, progress, and
+  failure state, background navigations still reach history, and automatic
+  hibernation ages from the moment a tab actually enters the background.
+- **Verifiable Offline Snapshots:** save a complete page as one MHTML research
+  archive plus an atomic provenance sidecar containing source metadata,
+  capture/runtime versions, byte size, and SHA-256. In-app verification hashes
+  large archives off the UI thread, rejects unsafe sidecar paths, and detects
+  missing or changed content. The sidecar is an integrity record, not a digital
+  signature.
+- **Explicit private export boundary:** private-page snapshots require a clear
+  disk-persistence warning and remain absent from standard download history.
+- **Shared article intelligence:** Reader View, Page Insights, Read Aloud,
+  cited summaries, and page Q&A now prefer semantic article content instead of
+  sending or presenting navigation, cookie banners, advertisements, and footer
+  boilerplate.
+- **Bounded and isolated extraction:** DOM scanning and returned text are
+  strictly capped, extraction runs in Qt's isolated Application World, only
+  plain text crosses into the app, and same-URL reloads invalidate stale
+  callbacks before private or standard content can reach a downstream action.
+- **Stronger snapshot hardening:** sidecar source/capture fields are fully
+  schema-checked, deeply nested JSON fails closed, concurrent saves are bound
+  to their originating standard or private page, and atomic sidecar writes use
+  unique temporary files.
 
 ## Compatibility and safety note
 

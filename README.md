@@ -23,7 +23,27 @@ Python automation.
 - Named Research Workspaces save ordinary tabs, order, active position, and
   pinned state; workspaces can be reopened alongside the current session,
   restored as a replacement, searched from Library Search, or exported as
-  Markdown. Private tabs are never captured.
+  Markdown or as a research pack containing matching notes. Private tabs are
+  never captured.
+- Selection-anchored Research Notes (`Ctrl+Alt+N`) preserve source title, URL,
+  quoted evidence, commentary, timestamps, and kind in a versioned bounded
+  format. Legacy notes migrate automatically; notes can be viewed, edited,
+  copied as Markdown, deleted, and exported with a workspace. Private-tab and
+  internal-page content is rejected by the shared persistence path used by the
+  UI, AI summaries, and plugins.
+- Verifiable Offline Snapshots (`Ctrl+Shift+S`) save the complete active page
+  as one portable MHTML archive, then create an adjacent provenance sidecar
+  with the source, capture time, runtime versions, byte size, and SHA-256.
+  Verification runs off the UI thread and rejects unsafe sidecar paths or
+  modified archives. Private-page capture requires an explicit disk-persistence
+  warning and never enters standard download history. The sidecar provides
+  local integrity checking, not signer authentication.
+- A shared, bounded readability pipeline prefers visible semantic
+  `<article>`/`<main>` content, removes navigation, advertisements, dialogs,
+  and other page furniture, and safely falls back to bounded plain text. It
+  runs in Qt's isolated Application World and returns text rather than
+  untrusted HTML. Reader View, Page Insights, Read Aloud, cited summaries, and
+  page Q&A now use the same document-bound extraction result.
 - Frecency-ranked address suggestions (Mozilla-style visit-count x recency
   scoring) backed by titled history entries with visit counts and timestamps.
 - Configurable default search engine: Google, DuckDuckGo, Bing, Brave, or
@@ -56,8 +76,10 @@ Python automation.
   tiles for the main browser workspaces.
 - Feature Audit page for checking that merged main/alpha-era features and newer
   Octo Browser capabilities are present.
-- Library Search (`Ctrl+Shift+F`) for searching open tabs, history, bookmarks,
-  reading list items, notes, and tasks from one dialog.
+- Transactional SQLite/FTS5 Library Search (`Ctrl+Shift+F`) for fast ranked
+  search across ordinary open tabs, history, bookmarks, reading-list items,
+  research-note titles/quotes/commentary, tasks, and workspaces. It falls back
+  safely when FTS5 is unavailable and never indexes private tabs.
 - Smart address commands: `octo:dashboard`, `octo:identity`, `octo:tabs`,
   `octo:features`, `octo:library`, `octo:downloads`, `octo:reading`,
   `octo:history`, `octo:bookmarks`, `octo:todos`, `octo:notes`,
@@ -91,9 +113,11 @@ Python automation.
 - Per-site content controls: disable JavaScript or image loading for chosen
   sites (Tools > Site Controls). Standard choices persist; private-tab choices
   stay in memory and never enter the settings file.
-- Persistent settings, workspaces, bookmarks, notes, and todos stored as JSON
-  under the platform app-data directory (history lives in `history.sqlite`);
-  API keys use the OS credential vault through `keyring` when available.
+- Persistent settings, workspaces, bookmarks, versioned research notes, and
+  todos stored as JSON under the platform app-data directory. History lives in
+  `history.sqlite` and the rebuildable unified-search index in
+  `library.sqlite`; API keys use the OS credential vault through `keyring` when
+  available.
 - Crash-resilient, versioned session restore preserves as many as 50 standard
   tabs, including order, duplicate URLs, titles, pinned state, and the active
   position, with an atomic 30-second autosave. Legacy URL-only sessions migrate
@@ -103,11 +127,13 @@ Python automation.
 - Persistent reading list panel for pages to revisit later.
 - User-initiated target-blank and popup-style requests open as normal tabs;
   script-only popup requests are blocked per tab.
-- Sidebar panels for notes/chat, calendar, todos, history, news, bookmarks, and
-  extension code.
-- Page tools: save page HTML, view source, open current page in a new tab,
-  reader view, page insights, screenshot saving, upscaled screenshot preview,
-  native PDF export, zoom controls,
+- Sidebar panels for structured research notes, calendar, todos, history,
+  news, bookmarks, and extension code. Page-aware AI chat has its own focused
+  dialog.
+- Page tools: save page HTML, save and verify complete MHTML research snapshots,
+  view source, open current page in a new tab, semantic reader view, article
+  insights,
+  screenshot saving, upscaled screenshot preview, native PDF export, zoom controls,
   duplicate tab, copy URL, copy Markdown link, tab overview, browser identity,
   site info, custom user agent, themes, and fullscreen.
 - Native Qt WebEngine identity avoids contradictory User-Agent and Client Hint
@@ -256,6 +282,15 @@ a secure vault on that system.
   prompt boundaries.
 - `octobrowse/extensions.py`: defensive, non-executing Manifest V3 directory/ZIP
   inspection, normalization, size/path limits, and permission review.
+- `octobrowse/library_index.py`: bounded transactional SQLite/FTS5 metadata
+  search with sanitized prefix queries, deterministic ranking, and LIKE
+  fallback.
+- `octobrowse/research.py`: versioned research-note migration, validation, and
+  Markdown/workspace research-pack export.
+- `octobrowse/readability.py`: bounded semantic DOM scoring, text-only article
+  extraction, trusted source binding, and malformed-result normalization.
+- `octobrowse/snapshots.py`: portable snapshot naming, atomic provenance
+  sidecars, streamed SHA-256 hashing, and path-safe integrity verification.
 - `octobrowse/workspaces.py`: versioned workspace validation and Markdown
   export.
 - `octobrowse/urls.py`: exact internal URL trust-boundary classification.
@@ -267,18 +302,18 @@ a secure vault on that system.
 - `ApiFetchWorker`: weather/news requests on a worker thread.
 - `OpenAIWorker`: bounded, non-stored Responses API calls on a worker thread.
 - `CommandPalette`: keyboard-first command discovery and execution.
-- `LibrarySearchDialog`: unified search across tabs and saved browser
-  collections.
+- `LibrarySearchDialog`: indexed search across tabs and saved browser
+  collections, with note/workspace-aware result routing.
 - `SettingsDialog`: homepage, model, location, and API-key settings.
 
 ## Roadmap
 
-- Move bookmarks/notes/todos and captured article text to SQLite/FTS5.
+- Optional full-page text capture with explicit storage controls; the current
+  FTS5 index intentionally stores browser metadata and user-authored research
+  text, not page bodies.
 - Procedural cosmetic filters (`#?#`) and cosmetic exceptions (`#@#`).
 - Revisit native extension execution after Qt/PyQt provides a stable Windows
   enablement path; retain provenance and permission review before activation.
-- Readability extraction, selection-anchored notes, and offline MHTML research
-  snapshots.
 
 ## Tests
 
