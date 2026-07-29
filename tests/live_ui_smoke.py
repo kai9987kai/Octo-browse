@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import QApplication, QDialog, QPlainTextEdit, QPushButton
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from main import OCTO_BROWSER_NAME, OCTO_BROWSER_VERSION, OctoBrowse
+from octobrowse.readability import MAX_READABLE_CHARS, ReadablePage
 from octobrowse.snapshots import manifest_path_for_archive, verify_snapshot_bundle
 
 
@@ -134,19 +135,22 @@ def main() -> int:
     window.getComputedStyle = () => ({display: "none", visibility: "hidden"});
   </script>
 </head>
-<body>
+<body class="menu-open sidebar-layout">
   <header><nav>Site navigation should not become research evidence.</nav></header>
   <div class="cookie-banner">Cookie preferences should be excluded.</div>
   <main>
     <article>
       <h1>Semantic extraction wins</h1>
-      <p class="byline">By Test Researcher</p>
       <p>The distinctive article evidence explains how bounded extraction
       keeps meaningful paragraphs while removing surrounding browser-page
       furniture from downstream reading and research tools.</p>
       <p>A second substantial paragraph gives the semantic article enough
       evidence density to outrank menus, advertisements, and related links.</p>
       <p style="display:none">HIDDEN EXTRACTION DECOY</p>
+      <div style="opacity: 0"><p>TRANSPARENT ANCESTOR DECOY</p></div>
+      <div aria-hidden="TRUE"><p>ARIA HIDDEN DECOY</p></div>
+      <section class="related"><p>RELATED CONTENT DECOY</p></section>
+      <footer><span rel="author">By Test Researcher</span></footer>
     </article>
     <aside>Sponsored related links should be excluded.</aside>
   </main>
@@ -186,14 +190,51 @@ def main() -> int:
         "Sponsored related links",
         "Footer boilerplate",
         "HIDDEN EXTRACTION DECOY",
+        "TRANSPARENT ANCESTOR DECOY",
+        "ARIA HIDDEN DECOY",
+        "RELATED CONTENT DECOY",
     ):
         if noise in readable.text:
             raise AssertionError(f"Readable-page extraction retained noise: {noise}")
+    if readable.byline != "By Test Researcher":
+        raise AssertionError("Article-footer byline metadata was filtered out.")
     if readable.method != "semantic:article":
         raise AssertionError(
             f"Readable-page extraction chose an unexpected root: {readable.method}"
         )
     browser.close_tab(browser.tabs.indexOf(article_tab))
+    browser.tabs.setCurrentWidget(dashboard)
+
+    browser.show_reader_tab(
+        ReadablePage(
+            text="'" * MAX_READABLE_CHARS,
+            title="Encoded reader limit smoke",
+            url="https://example.test/encoded-reader",
+        ),
+        private=False,
+    )
+    bounded_reader_tab = browser.current_browser()
+    if bounded_reader_tab is None:
+        raise AssertionError("Bounded Reader View did not open.")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if not bounded_reader_tab.property("loading"):
+            break
+        time.sleep(0.01)
+    if not bounded_reader_tab.property("load_ok"):
+        raise AssertionError("Bounded Reader View exceeded Qt's setHtml limit.")
+    bounded_reader_state: dict[str, str] = {}
+    bounded_reader_tab.page().toPlainText(
+        lambda text: bounded_reader_state.setdefault("text", text)
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and "text" not in bounded_reader_state:
+        app.processEvents()
+        time.sleep(0.01)
+    if "display safely shortened" not in bounded_reader_state.get("text", ""):
+        raise AssertionError("Reader View did not enforce its encoded HTML budget.")
+    browser.close_tab(browser.tabs.indexOf(bounded_reader_tab))
     browser.tabs.setCurrentWidget(dashboard)
 
     private_snapshot_tab = browser.add_tab(
@@ -297,9 +338,9 @@ def main() -> int:
     browser.close()
     app.processEvents()
     print(
-        "Live profile, internal trust, tab lifecycle, article extraction, "
-        "research index, concurrent profile-safe snapshots, and MV3 inspector "
-        "smoke passed."
+        "Live profile, internal trust, tab lifecycle, bounded article/Reader "
+        "extraction, research index, concurrent profile-safe snapshots, and "
+        "MV3 inspector smoke passed."
     )
     return 0
 

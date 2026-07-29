@@ -70,9 +70,14 @@ class ReadabilityTests(unittest.TestCase):
         self.assertIn("MAX_CANDIDATES = 40", READABLE_PAGE_SCRIPT)
         self.assertIn("MAX_BLOCKS = 2500", READABLE_PAGE_SCRIPT)
         self.assertIn("MAX_SCAN = 20000", READABLE_PAGE_SCRIPT)
+        self.assertIn("MAX_ANCESTORS = 64", READABLE_PAGE_SCRIPT)
         self.assertIn("MAX_TEXT = 120000", READABLE_PAGE_SCRIPT)
+        self.assertIn("CONTENT_BOUNDARY_SELECTOR", READABLE_PAGE_SCRIPT)
         self.assertNotIn("querySelectorAll", READABLE_PAGE_SCRIPT)
+        self.assertNotIn(".closest(", READABLE_PAGE_SCRIPT)
         self.assertNotIn("innerHTML", READABLE_PAGE_SCRIPT)
+        self.assertNotIn("innerText", READABLE_PAGE_SCRIPT)
+        self.assertNotIn("textContent", READABLE_PAGE_SCRIPT)
 
 
 if __name__ == "__main__":

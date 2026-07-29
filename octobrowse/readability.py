@@ -106,6 +106,7 @@ READABLE_PAGE_SCRIPT = r"""
   const MAX_CANDIDATES = 40;
   const MAX_BLOCKS = 2500;
   const MAX_SCAN = 20000;
+  const MAX_ANCESTORS = 64;
   const CANDIDATE_SELECTOR = [
     "article",
     "main",
@@ -118,6 +119,12 @@ READABLE_PAGE_SCRIPT = r"""
     "#article",
     "#content",
     ".content"
+  ].join(",");
+  const CONTENT_BOUNDARY_SELECTOR = [
+    "article",
+    "main",
+    "[role='main']",
+    "[itemprop='articleBody']"
   ].join(",");
   const NOISE_SELECTOR = [
     "script",
@@ -153,15 +160,115 @@ READABLE_PAGE_SCRIPT = r"""
     .replace(/\s+/g, " ")
     .trim();
 
-  const isVisible = node => {
-    if (!(node instanceof Element) || node.closest("[hidden],[aria-hidden='true']")) {
+  const identityIsNoise = node => {
+    if (!(node instanceof Element)) {
       return false;
     }
-    const style = window.getComputedStyle(node);
-    return style.display !== "none"
-      && style.visibility !== "hidden"
-      && Number(style.opacity || "1") !== 0
-      && node.getClientRects().length > 0;
+    const identity = (
+      `${typeof node.id === "string" ? node.id.slice(0, 256) : ""} `
+      + `${typeof node.className === "string" ? node.className.slice(0, 256) : ""}`
+    );
+    return NOISE_NAME.test(identity);
+  };
+
+  const treeVisibilityCache = new WeakMap();
+  const treeIsVisible = node => {
+    if (!(node instanceof Element)) {
+      return false;
+    }
+    if (treeVisibilityCache.has(node)) {
+      return treeVisibilityCache.get(node);
+    }
+    const lineage = [];
+    let current = node;
+    let visible = true;
+    let depth = 0;
+    while (current instanceof Element) {
+      if (treeVisibilityCache.has(current)) {
+        visible = treeVisibilityCache.get(current);
+        break;
+      }
+      if (depth >= MAX_ANCESTORS) {
+        visible = false;
+        break;
+      }
+      lineage.push(current);
+      const ariaHidden = inlineText(
+        current.getAttribute("aria-hidden")
+      ).toLowerCase();
+      const style = window.getComputedStyle(current);
+      if (
+        current.hasAttribute("hidden")
+        || ariaHidden === "true"
+        || style.display === "none"
+        || style.visibility === "hidden"
+        || Number(style.opacity || "1") === 0
+      ) {
+        visible = false;
+        break;
+      }
+      current = current.parentElement;
+      depth += 1;
+    }
+    for (const element of lineage) {
+      treeVisibilityCache.set(element, visible);
+    }
+    return visible;
+  };
+
+  const isVisible = node => (
+    treeIsVisible(node) && node.getClientRects().length > 0
+  );
+
+  const noiseTreeCache = new WeakMap();
+  const hasNoiseAncestor = node => {
+    if (!(node instanceof Element)) {
+      return true;
+    }
+    if (noiseTreeCache.has(node)) {
+      return noiseTreeCache.get(node);
+    }
+    const lineage = [];
+    let current = node;
+    let noisy = false;
+    let depth = 0;
+    while (current instanceof Element) {
+      if (noiseTreeCache.has(current)) {
+        noisy = noiseTreeCache.get(current);
+        break;
+      }
+      if (depth >= MAX_ANCESTORS) {
+        noisy = true;
+        break;
+      }
+      lineage.push(current);
+      const isContentBoundary = current.matches(
+        CONTENT_BOUNDARY_SELECTOR
+      );
+      const isDocumentRoot = (
+        current.tagName === "HTML" || current.tagName === "BODY"
+      );
+      if (
+        current.matches(NOISE_SELECTOR)
+        || (
+          !isContentBoundary
+          && !isDocumentRoot
+          && identityIsNoise(current)
+        )
+      ) {
+        noisy = true;
+        break;
+      }
+      if (isContentBoundary) {
+        break;
+      }
+      current = current.parentElement;
+      depth += 1;
+    }
+    for (const element of lineage) {
+      noiseTreeCache.set(element, noisy);
+    }
+    return noisy;
   };
 
   const collectElements = (
@@ -199,7 +306,7 @@ READABLE_PAGE_SCRIPT = r"""
     if (parentReadableCache.has(parent)) {
       return parentReadableCache.get(parent);
     }
-    const readable = !parent.closest(NOISE_SELECTOR) && isVisible(parent);
+    const readable = !hasNoiseAncestor(parent) && isVisible(parent);
     parentReadableCache.set(parent, readable);
     return readable;
   };
@@ -235,8 +342,40 @@ READABLE_PAGE_SCRIPT = r"""
     return pieces.join(" ").slice(0, maxChars);
   };
 
+  const boundedVisibleText = (
+    root,
+    maxChars = MAX_TEXT,
+    visitLimit = MAX_SCAN
+  ) => {
+    if (!root) {
+      return "";
+    }
+    const walker = document.createTreeWalker(
+      root,
+      NodeFilter.SHOW_TEXT
+    );
+    const pieces = [];
+    let length = 0;
+    let visited = 0;
+    let node = walker.nextNode();
+    while (node && visited < visitLimit && length < maxChars) {
+      visited += 1;
+      const parent = node.parentElement;
+      if (parent && isVisible(parent)) {
+        const text = inlineText(node.nodeValue);
+        if (text) {
+          const remaining = maxChars - length;
+          pieces.push(text.slice(0, remaining));
+          length += Math.min(text.length, remaining) + 1;
+        }
+      }
+      node = walker.nextNode();
+    }
+    return pieces.join(" ").slice(0, maxChars);
+  };
+
   const candidateScore = node => {
-    if (!isVisible(node) || node.matches(NOISE_SELECTOR)) {
+    if (!isVisible(node) || hasNoiseAncestor(node)) {
       return {score: -1, length: 0};
     }
     const text = boundedText(node, 50000, 6000);
@@ -250,7 +389,7 @@ READABLE_PAGE_SCRIPT = r"""
       6000
     );
     const linkLength = links.reduce(
-      (total, link) => total + inlineText(link.textContent).length,
+      (total, link) => total + boundedText(link, 2000, 500).length,
       0
     );
     const linkDensity = Math.min(0.95, linkLength / Math.max(1, text.length));
@@ -261,17 +400,17 @@ READABLE_PAGE_SCRIPT = r"""
       6000
     );
     const substantialParagraphs = paragraphs.reduce(
-      (total, paragraph) => total + (inlineText(paragraph.textContent).length >= 80 ? 1 : 0),
+      (total, paragraph) => total + (
+        boundedText(paragraph, 100, 100).length >= 80 ? 1 : 0
+      ),
       0
     );
     const punctuation = (text.match(/[.!?。！？]/g) || []).length;
     const tag = node.tagName.toLowerCase();
     const semanticBoost = tag === "article" ? 1.35 : tag === "main" ? 1.22 : 1;
-    const identity = `${node.id || ""} ${node.className || ""}`;
-    const noisePenalty = NOISE_NAME.test(identity) ? 0.18 : 1;
     const score = (
       text.length + substantialParagraphs * 140 + punctuation * 8
-    ) * Math.pow(1 - linkDensity, 2) * semanticBoost * noisePenalty;
+    ) * Math.pow(1 - linkDensity, 2) * semanticBoost;
     return {score, length: text.length};
   };
 
@@ -304,7 +443,11 @@ READABLE_PAGE_SCRIPT = r"""
   const paragraphs = [];
   let outputLength = 0;
   for (const block of blocks) {
-    if (outputLength >= MAX_TEXT || !isVisible(block) || block.closest(NOISE_SELECTOR)) {
+    if (
+      outputLength >= MAX_TEXT
+      || !isVisible(block)
+      || hasNoiseAncestor(block)
+    ) {
       continue;
     }
     const text = boundedText(
@@ -321,7 +464,7 @@ READABLE_PAGE_SCRIPT = r"""
       30,
       300
     ).reduce(
-      (total, link) => total + inlineText(link.textContent).length,
+      (total, link) => total + boundedText(link, 500, 100).length,
       0
     );
     if (text.length < 160 && linkText / Math.max(1, text.length) > 0.75) {
@@ -343,24 +486,31 @@ READABLE_PAGE_SCRIPT = r"""
   };
   const heading = collectElements(
     root,
-    element => element.tagName === "H1",
+    element => (
+      element.tagName === "H1"
+      && isVisible(element)
+      && !hasNoiseAncestor(element)
+    ),
     1,
     5000
   )[0];
   const author = collectElements(
     root,
-    element => element.matches(
-      "[rel='author'],[itemprop='author'],.byline,.author"
+    element => (
+      element.matches(
+        "[rel='author'],[itemprop='author'],.byline,.author"
+      )
+      && isVisible(element)
     ),
     1,
     5000
   )[0];
   const title = inlineText(
-    (heading && heading.innerText)
+    (heading && boundedVisibleText(heading, 512, 200))
     || meta("meta[property='og:title']")
     || document.title
   ).slice(0, 512);
-  const byline = inlineText(author && author.innerText).slice(0, 512);
+  const byline = boundedVisibleText(author, 512, 200);
   const excerpt = (
     meta("meta[name='description']")
     || meta("meta[property='og:description']")

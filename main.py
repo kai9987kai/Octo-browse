@@ -243,6 +243,7 @@ LEGACY_OCTO_BROWSER_USER_AGENT = (
     "(KHTML, like Gecko) OctoBrowser/3.1 Chrome/126.0.0.0 Safari/537.36"
 )
 MAX_HISTORY_ITEMS = 500
+MAX_READER_HTML_ENCODED_BYTES = 1_900_000
 
 DOWNLOAD_PATH_ROLE = Qt.ItemDataRole.UserRole
 DOWNLOAD_REQUEST_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -3845,7 +3846,8 @@ li {{ margin: 8px 0; }}
         def document_is_current() -> bool:
             try:
                 return (
-                    browser.page() is source_page
+                    self.tabs.indexOf(browser) >= 0
+                    and browser.page() is source_page
                     and browser.url().toString() == source_url
                     and int(browser.property("document_generation") or 0)
                     == source_generation
@@ -3865,32 +3867,7 @@ li {{ margin: 8px 0; }}
                 fallback_title=fallback_title,
                 source_url=source_url,
             )
-            if readable.text:
-                callback(readable)
-                return
-
-            def deliver_plain_text(text: str) -> None:
-                if not document_is_current():
-                    try:
-                        self.set_status("Page changed; content action cancelled")
-                    except RuntimeError:
-                        pass
-                    return
-                callback(
-                    normalize_readable_page(
-                        {
-                            "text": text,
-                            "method": "fallback:plain-text",
-                        },
-                        fallback_title=fallback_title,
-                        source_url=source_url,
-                    )
-                )
-
-            try:
-                source_page.toPlainText(deliver_plain_text)
-            except RuntimeError:
-                return
+            callback(readable)
 
         try:
             source_page.runJavaScript(
@@ -3920,30 +3897,39 @@ li {{ margin: 8px 0; }}
         if not cleaned:
             QMessageBox.information(self, "Reader View", "There is no readable text on this page.")
             return
-        words = cleaned.split()
-        minutes = max(1, round(len(words) / 220))
-        paragraphs = [
-            paragraph
-            for paragraph in cleaned.split("\n\n")
-            if paragraph.strip()
-        ]
-        body = "\n".join(f"<p>{html.escape(paragraph)}</p>" for paragraph in paragraphs)
-        keywords = ", ".join(self.extract_keywords(cleaned, limit=8))
+
         safe_url = html.escape(readable.url)
         title = html.escape(readable.title or "Reader View")
-        details = [
-            detail
-            for detail in (
-                readable.byline,
-                readable.site_name,
-                f"{len(words)} words",
-                f"about {minutes} min",
-                keywords,
+
+        def render_document(content: str, shortened: bool) -> tuple[str, int]:
+            words = content.split()
+            minutes = max(1, round(len(words) / 220)) if words else 0
+            paragraphs = [
+                paragraph
+                for paragraph in content.split("\n\n")
+                if paragraph.strip()
+            ]
+            body = "\n".join(
+                f"<p>{html.escape(paragraph)}</p>"
+                for paragraph in paragraphs
             )
-            if detail
-        ]
-        safe_details = " | ".join(html.escape(detail) for detail in details)
-        reader_html = f"""<!doctype html>
+            keywords = ", ".join(self.extract_keywords(content, limit=8))
+            details = [
+                detail
+                for detail in (
+                    readable.byline,
+                    readable.site_name,
+                    f"{len(words)} words",
+                    f"about {minutes} min",
+                    keywords,
+                    "display safely shortened" if shortened else "",
+                )
+                if detail
+            ]
+            safe_details = " | ".join(
+                html.escape(detail) for detail in details
+            )
+            document = f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -3975,13 +3961,46 @@ p {{ margin: 0 0 20px; }}
 </article>
 </body>
 </html>"""
+            return document, len(words)
+
+        reader_html, displayed_word_count = render_document(cleaned, False)
+        shortened = (
+            len(reader_html.encode("utf-8")) * 3
+            > MAX_READER_HTML_ENCODED_BYTES
+        )
+        if shortened:
+            low = 0
+            high = len(cleaned)
+            reader_html, displayed_word_count = render_document("", True)
+            while low <= high:
+                midpoint = (low + high) // 2
+                candidate = cleaned[:midpoint].rstrip()
+                candidate_html, candidate_words = render_document(
+                    candidate,
+                    True,
+                )
+                if (
+                    len(candidate_html.encode("utf-8")) * 3
+                    <= MAX_READER_HTML_ENCODED_BYTES
+                ):
+                    reader_html = candidate_html
+                    displayed_word_count = candidate_words
+                    low = midpoint + 1
+                else:
+                    high = midpoint - 1
+
         tab_title = f"Reader - {readable.title}" if readable.title else "Reader View"
         self.add_html_tab(reader_html, tab_title[:80], private=private)
-        self.set_status(
+        extraction_status = (
             "Reader View opened with article-focused text"
             if readable.method.startswith("semantic:")
             else "Reader View opened with full-page fallback text"
         )
+        if shortened:
+            extraction_status += (
+                f"; safely rendered {displayed_word_count} words within Qt limits"
+            )
+        self.set_status(extraction_status)
 
     def show_page_insights(self) -> None:
         browser = self.current_browser()
@@ -4034,11 +4053,11 @@ p {{ margin: 0 0 20px; }}
             "than", "that", "their", "there", "these", "this", "through", "when", "where", "which",
             "with", "would", "your",
         }
-        words = [
-            word.strip(".,:;!?()[]{}\"'").lower()
-            for word in text.split()
-            if len(word.strip(".,:;!?()[]{}\"'")) > 3
-        ]
+        words = []
+        for token in text.split():
+            word = token.strip(".,:;!?()[]{}\"'")
+            if 3 < len(word) <= 64:
+                words.append(word.lower())
         counts = Counter(word for word in words if word and word not in stop_words)
         return [word for word, _count in counts.most_common(limit)]
 
@@ -5014,6 +5033,7 @@ p {{ margin: 0 0 20px; }}
             if bool(snapshot_request.get("private_capture")) != bool(private):
                 self.finish_snapshot_target(snapshot_request)
                 download.cancel()
+                QTimer.singleShot(0, download.deleteLater)
                 self.set_status(
                     "Snapshot cancelled because its profile provenance changed"
                 )
@@ -5030,7 +5050,10 @@ p {{ margin: 0 0 20px; }}
             # snapshot path. A late request from a closed/expired page must
             # fail closed instead of becoming an unverified generic download.
             download.cancel()
-            self.set_status("Unmatched page-save request cancelled")
+            QTimer.singleShot(0, download.deleteLater)
+            self.set_status(
+                "Unverified native page save cancelled; use Verified Offline Snapshot"
+            )
             return
         else:
             default_dir = (

@@ -324,5 +324,7 @@ python tests/live_ui_smoke.py
 ```
 
 GitHub Actions runs the unit regression suite on Python 3.10 and 3.13. The
-live smoke additionally constructs both profile types and drives the real MV3
-inspector dialog against the bundled permission-free sample.
+live smoke additionally constructs both profile types, exercises isolated
+semantic extraction and the encoded Reader View budget, saves overlapping
+standard/private verified snapshots, checks private-history isolation, and
+drives the real MV3 inspector against the bundled permission-free sample.

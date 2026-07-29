@@ -67,23 +67,25 @@ class SnapshotTests(unittest.TestCase):
     def test_sidecar_cannot_redirect_verifier_outside_its_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             sidecar = Path(temp) / "hostile.mhtml.json"
-            sidecar.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "format": "mhtml",
-                        "archive": {
-                            "file": "../outside.mhtml",
-                            "bytes": 0,
-                            "sha256": "0" * 64,
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            result = verify_snapshot_bundle(sidecar)
-            self.assertFalse(result.valid)
-            self.assertIn("unsafe", result.reason.lower())
+            for archive_name in ("../outside.mhtml", "CON.mhtml"):
+                with self.subTest(archive_name=archive_name):
+                    sidecar.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "format": "mhtml",
+                                "archive": {
+                                    "file": archive_name,
+                                    "bytes": 0,
+                                    "sha256": "0" * 64,
+                                },
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    result = verify_snapshot_bundle(sidecar)
+                    self.assertFalse(result.valid)
+                    self.assertIn("unsafe", result.reason.lower())
 
     def test_selected_archive_must_match_the_sidecar_record(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

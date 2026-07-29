@@ -214,6 +214,7 @@ def verify_snapshot_bundle(path: str | Path) -> SnapshotVerification:
         or not archive_name
         or len(archive_name) > 255
         or Path(archive_name).name != archive_name
+        or archive_name.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES
         or bool(re.search(r'[<>:"/\\|?*\x00-\x1f]', archive_name))
         or archive_name.endswith((" ", "."))
     ):
