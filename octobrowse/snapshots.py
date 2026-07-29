@@ -7,6 +7,7 @@ import json
 import math
 import re
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _UTC_TIMESTAMP_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
 )
+_MANIFEST_REPLACE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -147,7 +149,19 @@ def write_snapshot_manifest(
         ) as stream:
             temporary = Path(stream.name)
             stream.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-        temporary.replace(manifest_path)
+        # Windows can transiently deny two simultaneous os.replace calls
+        # targeting the same file even when each writer has a unique temp.
+        # Serialize writers in this process and retry briefly for external
+        # scanners or another OctoBrowse process holding the destination.
+        with _MANIFEST_REPLACE_LOCK:
+            for attempt in range(5):
+                try:
+                    temporary.replace(manifest_path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.02 * (attempt + 1))
     finally:
         if temporary is not None:
             try:

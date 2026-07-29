@@ -104,6 +104,8 @@ except ImportError:  # pragma: no cover - optional runtime feature
     sr = None
 
 from PyQt6.QtCore import (
+    QCoreApplication,
+    QEvent,
     QSize,
     QStandardPaths,
     QStringListModel,
@@ -1521,6 +1523,7 @@ class LibrarySearchDialog(QDialog):
 class OctoBrowse(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self.shutting_down = False
         self.setWindowTitle(f"{OCTO_BROWSER_NAME} {OCTO_BROWSER_VERSION}")
         icon_path = resource_path("assets/octobrowse.png")
         if icon_path.exists():
@@ -3409,6 +3412,8 @@ code, pre {{
         return classify_internal_url(url)
 
     def update_tab_title(self, browser: QWebEngineView, title: str) -> None:
+        if self.shutting_down:
+            return
         index = self.tabs.indexOf(browser)
         if index == -1:
             return
@@ -4062,6 +4067,8 @@ p {{ margin: 0 0 20px; }}
         return [word for word, _count in counts.most_common(limit)]
 
     def update_url_bar(self, url: QUrl, browser: QWebEngineView) -> None:
+        if self.shutting_down:
+            return
         text = url.toString()
         if (
             not is_trusted_internal_url(text)
@@ -4255,12 +4262,16 @@ p {{ margin: 0 0 20px; }}
         )
 
     def update_progress_bar(self, progress: int, browser: QWebEngineView) -> None:
+        if self.shutting_down:
+            return
         browser.setProperty("load_progress", progress)
         if browser == self.current_browser():
             self.progress_bar.setValue(progress)
             self.progress_bar.setVisible(progress < 100)
 
     def on_load_started(self, browser: QWebEngineView) -> None:
+        if self.shutting_down:
+            return
         browser.setProperty("loading", True)
         browser.setProperty("load_progress", 0)
         browser.setProperty(
@@ -4273,6 +4284,8 @@ p {{ margin: 0 0 20px; }}
             self.set_status("Loading…")
 
     def on_load_finished(self, browser: QWebEngineView, ok: bool = True) -> None:
+        if self.shutting_down:
+            return
         browser.setProperty("loading", False)
         browser.setProperty("load_progress", 100 if ok else int(browser.property("load_progress") or 0))
         browser.setProperty("load_ok", bool(ok))
@@ -5586,6 +5599,8 @@ p {{ margin: 0 0 20px; }}
 
     def apply_site_content(self, browser: QWebEngineView, url: QUrl) -> None:
         """Apply per-site JavaScript/image preferences before the page renders."""
+        if self.shutting_down:
+            return
         host = url.host().lower()
         prefs = self.site_content_for_browser(browser).get(host, {})
         settings = browser.settings()
@@ -7082,7 +7097,40 @@ p {{ margin: 0 0 20px; }}
         else:
             super().keyPressEvent(event)
 
+    def _quiesce_webengine(self) -> None:
+        """Destroy pages before profiles and suppress callbacks during teardown."""
+        self.tabs.blockSignals(True)
+        browsers: list[QWebEngineView] = []
+        for index in range(self.tabs.count()):
+            widget = self.tabs.widget(index)
+            if not isinstance(widget, QWebEngineView):
+                continue
+            try:
+                widget.blockSignals(True)
+                widget.page().blockSignals(True)
+                widget.stop()
+            except RuntimeError:
+                # A WebEngine object may already be queued for deletion.
+                continue
+            browsers.append(widget)
+
+        for browser in browsers:
+            try:
+                index = self.tabs.indexOf(browser)
+                if index >= 0:
+                    self.tabs.removeTab(index)
+                browser.deleteLater()
+            except RuntimeError:
+                continue
+
+        # QWebEngineProfile must outlive every page that uses it. Process the
+        # view/page deletions now, while both profiles are still children of
+        # this window, instead of relying on QObject child-destruction order.
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
     def closeEvent(self, event: Any) -> None:
+        first_shutdown_request = not self.shutting_down
+        self.shutting_down = True
         self.hibernation_timer.stop()
         self.session_autosave_timer.stop()
         workers = (
@@ -7095,8 +7143,7 @@ p {{ margin: 0 0 20px; }}
         running = [worker for worker in workers if worker.isRunning()]
         if running:
             event.ignore()
-            if not getattr(self, "shutting_down", False):
-                self.shutting_down = True
+            if first_shutdown_request:
                 self.setEnabled(False)
                 self.set_status("Finishing background work before closing safely...")
                 for worker in running:
@@ -7105,6 +7152,7 @@ p {{ margin: 0 0 20px; }}
             QTimer.singleShot(250, self.close)
             return
         self.save_settings()
+        self._quiesce_webengine()
         self.history_db.close()
         self.library_index.close()
         for path in list(self.ephemeral_paths):

@@ -85,28 +85,39 @@ foreach ($module in @(
     if (($archiveListing -join "`n") -notmatch [regex]::Escape($module)) {
         throw "Frozen archive is missing application module: $module"
     }
+    if (($portableListing -join "`n") -notmatch [regex]::Escape($module)) {
+        throw "Standalone archive is missing application module: $module"
+    }
 }
 if (($portableListing -join "`n") -notmatch 'examples[/\\]mv3_hello[/\\]manifest\.json') {
     throw "Standalone payload is missing the bundled MV3 inspector sample."
 }
 
 function Invoke-SmokeTest {
-    param([Parameter(Mandatory = $true)][string]$Executable)
+    param(
+        [Parameter(Mandatory = $true)][string]$Executable,
+        [ValidateRange(1, 10)][int]$Attempts = 1,
+        [ValidateRange(30, 300)][int]$TimeoutSeconds = 90
+    )
 
-    $process = Start-Process -FilePath $Executable -ArgumentList "--smoke-test" `
-        -WindowStyle Hidden -PassThru
-    if (-not $process.WaitForExit(90000)) {
-        $process.Kill()
-        throw "Smoke test timed out: $Executable"
-    }
-    if ($process.ExitCode -ne 0) {
-        throw "Smoke test failed with exit code $($process.ExitCode): $Executable"
+    foreach ($attempt in 1..$Attempts) {
+        $process = Start-Process -FilePath $Executable -ArgumentList "--smoke-test" `
+            -WindowStyle Hidden -PassThru
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $process.Kill()
+            throw "Smoke test attempt $attempt timed out after $TimeoutSeconds seconds: $Executable"
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "Smoke test attempt $attempt failed with exit code $($process.ExitCode): $Executable"
+        }
+        Write-Host "Smoke test attempt $attempt/$Attempts passed: $Executable"
     }
 }
 
 if (-not $SkipSmokeTests) {
-    Invoke-SmokeTest -Executable $onedirExe
-    Invoke-SmokeTest -Executable $portableExe
+    Invoke-SmokeTest -Executable $onedirExe -Attempts 3
+    # Onefile extraction is slower under Windows x64 emulation on ARM64.
+    Invoke-SmokeTest -Executable $portableExe -TimeoutSeconds 180
 }
 
 $artifacts = @($portableItem, $installerItem)
