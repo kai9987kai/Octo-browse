@@ -51,6 +51,49 @@ class FilteringTests(unittest.TestCase):
         self.assertTrue(is_third_party_request("cdn.other.co.uk", "www.example.co.uk"))
         self.assertIsNone(is_third_party_request("cdn.example", ""))
 
+    def test_siblings_on_shared_hosting_are_third_party(self) -> None:
+        """Regression: these all used to collapse to one site, disabling
+        every $third-party rule on the platforms trackers actually use."""
+        for request_host, first_party_host in (
+            ("tracker.github.io", "victim.github.io"),
+            ("a.pages.dev", "b.pages.dev"),
+            ("bucket1.s3.amazonaws.com", "bucket2.s3.amazonaws.com"),
+            ("evil.vercel.app", "good.vercel.app"),
+            ("spy.herokuapp.com", "shop.herokuapp.com"),
+            ("tracker.co.in", "victim.co.in"),
+        ):
+            with self.subTest(request=request_host, first_party=first_party_host):
+                self.assertTrue(
+                    is_third_party_request(request_host, first_party_host)
+                )
+
+    def test_ancestor_hosts_remain_first_party(self) -> None:
+        self.assertFalse(is_third_party_request("cdn.user.github.io", "user.github.io"))
+        self.assertFalse(is_third_party_request("www.example.com", "example.com"))
+        self.assertFalse(is_third_party_request("example.com", "www.example.com"))
+
+    def test_third_party_rule_fires_across_shared_hosting(self) -> None:
+        rules = FilterRuleSet()
+        rules.parse_text("||tracker.github.io^$third-party")
+
+        self.assertTrue(
+            rules.should_block(
+                "https://tracker.github.io/beacon.js",
+                "tracker.github.io",
+                "script",
+                "victim.github.io",
+            )
+        )
+        # Same publisher: the rule must still not fire on its own subdomain.
+        self.assertFalse(
+            rules.should_block(
+                "https://tracker.github.io/beacon.js",
+                "tracker.github.io",
+                "script",
+                "tracker.github.io",
+            )
+        )
+
     def test_resource_type_name_accepts_qt_style_names(self) -> None:
         self.assertEqual(resource_type_name("ResourceTypeXhr"), "xmlhttprequest")
         self.assertEqual(resource_type_name("ResourceTypeMainFrame"), "document")

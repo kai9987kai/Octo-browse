@@ -1,5 +1,6 @@
 param(
-    [string]$Version = "3.4"
+    [string]$Version = "",
+    [string]$Python = ""
 )
 
 # FALLBACK installer builder (IExpress). The preferred installer is built by
@@ -9,6 +10,14 @@ param(
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
+
+# This script used to default $Version to a hardcoded string, so a forgotten
+# bump silently produced an installer named after the previous release. Read it
+# from octobrowse.version like every other packaging script does.
+. (Join-Path $PSScriptRoot "build_common.ps1")
+$Python = Resolve-OctoPython -Root $root -Python $Python
+$Version = Get-OctoVersion -Root $root -Python $Python -RequestedVersion $Version
+
 $distDir = Join-Path $root "dist\OctoBrowse"
 $releaseDir = Join-Path $root "release"
 $payloadDir = Join-Path $releaseDir "installer_payload"

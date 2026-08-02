@@ -3,9 +3,9 @@
 Octo-browse is an experimental Python + PyQt6/QtWebEngine desktop browser. It
 combines a normal tabbed browser surface with power tools for notes, history,
 bookmarks, page source, page saving, ad blocking, private tabs, page upscaling,
-text-to-speech, voice commands, cited AI page research, weather/news side panels,
-named research workspaces, a session password scratchpad, and opt-in trusted
-Python automation.
+text-to-speech, voice commands, on-device and cited AI page research,
+weather/news side panels, named research workspaces, a session password
+scratchpad, and opt-in trusted Python automation.
 
 ## Entry points
 
@@ -139,6 +139,11 @@ Python automation.
 - Native Qt WebEngine identity avoids contradictory User-Agent and Client Hint
   spoofing; the identity page reports the actual Chromium runtime and security
   patch base. A custom User-Agent remains available for compatibility testing.
+- On-device page summaries need no API key and no network. They run in-process
+  with only the standard library, are deterministic, and quote the page
+  verbatim with source offsets, so a bullet can always be checked against the
+  text it came from and nothing can be invented. Because no data leaves the
+  process they work in private tabs with no consent prompt.
 - Optional OpenAI summaries and page Q&A select relevant labelled excerpts,
   require evidence citations, isolate untrusted page instructions, set
   `store=False`, and require per-use consent before sending private-tab text.
@@ -162,7 +167,10 @@ Optional system/runtime notes:
   text is sent only after confirmation on every use.
 - Weather needs an OpenWeather API key.
 - News needs a NewsAPI key.
-- AI features need an OpenAI API key.
+- Cloud AI features need an OpenAI API key. On-device summaries do not.
+- `openai`, `gTTS`, `SpeechRecognition`, `requests` and `cryptography` are
+  imported on first use rather than at startup, so a session that never opens
+  those features never pays for them.
 
 ## Install
 
@@ -277,6 +285,15 @@ a secure vault on that system.
   Global Privacy Control headers with per-session stats.
 - `octobrowse/filtering.py` / `FilterParseWorker`: testable EasyList-subset
   parsing and indexed matching, parsed off the UI thread.
+- `octobrowse/public_suffix.py`: committed offline Public Suffix List subset
+  giving registrable-domain identity, so `$third-party` rules distinguish
+  sibling subdomains on shared hosting platforms.
+- `octobrowse/blockstats.py`: lock-guarded blocked-request and HTTPS-upgrade
+  tallies, written from Chromium's IO thread and read from Qt slots.
+- `octobrowse/local_summary.py`: deterministic stdlib-only extractive
+  summarization returning verbatim sentences with source offsets.
+- `octobrowse/optional_deps.py`: deferred loading for the heavy optional
+  dependencies, keeping them off the cold-start path.
 - `octobrowse/ai_context.py`: source chunking, deterministic relevance
   selection, bounded broad-page sampling, citations, and untrusted-content
   prompt boundaries.
@@ -323,7 +340,17 @@ python -m py_compile main.py alpha.py
 python tests/live_ui_smoke.py
 ```
 
-GitHub Actions runs the unit regression suite on Python 3.10 and 3.13. The
+Lint and coverage use the settings in `pyproject.toml`:
+
+```bash
+ruff check .
+coverage run -m unittest discover -s tests
+coverage report --include="octobrowse/*" --fail-under=85
+```
+
+GitHub Actions runs ruff, the unit regression suite on Python 3.10 and 3.13
+under coverage floors, and a Windows job covering the tests, the `--smoke-test`
+entry point, and packaging-script analysis. The
 live smoke additionally constructs both profile types, exercises isolated
 semantic extraction and the encoded Reader View budget, saves overlapping
 standard/private verified snapshots, checks private-history isolation, and

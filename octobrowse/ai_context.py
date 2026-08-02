@@ -12,8 +12,9 @@ import html
 import re
 import unicodedata
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Literal, Sequence, TypedDict
+from typing import Literal, TypedDict
 
 
 DEFAULT_CHUNK_CHARS = 1_600

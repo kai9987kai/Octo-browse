@@ -10,3 +10,8 @@ dist/
 release/
 release_build.log
 *.spec
+.coverage
+.coverage.*
+htmlcov/
+.ruff_cache/
+.pytest_cache/

@@ -163,6 +163,16 @@ function Get-OctoPyInstallerArguments {
         "--add-data", ((Join-Path $Root "assets") + ";assets"),
         "--add-data", ((Join-Path $Root "examples\mv3_hello") + ";examples\mv3_hello"),
         "--additional-hooks-dir", (Join-Path $Root "packaging\hooks"),
+        # These are imported at runtime by octobrowse/optional_deps.py so they
+        # stay off the cold-start path. PyInstaller cannot see a runtime import,
+        # so without these flags AI, text-to-speech, voice and plugin
+        # networking would break in the frozen build only. Keep this list in
+        # sync with DEFERRED in tests/test_optional_deps.py, which asserts it.
+        "--hidden-import", "openai",
+        "--hidden-import", "gtts",
+        "--hidden-import", "speech_recognition",
+        "--hidden-import", "requests",
+        "--hidden-import", "cryptography.fernet",
         "--exclude-module", "cv2",
         "--exclude-module", "numpy",
         "--exclude-module", "pocketsphinx"

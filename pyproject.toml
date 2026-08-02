@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "octobrowse"
+description = "A privacy-focused desktop web browser built on PyQt6 and QtWebEngine."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dynamic = ["version", "dependencies"]
+
+[project.urls]
+Homepage = "https://github.com/kai9987kai/Octo-browse"
+
+[tool.setuptools]
+# Only the UI-independent helper package is importable as a library; main.py is
+# the application entry point and is deliberately not packaged.
+packages = ["octobrowse"]
+
+[tool.setuptools.dynamic]
+version = { attr = "octobrowse.version.__version__" }
+dependencies = { file = ["requirements.txt"] }
+
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = [".venv", "build", "dist", "release"]
+
+[tool.ruff.lint]
+# Deliberately a gate that passes today rather than an aspiration that is
+# permanently red. Widen this set as the backlog below is worked off.
+select = ["E", "F", "W", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# BACKLOG. main.py carries 72 lines over 120 characters, inherited from before
+# this gate existed. Every other file is clean, so the rule is enforced
+# everywhere else and this entry shrinks as main.py is split up.
+"main.py" = ["E501", "UP037"]
+# The article extractor embeds JavaScript source as a Python string; the long
+# lines are a minified selector list and a regex that must not be broken.
+"octobrowse/readability.py" = ["E501"]
+# _package_error() attaches __cause__ explicitly, so the exception chain is
+# preserved even though ruff cannot see through the helper to prove it.
+"octobrowse/extensions.py" = ["B904"]
+
+
+[tool.coverage.run]
+source = ["main", "octobrowse"]
+branch = false
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+# RATCHET. Measured at 37% total / 89% for octobrowse when this gate landed.
+# Raise these as coverage improves; never lower them to make a build pass.
+fail_under = 35
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+# octobrowse/ is pure logic and fully annotated; main.py is Qt-heavy and is not
+# checked yet. Tighten module by module rather than in one sweep.
+files = ["octobrowse"]
+ignore_missing_imports = true

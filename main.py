@@ -44,7 +44,10 @@ from octobrowse.extensions import (
     extension_review_text,
     inspect_extension_source,
 )
+from octobrowse.blockstats import BlockStats
 from octobrowse.library_index import LibraryIndex
+from octobrowse.local_summary import LocalSummary, summarize
+from octobrowse import optional_deps
 from octobrowse.research import (
     make_research_note,
     normalize_research_notes,
@@ -72,36 +75,18 @@ from octobrowse.version import __version__
 from octobrowse.workspaces import make_workspace, normalize_workspaces, workspace_to_markdown
 
 try:
-    import requests
-except ImportError:  # pragma: no cover - optional runtime feature
-    requests = None
-
-try:
     import keyring
     from keyring.errors import KeyringError
 except ImportError:  # pragma: no cover - dependency fallback for source checkouts
     keyring = None
     KeyringError = Exception
 
-try:
-    from cryptography.fernet import Fernet
-except ImportError:  # pragma: no cover - optional runtime feature
-    Fernet = None
-
-try:
-    from gtts import gTTS
-except ImportError:  # pragma: no cover - optional runtime feature
-    gTTS = None
-
-try:
-    from openai import OpenAI
-except ImportError:  # pragma: no cover - optional runtime feature
-    OpenAI = None
-
-try:
-    import speech_recognition as sr
-except ImportError:  # pragma: no cover - optional runtime feature
-    sr = None
+# requests, cryptography, gtts, openai and speech_recognition are loaded on
+# first use instead of at import. They cost over a second of cold start between
+# them — openai alone is more than half of `import main` — and every one of
+# them is only reached from a background worker or an explicit user action.
+# See octobrowse/optional_deps.py; frozen builds need matching --hidden-import
+# entries in packaging/build_common.ps1.
 
 from PyQt6.QtCore import (
     QCoreApplication,
@@ -769,6 +754,7 @@ class ApiFetchWorker(QThread):
         self.as_json = as_json
 
     def run(self) -> None:
+        requests = optional_deps.load("requests")
         if requests is None:
             self.failed.emit(self.kind, "Install the requests package.")
             return
@@ -803,11 +789,12 @@ class OpenAIWorker(QThread):
         self.max_output_tokens = max_output_tokens
 
     def run(self) -> None:
-        if OpenAI is None:
+        openai_module = optional_deps.load("openai")
+        if openai_module is None:
             self.failed.emit(self.task, "Install the openai package to use AI features.")
             return
         try:
-            client = OpenAI(api_key=self.api_key, timeout=30.0, max_retries=1)
+            client = openai_module.OpenAI(api_key=self.api_key, timeout=30.0, max_retries=1)
             response = client.responses.create(
                 model=self.model,
                 instructions=self.instructions,
@@ -846,11 +833,12 @@ class SpeechWorker(QThread):
     def run(self) -> None:
         output_file = ""
         try:
-            if gTTS is None:
+            gtts_module = optional_deps.load("gtts")
+            if gtts_module is None:
                 raise RuntimeError("Install gTTS to use text-to-speech.")
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
                 output_file = temp_file.name
-            gTTS(self.text, lang="en", slow=False).save(output_file)
+            gtts_module.gTTS(self.text, lang="en", slow=False).save(output_file)
             if self.isInterruptionRequested():
                 Path(output_file).unlink(missing_ok=True)
                 return
@@ -915,13 +903,13 @@ class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
     def __init__(self, block_list: set[str]) -> None:
         super().__init__()
         self.block_list = {domain.lower() for domain in block_list}
-        self.blocked_by_domain: Counter[str] = Counter()
-        self.blocked_by_first_party: dict[str, Counter[str]] = {}
+        # interceptRequest runs on Chromium's IO thread while the UI thread
+        # reads these tallies from Qt slots; BlockStats owns the locking.
+        self.stats = BlockStats()
         self.ad_block_enabled = False
         self.https_only = False
         self.gpc_enabled = True
         self.dnt_enabled = False
-        self.https_upgrades = 0
         self.filter_rules: FilterRuleSet | None = None
 
     def interceptRequest(self, info: Any) -> None:
@@ -939,24 +927,20 @@ class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
             if not excepted:
                 match = self._matching_domain(host)
                 if match:
-                    self.blocked_by_domain[match] += 1
-                    self._record_site_block(first_party_host, match)
+                    self.stats.record(first_party_host, match)
                     info.block(True)
                     return
                 if rules is not None and rules.should_block(
                     url.toString(), host, request_type, first_party_host
                 ):
-                    self.blocked_by_domain[host or "pattern-rule"] += 1
-                    self._record_site_block(
-                        first_party_host, host or "pattern-rule"
-                    )
+                    self.stats.record(first_party_host, host or "pattern-rule")
                     info.block(True)
                     return
         if self.https_only and url.scheme() == "http" and self._upgradable_host(host):
             if info.resourceType() == QWebEngineUrlRequestInfo.ResourceType.ResourceTypeMainFrame:
                 secure = QUrl(url)
                 secure.setScheme("https")
-                self.https_upgrades += 1
+                self.stats.record_https_upgrade()
                 info.redirect(secure)
                 return
         if self.gpc_enabled:
@@ -965,30 +949,25 @@ class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
             info.setHttpHeader(b"DNT", b"1")
 
     def reset_stats(self) -> None:
-        self.blocked_by_domain.clear()
-        self.blocked_by_first_party.clear()
-        self.https_upgrades = 0
+        self.stats.reset()
+
+    @property
+    def https_upgrades(self) -> int:
+        return self.stats.https_upgrades
 
     def total_blocked(self) -> int:
-        return sum(self.blocked_by_domain.values())
+        return self.stats.total()
 
     def blocked_for_site(self, host: str) -> int:
-        return sum(self.blocked_by_first_party.get(host.lower(), {}).values())
+        return self.stats.for_site(host)
 
     def top_blocked_for_site(
         self, host: str, limit: int = 5
     ) -> list[tuple[str, int]]:
-        return self.blocked_by_first_party.get(
-            host.lower(), Counter()
-        ).most_common(limit)
+        return self.stats.top_for_site(host, limit)
 
-    def _record_site_block(self, first_party_host: str, blocked_host: str) -> None:
-        if not first_party_host:
-            return
-        counter = self.blocked_by_first_party.setdefault(
-            first_party_host, Counter()
-        )
-        counter[blocked_host] += 1
+    def top_blocked_domains(self, limit: int = 8) -> list[tuple[str, int]]:
+        return self.stats.top_domains(limit)
 
     def _matching_domain(self, host: str) -> str | None:
         return _domain_suffix_match(host, self.block_list)
@@ -1008,10 +987,19 @@ class PasswordManager:
 
     def __init__(self) -> None:
         self.passwords: dict[str, str] = {}
-        self.cipher = Fernet(Fernet.generate_key()) if Fernet is not None else None
+        self._cipher: Any = None
+
+    @property
+    def cipher(self) -> Any:
+        """Create the session key on first use, not during browser startup."""
+        if self._cipher is None:
+            fernet_module = optional_deps.load("cryptography.fernet")
+            if fernet_module is not None:
+                self._cipher = fernet_module.Fernet(fernet_module.Fernet.generate_key())
+        return self._cipher
 
     def available(self) -> bool:
-        return self.cipher is not None
+        return optional_deps.available("cryptography.fernet")
 
     def encrypt(self, password: str) -> str:
         if self.cipher is None:
@@ -1227,6 +1215,7 @@ class OctoPluginAPI:
     # --- network ---
     def fetch(self, url: str, timeout: float = 10.0) -> str:
         self._require("network")
+        requests = optional_deps.load("requests")
         if requests is None:
             raise RuntimeError("Install the requests package to use plugin networking.")
         url = str(url)
@@ -1563,7 +1552,9 @@ class OctoBrowse(QMainWindow):
         self.ad_block_enabled = self.settings.ad_block_enabled
         self.incognito_mode = False
         self.password_manager = PasswordManager()
-        self.voice_recognizer = sr.Recognizer() if sr is not None else None
+        # Built on first use in voice_command; constructing it here would drag
+        # speech_recognition (and PyAudio) into every cold start.
+        self.voice_recognizer: Any = None
         self.vpn_enabled = False
         self.default_user_agent = ""
 
@@ -2018,6 +2009,12 @@ class OctoBrowse(QMainWindow):
         self._add_menu_action(data_menu, "Clear Browser Data", "Clear history, cookies, cache, and block stats", self.clear_browser_data)
 
         ai_menu = menu_bar.addMenu("AI")
+        self._add_menu_action(
+            ai_menu,
+            "Summarize Page (On-Device)",
+            "Summarize this page offline, quoting it verbatim",
+            self.summarize_page_offline,
+        )
         self._add_menu_action(ai_menu, "Summarize Page", "Summarize readable page text", self.summarize_page)
         self._add_menu_action(ai_menu, "Ask About Page", "Open page-aware chat", self.open_chatbot)
 
@@ -2260,6 +2257,9 @@ class OctoBrowse(QMainWindow):
             BrowserCommand("Tab overview", "current tabs", self.open_tab_overview),
             BrowserCommand("Browser identity", "user agent navigator brands", self.open_browser_identity_page),
             BrowserCommand("Test browser identity online", "what browser site", self.open_browser_identity_test),
+            BrowserCommand(
+                "Summarize page on device", "Offline", self.summarize_page_offline
+            ),
             BrowserCommand("Summarize page", "OpenAI", self.summarize_page),
             BrowserCommand("Ask about page", "AI chat", self.open_chatbot),
             BrowserCommand("Toggle ad block", "privacy", self.toggle_ad_block),
@@ -2833,6 +2833,8 @@ li {{ margin: 7px 0; }}
             "Privacy And Identity": [
                 "Ad-block interceptor with fast suffix matching and privacy report",
                 "EasyList-compatible filters with resource-type, third-party, and exception semantics",
+                "Public-suffix-aware site identity so third-party rules fire on shared hosting platforms",
+                "Lock-guarded blocking telemetry safe to read from the UI while the IO thread writes",
                 "Cosmetic element-hiding rules injected per page",
                 "Automatic weekly EasyList refresh",
                 "Per-site content controls (JavaScript and image toggles)",
@@ -2852,6 +2854,8 @@ li {{ margin: 7px 0; }}
                 "Private download provenance supplied directly by the off-record profile",
             ],
             "AI And Voice": [
+                "Deterministic on-device extractive summaries that need no API key and send nothing",
+                "Verbatim summary sentences carrying source offsets, so no bullet can be invented",
                 "Citation-grounded OpenAI summaries over article-focused text with privacy-aware save-to-note",
                 "Query-relevant cited page assistant over shared readable content",
                 "Prompt-injection-aware context boundaries, store=False, and private-tab consent",
@@ -4483,7 +4487,9 @@ p {{ margin: 0 0 20px; }}
             self.update_status_badges()
 
     def read_aloud(self) -> None:
-        if gTTS is None:
+        # available() checks the spec without paying for the import here; the
+        # SpeechWorker thread performs the real load.
+        if not optional_deps.available("gtts"):
             QMessageBox.critical(self, "Read Aloud", "Install gTTS to use text-to-speech.")
             return
         browser = self.current_browser()
@@ -4560,7 +4566,7 @@ p {{ margin: 0 0 20px; }}
         private = bool(browser and browser.property("private"))
         profile = self.private_profile if private else self.profile
         blocked = interceptor.total_blocked()
-        top_domains = interceptor.blocked_by_domain.most_common(8)
+        top_domains = interceptor.top_blocked_domains(8)
         try:
             saved_permissions = len(profile.listAllPermissions()) if profile else 0
         except Exception:
@@ -4600,6 +4606,66 @@ p {{ margin: 0 0 20px; }}
             lines.append("")
             lines.extend(f"{domain}: {count}" for domain, count in top_domains)
         QMessageBox.information(self, "Privacy Report", "\n".join(lines))
+
+    @staticmethod
+    def render_local_summary(summary: LocalSummary, title: str, url: str) -> str:
+        """Render an on-device summary as plain text, provenance included."""
+        lines: list[str] = []
+        if title:
+            lines.append(title)
+        if url:
+            lines.append(url)
+        if lines:
+            lines.append("")
+        lines.append("Key sentences from this page (quoted verbatim):")
+        lines.append("")
+        for bullet in summary.bullets:
+            lines.append(f"• {bullet.text}")
+        if summary.keywords:
+            lines.append("")
+            lines.append(f"Recurring terms: {', '.join(summary.keywords)}")
+        lines.append("")
+        lines.append(
+            "Generated on this device by OctoBrowse. No page content was sent "
+            "anywhere. Every line above is copied word-for-word from the page, "
+            "so nothing here is invented — but the selection is mechanical, not "
+            "an understanding of the article."
+        )
+        return "\n".join(lines)
+
+    def summarize_page_offline(self) -> None:
+        """Summarize the active page entirely on-device — no key, no network."""
+        browser = self.current_browser()
+        if browser is None:
+            return
+        source_private = bool(browser.property("private"))
+        self.set_status("Reading the page for an on-device summary...")
+
+        def show(readable: ReadablePage, source_private: bool = source_private) -> None:
+            summary = summarize(readable.text)
+            if not summary:
+                self.set_status("No readable article text found to summarize.")
+                QMessageBox.information(
+                    self,
+                    "On-Device Summary",
+                    "OctoBrowse could not find enough article text on this page "
+                    "to summarize.",
+                )
+                return
+            self.set_status(
+                f"On-device summary: {len(summary.bullets)} key sentences "
+                f"({summary.coverage:.0%} term coverage)."
+            )
+            self.show_ai_summary(
+                self.render_local_summary(summary, readable.title, readable.url),
+                readable.url,
+                readable.title,
+                source_private=source_private,
+                heading="On-Device Page Summary",
+                note_kind="local-summary",
+            )
+
+        self.extract_readable_page(browser, show)
 
     def summarize_page(self) -> None:
         if not self.ensure_openai_key():
@@ -4643,7 +4709,19 @@ p {{ margin: 0 0 20px; }}
             QLineEdit.EchoMode.Password,
         )
         if not ok or not key.strip():
-            QMessageBox.critical(self, "OpenAI", "OpenAI API key is required for this feature.")
+            # Declining a cloud account must not be a dead end: offer the
+            # on-device summarizer, which needs no key and sends nothing.
+            answer = QMessageBox.question(
+                self,
+                "OpenAI",
+                "This feature uses the OpenAI API, which needs a key.\n\n"
+                "Summarize this page on your device instead? It works offline "
+                "and quotes the page directly.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                QTimer.singleShot(0, self.summarize_page_offline)
             return False
         self.openai_api_key = key.strip()
         self.settings.openai_api_key = self.openai_api_key
@@ -4824,9 +4902,11 @@ p {{ margin: 0 0 20px; }}
         source_title: str = "",
         *,
         source_private: bool = False,
+        heading: str = "Cited Page Summary",
+        note_kind: str = "ai-summary",
     ) -> None:
         dialog = QDialog(self)
-        dialog.setWindowTitle("Cited Page Summary")
+        dialog.setWindowTitle(heading)
         dialog.resize(700, 520)
         layout = QVBoxLayout(dialog)
         output = QPlainTextEdit(text)
@@ -4854,7 +4934,7 @@ p {{ margin: 0 0 20px; }}
                 url=source_url,
                 title=source_title or source_url or "AI page summary",
                 body=text,
-                kind="ai-summary",
+                kind=note_kind,
                 source_private=source_private,
             )
             if saved is not None:
@@ -4878,9 +4958,14 @@ p {{ margin: 0 0 20px; }}
         self.set_status("AI request failed")
 
     def voice_command(self) -> None:
-        if sr is None or self.voice_recognizer is None:
+        # Bound before the try block: the except clauses below reference
+        # sr.UnknownValueError and sr.RequestError.
+        sr = optional_deps.load("speech_recognition")
+        if sr is None:
             QMessageBox.critical(self, "Voice Command", "Install SpeechRecognition and PyAudio to use voice commands.")
             return
+        if self.voice_recognizer is None:
+            self.voice_recognizer = sr.Recognizer()
         try:
             with sr.Microphone() as source:
                 QMessageBox.information(self, "Voice Command", "Listening...")
@@ -5478,6 +5563,31 @@ p {{ margin: 0 0 20px; }}
             self.save_settings()
         return allowed
 
+    @staticmethod
+    def _permission_should_remember(private: bool, persistent: bool) -> bool:
+        """Only non-private, Qt-persistent decisions may reach settings.json."""
+        return bool(persistent) and not bool(private)
+
+    @staticmethod
+    def _page_is_private(page: Any) -> bool:
+        """Report whether a page belongs to the off-the-record profile.
+
+        OctoWebPage records the authoritative flag on itself. Pages Qt creates
+        internally are not OctoWebPage instances, so fall back to the owning
+        view's dynamic property, then fail closed: an unclassifiable page is
+        treated as private so nothing about it is written to disk.
+        """
+        private = getattr(page, "private", None)
+        if isinstance(private, bool):
+            return private
+        try:
+            parent_view = page.parent()
+        except Exception:
+            return True
+        if isinstance(parent_view, QWebEngineView):
+            return bool(parent_view.property("private"))
+        return True
+
     def handle_permission_request(
         self, page: QWebEnginePage, permission: Any
     ) -> None:
@@ -5485,22 +5595,27 @@ p {{ margin: 0 0 20px; }}
         try:
             permission_type = permission.permissionType()
             feature_name = getattr(permission_type, "name", str(permission_type))
-            parent_view = page.parent()
-            private = bool(
-                isinstance(parent_view, QWebEngineView)
-                and parent_view.property("private")
+            remember = self._permission_should_remember(
+                self._page_is_private(page),
+                self._permission_is_persistent(permission_type),
             )
-            remember = (
-                not private and self._permission_is_persistent(permission_type)
-            )
-            if self._decide_permission(
+            allowed = self._decide_permission(
                 permission.origin(), feature_name, remember=remember
-            ):
-                permission.grant()
-            else:
+            )
+        except Exception as exc:
+            # Never leave the page's permission promise unsettled: an
+            # unhandled failure here used to hang getUserMedia/geolocation
+            # forever with no feedback. Deny, and say why.
+            try:
                 permission.deny()
-        except Exception:
-            pass
+            except Exception:
+                pass
+            self.set_status(f"Permission request denied after an internal error: {exc}")
+            return
+        try:
+            permission.grant() if allowed else permission.deny()
+        except Exception as exc:
+            self.set_status(f"Permission decision could not be applied: {exc}")
 
     def handle_feature_permission(self, page: QWebEnginePage, origin: QUrl, feature: Any) -> None:
         """Legacy per-feature permission API (Qt < 6.8)."""

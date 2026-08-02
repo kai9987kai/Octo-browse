@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
+
+from .public_suffix import registrable_domain
 
 
 RESOURCE_OPTIONS = {
@@ -46,9 +49,9 @@ RESOURCE_TYPE_NAMES = {
     "ResourceTypeWebSocket": "websocket",
 }
 
-# Common multi-label public suffixes.  This deliberately small fallback avoids
-# a network-updated PSL dependency while handling the domains users encounter
-# most often. Exact/subdomain checks below cover intranet and custom suffixes.
+# Superseded by octobrowse.public_suffix, which covers these plus the private
+# hosting platforms.  Retained because it documents the original fallback set
+# and because a stale public-suffix subset degrades to exactly this behaviour.
 COMMON_MULTI_LABEL_SUFFIXES = {
     "ac.uk", "co.uk", "gov.uk", "ltd.uk", "me.uk", "net.uk", "org.uk", "plc.uk",
     "asn.au", "com.au", "edu.au", "gov.au", "id.au", "net.au", "org.au",
@@ -80,16 +83,15 @@ def resource_type_name(resource_type: Any) -> str:
 
 
 def _site_key(host: str) -> str:
+    """Return the site identity of ``host`` — its registrable domain.
+
+    Falls back to the full host when the host *is* a public suffix, so two
+    different suffixes never collapse onto one another.
+    """
     host = host.lower().strip(".")
     if not host:
         return ""
-    labels = host.split(".")
-    if len(labels) <= 2 or all(part.isdigit() for part in labels):
-        return host
-    suffix = ".".join(labels[-2:])
-    if suffix in COMMON_MULTI_LABEL_SUFFIXES and len(labels) >= 3:
-        return ".".join(labels[-3:])
-    return suffix
+    return registrable_domain(host) or host
 
 
 def is_third_party_request(request_host: str, first_party_host: str) -> bool | None:
@@ -98,6 +100,9 @@ def is_third_party_request(request_host: str, first_party_host: str) -> bool | N
     first_party_host = first_party_host.lower().strip(".")
     if not request_host or not first_party_host:
         return None
+    # A host and its own ancestor stay first-party even when that ancestor is
+    # itself a public suffix. Only *sibling* subdomains under a shared suffix
+    # — a.github.io versus b.github.io — are genuinely cross-site.
     if (
         request_host == first_party_host
         or request_host.endswith("." + first_party_host)
@@ -327,7 +332,12 @@ class FilterRuleSet:
         tokens = [token for token in tokens if token not in {"http", "https", "www"}]
         return max(tokens, key=len) if tokens else None
 
-    def _matching_rules(self, url_text: str, buckets: dict[str, list[NetworkRule]], generic: Iterable[NetworkRule]) -> Iterable[NetworkRule]:
+    def _matching_rules(
+        self,
+        url_text: str,
+        buckets: dict[str, list[NetworkRule]],
+        generic: Iterable[NetworkRule],
+    ) -> Iterable[NetworkRule]:
         lowered = url_text.lower()
         for token in set(self._TOKEN_RE.findall(lowered)):
             yield from buckets.get(token, ())
