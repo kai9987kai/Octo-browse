@@ -28,6 +28,7 @@ from __future__ import annotations
 
 
 __all__ = [
+    "is_public_suffix",
     "public_suffix",
     "registrable_domain",
     "same_site",
@@ -71,8 +72,11 @@ _AWS_REGIONS = (
 # ICANN section: registries that delegate at the second level.
 _ICANN_RULES = {
     # United Kingdom
+    # NB: sch.uk is NOT here — the real PSL entry is the wildcard *.sch.uk,
+    # so it lives in _WILDCARD_RULES. Listing it as a plain rule collapsed
+    # every school under a local authority onto one site.
     "ac.uk", "co.uk", "gov.uk", "ltd.uk", "me.uk", "net.uk", "nhs.uk",
-    "org.uk", "plc.uk", "police.uk", "sch.uk",
+    "org.uk", "plc.uk", "police.uk",
     # Australia
     "asn.au", "com.au", "edu.au", "gov.au", "id.au", "net.au", "org.au",
     # New Zealand
@@ -130,8 +134,16 @@ _ICANN_RULES = {
 }
 
 # ICANN wildcard rules: every label under these is its own public suffix.
+# Every parent of an entry in _EXCEPTION_RULES must appear here — an exception
+# exists only to carve a hole in a matching wildcard, and shipping one without
+# the other silently merges unrelated organisations onto a single site.
+# test_public_suffix.py asserts that invariant.
 _WILDCARD_RULES = {
     "bd", "ck", "er", "jm", "kh", "mm", "pg", "ye", "zw",
+    "sch.uk",
+    # The Japanese city domains carved out by the !city.<city>.jp exceptions.
+    "kawasaki.jp", "kitakyushu.jp", "kobe.jp", "nagoya.jp", "sapporo.jp",
+    "sendai.jp", "yokohama.jp",
     "compute.amazonaws.com", "compute-1.amazonaws.com",
     "elb.amazonaws.com",
     "s3.dualstack.amazonaws.com",
@@ -211,9 +223,25 @@ _MAX_RULE_LABELS = max(
 
 
 def _normalize(host: str) -> str:
+    """Reduce an authority to a bare lowercase hostname.
+
+    Callers pass QUrl.host(), which is already bare, but the exported API is
+    also reachable with a host:port pair or a bracketed IPv6 literal. Without
+    stripping those, ``example.com:8080`` and ``example.com`` resolve to two
+    different sites.
+    """
     if not isinstance(host, str):
         return ""
-    return host.strip().strip(".").lower()
+    host = host.strip().lower()
+    if host.startswith("["):
+        closing = host.find("]")
+        if closing > 0:
+            return host[1:closing]
+    # A single colon followed by digits is a port; more than one means IPv6.
+    head, separator, tail = host.rpartition(":")
+    if separator and head and ":" not in head and tail.isdigit():
+        host = head
+    return host.strip(".")
 
 
 def _is_ip_literal(host: str) -> bool:
@@ -296,6 +324,20 @@ def registrable_domain(host: str) -> str | None:
     if len(labels) <= suffix_labels:
         return None
     return ".".join(labels[len(labels) - suffix_labels - 1:])
+
+
+def is_public_suffix(host: str) -> bool:
+    """Whether ``host`` is a shared parent that no single party owns.
+
+    ``github.io`` and ``co.uk`` are; ``user.github.io`` and ``localhost`` are
+    not. Callers use this to tell a real shared ancestor from a suffix that
+    merely looks like one.
+    """
+
+    host = _normalize(host)
+    if not host or _is_ip_literal(host):
+        return False
+    return registrable_domain(host) is None
 
 
 def same_site(left: str, right: str) -> bool:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -52,19 +53,53 @@ class OptionalDepsTests(unittest.TestCase):
     def test_load_survives_a_module_that_raises_on_import(self) -> None:
         # A dependency whose own import explodes must not take the browser
         # down; it is reported as simply unavailable.
-        broken = REPO_ROOT / "octobrowse_broken_probe.py"
-        broken.write_text("raise RuntimeError('boom')\n", encoding="utf-8")
-        try:
-            sys.path.insert(0, str(REPO_ROOT))
-            self.assertIsNone(optional_deps.load("octobrowse_broken_probe"))
-        finally:
-            sys.path.remove(str(REPO_ROOT))
-            broken.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "octobrowse_broken_probe.py").write_text(
+                "raise RuntimeError('boom')\n", encoding="utf-8"
+            )
+            sys.path.insert(0, str(root))
+            try:
+                self.assertIsNone(optional_deps.load("octobrowse_broken_probe"))
+            finally:
+                sys.path.remove(str(root))
+                sys.modules.pop("octobrowse_broken_probe", None)
 
     def test_every_deferred_dependency_is_declared(self) -> None:
         for name in DEFERRED:
             with self.subTest(name=name):
                 self.assertIn(name, optional_deps.OPTIONAL_DISTRIBUTIONS)
+
+    def test_install_hint_names_the_distribution_not_the_module(self) -> None:
+        self.assertIn("cryptography", optional_deps.install_hint("cryptography.fernet"))
+        self.assertIn("gTTS", optional_deps.install_hint("gtts"))
+        self.assertIn(
+            "SpeechRecognition", optional_deps.install_hint("speech_recognition")
+        )
+        # Unknown names degrade to the module name rather than raising.
+        self.assertIn("mystery", optional_deps.install_hint("mystery"))
+
+    def test_available_does_not_leak_a_broken_parent_package(self) -> None:
+        """Resolving a dotted name imports the parent. A parent whose __init__
+        raises must be reported as unavailable, not escape into a Qt slot."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "octobrowse_broken_parent"
+            package.mkdir()
+            (package / "__init__.py").write_text(
+                "raise RuntimeError('backend blew up at import time')\n",
+                encoding="utf-8",
+            )
+            (package / "leaf.py").write_text("value = 1\n", encoding="utf-8")
+            sys.path.insert(0, str(root))
+            try:
+                self.assertFalse(
+                    optional_deps.available("octobrowse_broken_parent.leaf")
+                )
+                self.assertIsNone(optional_deps.load("octobrowse_broken_parent.leaf"))
+            finally:
+                sys.path.remove(str(root))
+                sys.modules.pop("octobrowse_broken_parent", None)
 
 
 class StartupImportTests(unittest.TestCase):

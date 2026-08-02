@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from PyQt6.QtCore import QUrl
 from PyQt6.QtWebEngineCore import QWebEnginePermission
 
 from main import OctoBrowse
@@ -131,7 +132,7 @@ class PermissionRequestHandlingTests(unittest.TestCase):
 
     def test_internal_failure_denies_instead_of_hanging(self) -> None:
         browser = self.make_browser()
-        browser._decide_permission = lambda *a, **k: True  # type: ignore[assignment]
+        browser._decide_permission = lambda *a, **k: (True, False)  # type: ignore[assignment]
         permission = BrokenPermission(
             QWebEnginePermission.PermissionType.Geolocation
         )
@@ -154,9 +155,11 @@ class PermissionRequestHandlingTests(unittest.TestCase):
 
         recorded: list[bool] = []
 
-        def decide(origin: object, feature_name: str, *, remember: bool) -> bool:
+        def decide(
+            origin: object, feature_name: str, *, remember: bool
+        ) -> tuple[bool, bool]:
             recorded.append(remember)
-            return True
+            return True, remember
 
         browser._decide_permission = decide  # type: ignore[assignment]
         permission = FakePermission(
@@ -181,19 +184,85 @@ class PermissionRequestHandlingTests(unittest.TestCase):
 
         recorded: list[bool] = []
 
-        def decide(origin: object, feature_name: str, *, remember: bool) -> bool:
+        def decide(
+            origin: object, feature_name: str, *, remember: bool
+        ) -> tuple[bool, bool]:
             recorded.append(remember)
-            return True
+            return True, remember
 
         browser._decide_permission = decide  # type: ignore[assignment]
         permission = FakePermission(
-            QWebEnginePermission.PermissionType.Geolocation, "https://standard.example"
+            QWebEnginePermission.PermissionType.Geolocation,
+            QUrl("https://standard.example"),
         )
 
         browser.handle_permission_request(StandardPage(), permission)  # type: ignore[arg-type]
 
         self.assertEqual(recorded, [True])
         self.assertEqual(permission.granted, 1)
+        self.assertEqual(
+            browser.site_permissions,
+            {"https://standard.example": {"Geolocation": True}},
+        )
+        self.assertEqual(browser.saved, 1)
+
+    def test_a_decision_that_qt_rejects_is_not_recorded(self) -> None:
+        """Regression: an unapplied Allow must never reach settings.json.
+
+        The decision used to be persisted before Qt accepted it, so a failure
+        anywhere afterwards left a stored "Allow" for a request that was in
+        fact denied — and the next request read that value and granted
+        silently, with no prompt.
+        """
+        browser = self.make_browser()
+
+        class StandardPage:
+            private = False
+
+            def parent(self) -> object:
+                return None
+
+        class RejectingPermission(FakePermission):
+            def grant(self) -> None:
+                raise RuntimeError("Qt rejected the grant")
+
+        browser._decide_permission = lambda *a, **k: (True, True)  # type: ignore[assignment]
+        permission = RejectingPermission(
+            QWebEnginePermission.PermissionType.Geolocation,
+            QUrl("https://standard.example"),
+        )
+
+        browser.handle_permission_request(StandardPage(), permission)  # type: ignore[arg-type]
+
+        self.assertEqual(browser.site_permissions, {})
+        self.assertEqual(browser.saved, 0)
+        self.assertIn("could not be applied", browser.statuses[-1])
+
+    def test_a_save_failure_does_not_change_the_applied_decision(self) -> None:
+        """A failing save is reported, not silently converted into a denial."""
+        browser = self.make_browser()
+
+        class StandardPage:
+            private = False
+
+            def parent(self) -> object:
+                return None
+
+        def exploding_save() -> None:
+            raise RuntimeError("settings.json is locked")
+
+        browser.save_settings = exploding_save  # type: ignore[assignment]
+        browser._decide_permission = lambda *a, **k: (True, True)  # type: ignore[assignment]
+        permission = FakePermission(
+            QWebEnginePermission.PermissionType.Geolocation,
+            QUrl("https://standard.example"),
+        )
+
+        browser.handle_permission_request(StandardPage(), permission)  # type: ignore[arg-type]
+
+        self.assertEqual(permission.granted, 1)
+        self.assertEqual(permission.denied, 0)
+        self.assertIn("could not be saved", browser.statuses[-1])
 
     def test_denied_decision_denies_the_permission(self) -> None:
         browser = self.make_browser()
@@ -204,7 +273,7 @@ class PermissionRequestHandlingTests(unittest.TestCase):
             def parent(self) -> object:
                 return None
 
-        browser._decide_permission = lambda *a, **k: False  # type: ignore[assignment]
+        browser._decide_permission = lambda *a, **k: (False, False)  # type: ignore[assignment]
         permission = FakePermission(
             QWebEnginePermission.PermissionType.Geolocation, "https://standard.example"
         )

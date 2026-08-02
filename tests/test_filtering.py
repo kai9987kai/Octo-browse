@@ -49,7 +49,7 @@ class FilteringTests(unittest.TestCase):
     def test_common_public_suffix_same_site_detection(self) -> None:
         self.assertFalse(is_third_party_request("cdn.example.co.uk", "www.example.co.uk"))
         self.assertTrue(is_third_party_request("cdn.other.co.uk", "www.example.co.uk"))
-        self.assertIsNone(is_third_party_request("cdn.example", ""))
+        self.assertTrue(is_third_party_request("cdn.example", ""))
 
     def test_siblings_on_shared_hosting_are_third_party(self) -> None:
         """Regression: these all used to collapse to one site, disabling
@@ -71,6 +71,37 @@ class FilteringTests(unittest.TestCase):
         self.assertFalse(is_third_party_request("cdn.user.github.io", "user.github.io"))
         self.assertFalse(is_third_party_request("www.example.com", "example.com"))
         self.assertFalse(is_third_party_request("example.com", "www.example.com"))
+        self.assertFalse(is_third_party_request("foo.localhost", "localhost"))
+
+    def test_a_public_suffix_ancestor_is_not_the_same_site(self) -> None:
+        """A document at the apex of a shared host is not first-party with
+        every user's subdomain on that platform."""
+        for request_host, first_party_host in (
+            ("evil.neocities.org", "neocities.org"),
+            ("neocities.org", "evil.neocities.org"),
+            ("spy.github.io", "github.io"),
+            ("tracker.blogspot.com", "blogspot.com"),
+        ):
+            with self.subTest(request=request_host, first_party=first_party_host):
+                self.assertTrue(
+                    is_third_party_request(request_host, first_party_host)
+                )
+
+    def test_an_unknown_first_party_is_treated_as_third_party(self) -> None:
+        """about:blank / file:// / data: all yield an empty host. Returning
+        None made every $third-party rule non-matching — the blocker failed
+        open on exactly those documents."""
+        self.assertTrue(is_third_party_request("tracker.example", ""))
+        self.assertIsNone(is_third_party_request("", "victim.test"))
+        self.assertIsNone(is_third_party_request("", ""))
+
+        rules = FilterRuleSet()
+        rules.parse_text("||tracker.example^$third-party")
+        self.assertTrue(
+            rules.should_block(
+                "https://tracker.example/t.js", "tracker.example", "script", ""
+            )
+        )
 
     def test_third_party_rule_fires_across_shared_hosting(self) -> None:
         rules = FilterRuleSet()

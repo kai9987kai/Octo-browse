@@ -15,3 +15,4 @@ release_build.log
 htmlcov/
 .ruff_cache/
 .pytest_cache/
+*.egg-info/

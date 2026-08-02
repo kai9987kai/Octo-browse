@@ -20,6 +20,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import html
 from collections import Counter
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
 
+from octobrowse.frecency import frecency, rank_entries
 from octobrowse.filtering import (
     FilterRuleSet,
     domain_suffix_match as _domain_suffix_match,
@@ -47,6 +49,7 @@ from octobrowse.extensions import (
 from octobrowse.blockstats import BlockStats
 from octobrowse.library_index import LibraryIndex
 from octobrowse.local_summary import LocalSummary, summarize
+from octobrowse.quote_anchor import QuoteAnchor, build_anchor
 from octobrowse import optional_deps
 from octobrowse.research import (
     make_research_note,
@@ -756,7 +759,7 @@ class ApiFetchWorker(QThread):
     def run(self) -> None:
         requests = optional_deps.load("requests")
         if requests is None:
-            self.failed.emit(self.kind, "Install the requests package.")
+            self.failed.emit(self.kind, optional_deps.install_hint("requests"))
             return
         try:
             response = requests.get(self.url, timeout=6 if self.as_json else 30)
@@ -791,7 +794,9 @@ class OpenAIWorker(QThread):
     def run(self) -> None:
         openai_module = optional_deps.load("openai")
         if openai_module is None:
-            self.failed.emit(self.task, "Install the openai package to use AI features.")
+            self.failed.emit(
+                self.task, optional_deps.install_hint("openai") + " AI features need it."
+            )
             return
         try:
             client = openai_module.OpenAI(api_key=self.api_key, timeout=30.0, max_retries=1)
@@ -835,7 +840,7 @@ class SpeechWorker(QThread):
         try:
             gtts_module = optional_deps.load("gtts")
             if gtts_module is None:
-                raise RuntimeError("Install gTTS to use text-to-speech.")
+                raise RuntimeError(optional_deps.install_hint("gtts"))
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
                 output_file = temp_file.name
             gtts_module.gTTS(self.text, lang="en", slow=False).save(output_file)
@@ -988,28 +993,47 @@ class PasswordManager:
     def __init__(self) -> None:
         self.passwords: dict[str, str] = {}
         self._cipher: Any = None
+        # The check-then-act in `cipher` is not atomic. Two callers could each
+        # generate a key and the second assignment would discard the first,
+        # leaving anything encrypted with the lost key permanently unreadable.
+        self._cipher_lock = threading.Lock()
 
     @property
     def cipher(self) -> Any:
         """Create the session key on first use, not during browser startup."""
-        if self._cipher is None:
-            fernet_module = optional_deps.load("cryptography.fernet")
-            if fernet_module is not None:
-                self._cipher = fernet_module.Fernet(fernet_module.Fernet.generate_key())
-        return self._cipher
+        cipher = self._cipher
+        if cipher is not None:
+            return cipher
+        with self._cipher_lock:
+            if self._cipher is None:
+                fernet_module = optional_deps.load("cryptography.fernet")
+                if fernet_module is not None:
+                    self._cipher = fernet_module.Fernet(
+                        fernet_module.Fernet.generate_key()
+                    )
+            return self._cipher
 
     def available(self) -> bool:
-        return optional_deps.available("cryptography.fernet")
+        """Whether the manager can actually encrypt.
+
+        This gates the password dialog, so it must reflect a *constructed*
+        cipher rather than a resolvable module spec: cryptography commonly
+        resolves and then fails to import its `_rust` backend on Windows, which
+        used to open a dialog that could never save anything.
+        """
+        return self.cipher is not None
 
     def encrypt(self, password: str) -> str:
-        if self.cipher is None:
-            raise RuntimeError("Install cryptography to use the password manager.")
-        return self.cipher.encrypt(password.encode("utf-8")).decode("utf-8")
+        cipher = self.cipher
+        if cipher is None:
+            raise RuntimeError(optional_deps.install_hint("cryptography.fernet"))
+        return cipher.encrypt(password.encode("utf-8")).decode("utf-8")
 
     def decrypt(self, encrypted_password: str) -> str:
-        if self.cipher is None:
-            raise RuntimeError("Install cryptography to use the password manager.")
-        return self.cipher.decrypt(encrypted_password.encode("utf-8")).decode("utf-8")
+        cipher = self.cipher
+        if cipher is None:
+            raise RuntimeError(optional_deps.install_hint("cryptography.fernet"))
+        return cipher.decrypt(encrypted_password.encode("utf-8")).decode("utf-8")
 
     def save_password(self, url: str, password: str) -> None:
         self.passwords[url] = self.encrypt(password)
@@ -1217,7 +1241,10 @@ class OctoPluginAPI:
         self._require("network")
         requests = optional_deps.load("requests")
         if requests is None:
-            raise RuntimeError("Install the requests package to use plugin networking.")
+            raise RuntimeError(
+                optional_deps.install_hint("requests")
+                + " Plugin networking needs it."
+            )
         url = str(url)
         if not url.lower().startswith(("http://", "https://")):
             raise ValueError("Plugins may only fetch http(s) URLs.")
@@ -1545,6 +1572,10 @@ class OctoBrowse(QMainWindow):
             self.history_db.import_entries(legacy_history)
             self.history = self.history_db.load()
         self._history_index: dict[str, dict[str, Any]] = {entry["url"]: entry for entry in self.history}
+        # Widget-side mirror of _history_index. Without it every navigation and
+        # every title change scanned up to MAX_HISTORY_ITEMS rows, one PyQt
+        # round-trip each, to find the row it already knew the key for.
+        self._history_items: dict[str, QListWidgetItem] = {}
         self.library_index = LibraryIndex(self.store.directory / "library.sqlite")
         self._library_routes: dict[str, dict[str, Any]] = {}
 
@@ -1599,6 +1630,14 @@ class OctoBrowse(QMainWindow):
         self.filter_list_dir = self.store.directory / "filterlists"
         QTimer.singleShot(0, self.reload_filter_lists)
         QTimer.singleShot(5_000, self.refresh_stale_filter_lists)
+
+        # Coalesces address-bar completer rebuilds; see
+        # refresh_address_suggestions. Created before create_toolbar so the
+        # first rebuild there is not queued behind an uninitialised timer.
+        self._suggestions_timer = QTimer(self)
+        self._suggestions_timer.setSingleShot(True)
+        self._suggestions_timer.setInterval(300)
+        self._suggestions_timer.timeout.connect(self._rebuild_address_suggestions)
 
         self.hibernation_timer = QTimer(self)
         self.hibernation_timer.timeout.connect(self.hibernate_idle_tabs)
@@ -2360,19 +2399,37 @@ class OctoBrowse(QMainWindow):
             "!pypi ",
             "!mdn ",
         ]
-        now = time.time()
-        ranked = sorted(self.history, key=lambda entry: self._frecency(entry, now), reverse=True)
+        ranked = rank_entries(self.history, time.time(), limit=60)
         urls = []
-        for url in [entry["url"] for entry in ranked[:60]] + self.bookmarks + self.reading_list:
+        for url in [entry["url"] for entry in ranked] + self.bookmarks + self.reading_list:
             if url and url not in urls:
                 urls.append(url)
         return commands + urls
 
     def refresh_address_suggestions(self) -> None:
+        """Queue a completer rebuild instead of performing one per navigation.
+
+        Rebuilding ranks all of history and invalidates the QCompleter index,
+        and this is reached from every urlChanged signal — several times per
+        page load. Coalescing bursts keeps that off the navigation path.
+        """
+        timer = getattr(self, "_suggestions_timer", None)
+        if timer is None:
+            self._rebuild_address_suggestions()
+            return
+        timer.start()
+
+    def _rebuild_address_suggestions(self) -> None:
         if hasattr(self, "url_suggestions_model"):
             self.url_suggestions_model.setStringList(self.address_suggestions())
 
     def apply_address_suggestion(self, text: str) -> None:
+        # Flush any queued rebuild so an accepted suggestion acts on current
+        # data rather than on a list that is up to one debounce interval old.
+        timer = getattr(self, "_suggestions_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+            self._rebuild_address_suggestions()
         self.url_bar.setText(text)
         if not text.endswith(" "):
             self.navigate_to_url()
@@ -2855,6 +2912,7 @@ li {{ margin: 7px 0; }}
             ],
             "AI And Voice": [
                 "Deterministic on-device extractive summaries that need no API key and send nothing",
+                "Relocatable quote anchors that survive page edits, with honest failure when a quote is gone",
                 "Verbatim summary sentences carrying source offsets, so no bullet can be invented",
                 "Citation-grounded OpenAI summaries over article-focused text with privacy-aware save-to-note",
                 "Query-relevant cited page assistant over shared readable content",
@@ -4135,30 +4193,28 @@ p {{ margin: 0 0 20px; }}
         item = QListWidgetItem(f"{title}  -  {url}" if title else url)
         item.setData(Qt.ItemDataRole.UserRole, url)
         item.setToolTip(url)
+        self._history_items[url] = item
         return item
 
     def _history_sidebar_item(self, url: str) -> QListWidgetItem | None:
-        for row in range(self.history_sidebar.count()):
-            item = self.history_sidebar.item(row)
-            if item.data(Qt.ItemDataRole.UserRole) == url:
-                return item
-        return None
+        return self._history_items.get(url)
+
+    def _drop_history_item(self, url: str) -> None:
+        """Remove a row and its index entry.
+
+        The dict holds a reference to the QListWidgetItem, so forgetting to
+        drop it here would keep rows alive after takeItem hands ownership back.
+        """
+        item = self._history_items.pop(url, None)
+        if item is not None:
+            row = self.history_sidebar.row(item)
+            if row >= 0:
+                self.history_sidebar.takeItem(row)
 
     @staticmethod
     def _frecency(entry: dict[str, Any], now: float) -> float:
-        """Mozilla-style frecency: visit count weighted by recency buckets."""
-        age_days = max(0.0, now - float(entry.get("last_visit") or 0)) / 86400
-        if age_days <= 4:
-            weight = 100
-        elif age_days <= 14:
-            weight = 70
-        elif age_days <= 31:
-            weight = 50
-        elif age_days <= 90:
-            weight = 30
-        else:
-            weight = 10
-        return max(1, int(entry.get("visits") or 1)) * weight
+        """Compatibility shim; the ranking itself lives in octobrowse.frecency."""
+        return frecency(entry, now)
 
     def add_to_history(self, url: str) -> None:
         if self.is_internal_url(url):
@@ -4179,9 +4235,7 @@ p {{ margin: 0 0 20px; }}
             if len(self.history) > MAX_HISTORY_ITEMS:
                 for removed in self.history[: len(self.history) - MAX_HISTORY_ITEMS]:
                     self._history_index.pop(removed["url"], None)
-                    stale_item = self._history_sidebar_item(removed["url"])
-                    if stale_item is not None:
-                        self.history_sidebar.takeItem(self.history_sidebar.row(stale_item))
+                    self._drop_history_item(removed["url"])
                 self.history = self.history[-MAX_HISTORY_ITEMS:]
             self.history_sidebar.addItem(self._make_history_item(entry))
         self.history_db.record_visit(url, now)
@@ -4206,6 +4260,7 @@ p {{ margin: 0 0 20px; }}
     def clear_history(self) -> None:
         self.history.clear()
         self._history_index.clear()
+        self._history_items.clear()
         self.history_sidebar.clear()
         self.history_db.clear()
         self.refresh_address_suggestions()
@@ -4225,6 +4280,7 @@ p {{ margin: 0 0 20px; }}
             return
         self.history.clear()
         self._history_index.clear()
+        self._history_items.clear()
         self.history_sidebar.clear()
         self.history_db.clear()
         profiles = [self.profile]
@@ -4487,10 +4543,16 @@ p {{ margin: 0 0 20px; }}
             self.update_status_badges()
 
     def read_aloud(self) -> None:
-        # available() checks the spec without paying for the import here; the
-        # SpeechWorker thread performs the real load.
+        # Checked up front, before confirm_cloud_speech asks the user to
+        # approve sending page text: discovering the missing dependency after
+        # that consent would be worse than checking early. In a source install
+        # this resolves the spec without importing; in a frozen build
+        # available() does perform the import, which is a one-off cost on an
+        # explicit menu action rather than on the startup path.
         if not optional_deps.available("gtts"):
-            QMessageBox.critical(self, "Read Aloud", "Install gTTS to use text-to-speech.")
+            QMessageBox.critical(
+                self, "Read Aloud", optional_deps.install_hint("gtts")
+            )
             return
         browser = self.current_browser()
         if browser and self.confirm_cloud_speech(browser):
@@ -4633,6 +4695,47 @@ p {{ margin: 0 0 20px; }}
         )
         return "\n".join(lines)
 
+    @staticmethod
+    def _anchor_under_cursor(
+        rendered: str, output: QPlainTextEdit, anchors: list[QuoteAnchor]
+    ) -> QuoteAnchor | None:
+        """Return the anchor whose quote contains the text cursor, if any."""
+        try:
+            position = output.textCursor().position()
+        except Exception:
+            return None
+        for anchor in anchors:
+            start = rendered.find(anchor.exact)
+            while start != -1:
+                if start <= position <= start + len(anchor.exact):
+                    return anchor
+                start = rendered.find(anchor.exact, start + 1)
+        return None
+
+    def locate_quote_in_page(self, anchor: QuoteAnchor) -> None:
+        """Scroll the active page to a quote captured from it earlier.
+
+        Relocation is done by the anchor's own text rather than by a stored
+        offset, so it still works after the page has changed. Qt's find-in-page
+        does the highlighting, which keeps this to one code path.
+        """
+        browser = self.current_browser()
+        if browser is None:
+            return
+        needle = anchor.exact.strip()
+        if not needle:
+            self.set_status("That quote is empty.")
+            return
+        # findText matches a contiguous run; a long quote spanning re-wrapped
+        # markup will not match, so search its opening clause instead.
+        if len(needle) > 120:
+            needle = needle[:120].rsplit(" ", 1)[0] or needle[:120]
+        self.find_bar.setText(needle)
+        if not self.find_bar.isVisible():
+            self.toggle_find_bar()
+        self.find_in_page()
+        self.set_status(f"Locating: {needle[:60]}...")
+
     def summarize_page_offline(self) -> None:
         """Summarize the active page entirely on-device — no key, no network."""
         browser = self.current_browser()
@@ -4663,6 +4766,18 @@ p {{ margin: 0 0 20px; }}
                 source_private=source_private,
                 heading="On-Device Page Summary",
                 note_kind="local-summary",
+                # Each bullet carries the offset it was lifted from, so it can
+                # be anchored and found again even after the page changes.
+                anchors=[
+                    anchor
+                    for anchor in (
+                        build_anchor(
+                            summary.source_text, bullet.offset, len(bullet.text)
+                        )
+                        for bullet in summary.bullets
+                    )
+                    if anchor is not None
+                ],
             )
 
         self.extract_readable_page(browser, show)
@@ -4904,6 +5019,7 @@ p {{ margin: 0 0 20px; }}
         source_private: bool = False,
         heading: str = "Cited Page Summary",
         note_kind: str = "ai-summary",
+        anchors: list[QuoteAnchor] | None = None,
     ) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle(heading)
@@ -4917,6 +5033,23 @@ p {{ margin: 0 0 20px; }}
         note_button = QPushButton("Save as Note")
         close_button = QPushButton("Close")
         copy_button.clicked.connect(lambda: QApplication.clipboard().setText(text))
+
+        if anchors:
+            locate_button = QPushButton("Find in Page")
+            locate_button.setToolTip(
+                "Put the cursor on a quoted line, then find it in the page."
+            )
+
+            def locate() -> None:
+                anchor = self._anchor_under_cursor(text, output, anchors)
+                if anchor is None:
+                    self.set_status("Put the cursor on a quoted line first.")
+                    return
+                dialog.accept()
+                self.locate_quote_in_page(anchor)
+
+            locate_button.clicked.connect(locate)
+            buttons.addWidget(locate_button)
 
         can_save = self.research_source_is_persistable(
             source_url,
@@ -4962,7 +5095,12 @@ p {{ margin: 0 0 20px; }}
         # sr.UnknownValueError and sr.RequestError.
         sr = optional_deps.load("speech_recognition")
         if sr is None:
-            QMessageBox.critical(self, "Voice Command", "Install SpeechRecognition and PyAudio to use voice commands.")
+            QMessageBox.critical(
+                self,
+                "Voice Command",
+                optional_deps.install_hint("speech_recognition")
+                + " PyAudio is also required for microphone input.",
+            )
             return
         if self.voice_recognizer is None:
             self.voice_recognizer = sr.Recognizer()
@@ -5529,18 +5667,35 @@ p {{ margin: 0 0 20px; }}
         if changed:
             self.save_settings()
 
+    def _remember_permission(
+        self, origin: QUrl, feature_name: str, allowed: bool
+    ) -> None:
+        """Persist a decision. Only ever called once it has been applied."""
+        key = self._permission_key(origin)
+        self.site_permissions.setdefault(key, {})[feature_name] = allowed
+        self.save_settings()
+
     def _decide_permission(
         self,
         origin: QUrl,
         feature_name: str,
         *,
         remember: bool,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
+        """Return ``(allowed, is_new_decision)``.
+
+        This deliberately does NOT persist. Writing the grant here meant a
+        failure anywhere afterwards — including inside save_settings, which
+        walks live views and can raise while this modal pumps events — left an
+        "Allow" on disk for a request that was actually denied, so the next
+        request was granted silently with no prompt. The caller records the
+        decision only after Qt has accepted it.
+        """
         key = self._permission_key(origin)
         if remember:
             stored = self.site_permissions.get(key, {})
             if feature_name in stored:
-                return stored[feature_name]
+                return stored[feature_name], False
         label = feature_name.replace("MediaAudioVideoCapture", "camera and microphone")
         label = label.replace("MediaAudioCapture", "microphone").replace("MediaVideoCapture", "camera")
         label = label.replace("DesktopAudioVideoCapture", "screen and audio capture")
@@ -5558,10 +5713,7 @@ p {{ margin: 0 0 20px; }}
             QMessageBox.StandardButton.No,
         )
         allowed = answer == QMessageBox.StandardButton.Yes
-        if remember:
-            self.site_permissions.setdefault(key, {})[feature_name] = allowed
-            self.save_settings()
-        return allowed
+        return allowed, bool(remember)
 
     @staticmethod
     def _permission_should_remember(private: bool, persistent: bool) -> bool:
@@ -5595,12 +5747,13 @@ p {{ margin: 0 0 20px; }}
         try:
             permission_type = permission.permissionType()
             feature_name = getattr(permission_type, "name", str(permission_type))
+            origin = permission.origin()
             remember = self._permission_should_remember(
                 self._page_is_private(page),
                 self._permission_is_persistent(permission_type),
             )
-            allowed = self._decide_permission(
-                permission.origin(), feature_name, remember=remember
+            allowed, is_new_decision = self._decide_permission(
+                origin, feature_name, remember=remember
             )
         except Exception as exc:
             # Never leave the page's permission promise unsettled: an
@@ -5615,14 +5768,23 @@ p {{ margin: 0 0 20px; }}
         try:
             permission.grant() if allowed else permission.deny()
         except Exception as exc:
+            # The decision was never applied, so it must not be recorded as if
+            # it had been.
             self.set_status(f"Permission decision could not be applied: {exc}")
+            return
+        if is_new_decision:
+            try:
+                self._remember_permission(origin, feature_name, allowed)
+            except Exception as exc:
+                self.set_status(f"Permission applied but could not be saved: {exc}")
 
     def handle_feature_permission(self, page: QWebEnginePage, origin: QUrl, feature: Any) -> None:
         """Legacy per-feature permission API (Qt < 6.8)."""
         feature_name = getattr(feature, "name", str(feature))
+        allowed, _ = self._decide_permission(origin, feature_name, remember=False)
         policy = (
             QWebEnginePage.PermissionPolicy.PermissionGrantedByUser
-            if self._decide_permission(origin, feature_name, remember=False)
+            if allowed
             else QWebEnginePage.PermissionPolicy.PermissionDeniedByUser
         )
         page.setFeaturePermission(origin, feature, policy)
@@ -7114,9 +7276,7 @@ p {{ margin: 0 0 20px; }}
 
     def remove_history_entry(self, item: QListWidgetItem) -> None:
         url = str(item.data(Qt.ItemDataRole.UserRole) or item.text())
-        row = self.history_sidebar.row(item)
-        if row >= 0:
-            self.history_sidebar.takeItem(row)
+        self._drop_history_item(url)
         entry = self._history_index.pop(url, None)
         if entry is not None and entry in self.history:
             self.history.remove(entry)
@@ -7126,7 +7286,9 @@ p {{ margin: 0 0 20px; }}
 
     def manage_passwords(self) -> None:
         if not self.password_manager.available():
-            QMessageBox.critical(self, "Passwords", "Install cryptography to use the password manager.")
+            QMessageBox.critical(
+                self, "Passwords", optional_deps.install_hint("cryptography.fernet")
+            )
             return
         browser = self.current_browser()
         if not browser:

@@ -2,11 +2,53 @@ from __future__ import annotations
 
 import unittest
 
+from octobrowse import public_suffix as psl
 from octobrowse.public_suffix import (
+    is_public_suffix,
     public_suffix,
     registrable_domain,
     same_site,
 )
+
+
+class RulesetInvariantTests(unittest.TestCase):
+    """Structural checks on the committed subset itself.
+
+    Both data errors found after the first release — `sch.uk` shipped as a
+    plain rule instead of `*.sch.uk`, and seven `!city.<city>.jp` exceptions
+    shipped without their `*.<city>.jp` wildcards — are caught here.
+    """
+
+    def test_every_exception_has_its_parent_wildcard(self) -> None:
+        for rule in sorted(psl._EXCEPTIONS):
+            parent = rule.split(".", 1)[1]
+            with self.subTest(rule=rule):
+                self.assertIn(
+                    parent,
+                    psl._WILDCARD,
+                    f"!{rule} carves a hole in *.{parent}, which is not shipped",
+                )
+
+    def test_no_rule_appears_in_two_categories(self) -> None:
+        self.assertEqual(psl._NORMAL_RULES & psl._WILDCARD, frozenset())
+        self.assertEqual(psl._NORMAL_RULES & psl._EXCEPTIONS, frozenset())
+
+    def test_rules_are_lowercase_and_unanchored(self) -> None:
+        for group in (psl._NORMAL_RULES, psl._WILDCARD, psl._EXCEPTIONS):
+            for rule in sorted(group):
+                with self.subTest(rule=rule):
+                    self.assertEqual(rule, rule.lower())
+                    self.assertNotIn("*", rule)
+                    self.assertNotIn("!", rule)
+                    self.assertFalse(rule.startswith("."))
+                    self.assertFalse(rule.endswith("."))
+
+    def test_max_rule_labels_covers_every_rule(self) -> None:
+        for rule in sorted(psl._NORMAL_RULES | psl._EXCEPTIONS):
+            self.assertLessEqual(rule.count(".") + 1, psl._MAX_RULE_LABELS)
+        for rule in sorted(psl._WILDCARD):
+            # A wildcard consumes one label beyond its own.
+            self.assertLessEqual(rule.count(".") + 2, psl._MAX_RULE_LABELS)
 
 
 class PublicSuffixTests(unittest.TestCase):
@@ -45,6 +87,47 @@ class PublicSuffixTests(unittest.TestCase):
         # "!www.ck" makes www.ck registrable despite the "*.ck" wildcard.
         self.assertEqual(public_suffix("www.ck"), "ck")
         self.assertEqual(registrable_domain("www.ck"), "www.ck")
+
+    def test_uk_schools_are_separate_sites(self) -> None:
+        """The PSL entry is *.sch.uk, not sch.uk."""
+        self.assertEqual(public_suffix("brookfield.leics.sch.uk"), "leics.sch.uk")
+        self.assertEqual(
+            registrable_domain("stmarys.leics.sch.uk"), "stmarys.leics.sch.uk"
+        )
+        self.assertFalse(
+            same_site("brookfield.leics.sch.uk", "stmarys.leics.sch.uk")
+        )
+
+    def test_japanese_city_wildcards_and_their_exceptions(self) -> None:
+        # *.kawasaki.jp makes every org under it its own site...
+        self.assertEqual(public_suffix("acme.kawasaki.jp"), "acme.kawasaki.jp")
+        self.assertEqual(
+            registrable_domain("www.acme.kawasaki.jp"), "www.acme.kawasaki.jp"
+        )
+        self.assertFalse(same_site("a.acme.kawasaki.jp", "b.other.kawasaki.jp"))
+        # ...while !city.kawasaki.jp carves the city itself back out.
+        self.assertEqual(registrable_domain("city.kawasaki.jp"), "city.kawasaki.jp")
+        self.assertTrue(same_site("www.city.kawasaki.jp", "city.kawasaki.jp"))
+
+    def test_ports_and_bracketed_ipv6_are_stripped(self) -> None:
+        self.assertEqual(registrable_domain("example.com:8080"), "example.com")
+        self.assertEqual(registrable_domain("www.example.com:443"), "example.com")
+        self.assertEqual(registrable_domain("localhost:3000"), "localhost")
+        self.assertEqual(registrable_domain("[::1]"), "::1")
+        self.assertEqual(registrable_domain("[::1]:8080"), "::1")
+        self.assertTrue(same_site("example.com:8080", "example.com"))
+
+    def test_is_public_suffix(self) -> None:
+        for host in ("github.io", "co.uk", "s3.amazonaws.com", "leics.sch.uk"):
+            with self.subTest(host=host):
+                self.assertTrue(is_public_suffix(host))
+        for host in ("user.github.io", "example.co.uk", "localhost", "192.168.1.1"):
+            with self.subTest(host=host):
+                self.assertFalse(is_public_suffix(host))
+        # A wildcard rule needs a label in front of it: "*.sch.uk" does not
+        # match the bare "sch.uk", which falls to the default rule and is
+        # therefore registrable. This mirrors the real list.
+        self.assertFalse(is_public_suffix("sch.uk"))
 
     def test_unknown_suffix_falls_back_to_the_default_rule(self) -> None:
         self.assertEqual(public_suffix("example.invalidtld"), "invalidtld")

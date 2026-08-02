@@ -173,3 +173,91 @@ class SettingsStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PasswordManagerTests(unittest.TestCase):
+    """PasswordManager builds its cipher lazily; that must stay safe."""
+
+    def test_available_reflects_a_constructed_cipher(self) -> None:
+        from main import PasswordManager
+
+        manager = PasswordManager()
+        self.assertEqual(manager.available(), manager.cipher is not None)
+
+    def test_available_is_false_when_the_backend_cannot_load(self) -> None:
+        """cryptography commonly resolves and then fails to import its Rust
+        backend on Windows. The dialog must not open on a cipher that can
+        never be built."""
+        from main import PasswordManager
+        from octobrowse import optional_deps
+
+        manager = PasswordManager()
+        original = optional_deps.load
+        optional_deps.load = lambda name: (  # type: ignore[assignment]
+            None if name == "cryptography.fernet" else original(name)
+        )
+        try:
+            self.assertFalse(manager.available())
+            with self.assertRaises(RuntimeError):
+                manager.encrypt("hunter2")
+        finally:
+            optional_deps.load = original  # type: ignore[assignment]
+
+    def test_concurrent_first_use_never_discards_a_key(self) -> None:
+        """Regression: the lazy property was a check-then-act race. Two
+        threads could each generate a key and the second assignment discarded
+        the first, making anything encrypted with the lost key undecryptable."""
+        import sys
+        import threading
+
+        from main import PasswordManager
+
+        if PasswordManager().cipher is None:
+            self.skipTest("cryptography is not installed")
+
+        original_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-9)
+        try:
+            failures = 0
+            for _ in range(200):
+                manager = PasswordManager()
+                start = threading.Barrier(2)
+                errors: list[BaseException] = []
+
+                def toucher(
+                    manager: object = manager,
+                    start: threading.Barrier = start,
+                    errors: list = errors,
+                ) -> None:
+                    try:
+                        start.wait()
+                        manager.cipher  # noqa: B018 - forces construction
+                    except BaseException as exc:  # pragma: no cover
+                        errors.append(exc)
+
+                def saver(
+                    manager: object = manager,
+                    start: threading.Barrier = start,
+                    errors: list = errors,
+                ) -> None:
+                    try:
+                        start.wait()
+                        manager.save_password("https://x.test", "hunter2")
+                    except BaseException as exc:  # pragma: no cover
+                        errors.append(exc)
+
+                threads = [
+                    threading.Thread(target=toucher),
+                    threading.Thread(target=saver),
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+                self.assertEqual(errors, [])
+                if manager.get_password("https://x.test") != "hunter2":
+                    failures += 1
+            self.assertEqual(failures, 0, f"{failures}/200 trials lost the key")
+        finally:
+            sys.setswitchinterval(original_interval)

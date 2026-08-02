@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from collections.abc import Iterable
 from typing import Any
 
-from .public_suffix import registrable_domain
+from .public_suffix import is_public_suffix, registrable_domain
 
 
 RESOURCE_OPTIONS = {
@@ -94,19 +94,37 @@ def _site_key(host: str) -> str:
     return registrable_domain(host) or host
 
 
+def _is_owned_ancestor(descendant: str, ancestor: str) -> bool:
+    """Whether ``ancestor`` is a real parent site of ``descendant``.
+
+    A DNS ancestor is only the *same site* when somebody actually owns it.
+    ``neocities.org`` is a DNS ancestor of ``evil.neocities.org`` but it is a
+    public suffix, so the two belong to different publishers and must stay
+    cross-site — otherwise a document served at the apex of a shared host is
+    first-party with every user's subdomain on the platform.
+    """
+    return descendant.endswith("." + ancestor) and not is_public_suffix(ancestor)
+
+
 def is_third_party_request(request_host: str, first_party_host: str) -> bool | None:
-    """Return whether two hosts are cross-site, or ``None`` without an origin."""
+    """Return whether two hosts are cross-site, or ``None`` without a request.
+
+    An unknown first party (``about:blank``, ``file://``, ``data:`` — all of
+    which yield an empty ``QUrl.host()``) is reported as third-party rather
+    than unknown. Returning ``None`` made both ``$third-party`` and
+    ``$~third-party`` rules non-matching, so the blocker failed open on exactly
+    those documents; a blocker should fail toward blocking.
+    """
     request_host = request_host.lower().strip(".")
     first_party_host = first_party_host.lower().strip(".")
-    if not request_host or not first_party_host:
+    if not request_host:
         return None
-    # A host and its own ancestor stay first-party even when that ancestor is
-    # itself a public suffix. Only *sibling* subdomains under a shared suffix
-    # — a.github.io versus b.github.io — are genuinely cross-site.
-    if (
-        request_host == first_party_host
-        or request_host.endswith("." + first_party_host)
-        or first_party_host.endswith("." + request_host)
+    if not first_party_host:
+        return True
+    if request_host == first_party_host:
+        return False
+    if _is_owned_ancestor(request_host, first_party_host) or _is_owned_ancestor(
+        first_party_host, request_host
     ):
         return False
     return _site_key(request_host) != _site_key(first_party_host)

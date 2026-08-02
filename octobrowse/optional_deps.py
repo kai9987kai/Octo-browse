@@ -27,7 +27,7 @@ import sys
 from types import ModuleType
 
 
-__all__ = ["available", "load", "reset_cache"]
+__all__ = ["available", "install_hint", "load", "reset_cache"]
 
 
 #: Dependencies deferred by this module, mapped to the pip distribution that
@@ -62,10 +62,23 @@ def load(name: str) -> ModuleType | None:
 
 
 def available(name: str) -> bool:
-    """Whether ``name`` can be imported, without importing it when avoidable.
+    """Whether ``name`` can be imported.
 
-    Under a frozen build ``find_spec`` cannot be trusted, so this falls back to
-    a real (cached) load there.
+    Normally this resolves the module spec without executing anything. Two
+    caveats, both of which callers on the UI thread must respect:
+
+    * Under a frozen build ``find_spec`` cannot be trusted, so this falls back
+      to a real (cached) load — which is a full, blocking import. Do not call
+      this from a Qt slot to gate a feature whose worker would load the module
+      anyway; let the worker report the failure instead.
+    * Resolving a dotted name imports the *parent* package, so a package whose
+      ``__init__`` raises is caught here rather than escaping into a Qt slot.
+      This mirrors load()'s deliberately broad handler; the two must agree.
+
+    Note that a true answer means "importable", not "usable" — a package can
+    resolve and still fail at runtime (cryptography with a broken ``_rust``
+    backend is the common Windows case). Gate on the constructed object when
+    usability is what matters.
     """
 
     if name in sys.modules:
@@ -74,8 +87,19 @@ def available(name: str) -> bool:
         return load(name) is not None
     try:
         return importlib.util.find_spec(name) is not None
-    except (ImportError, ValueError):
+    except Exception:
         return False
+
+
+def install_hint(name: str) -> str:
+    """Return a 'pip install X' hint for a deferred dependency.
+
+    Sourced from OPTIONAL_DISTRIBUTIONS so the advice cannot drift away from
+    the module names this package actually loads.
+    """
+
+    distribution = OPTIONAL_DISTRIBUTIONS.get(name, name)
+    return f"Install the {distribution} package (pip install {distribution})."
 
 
 def reset_cache() -> None:

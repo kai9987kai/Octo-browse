@@ -294,6 +294,11 @@ a secure vault on that system.
   summarization returning verbatim sentences with source offsets.
 - `octobrowse/optional_deps.py`: deferred loading for the heavy optional
   dependencies, keeping them off the cold-start path.
+- `octobrowse/quote_anchor.py`: W3C-style relocatable quote anchors — exact
+  text plus surrounding context, so a saved quote is still findable after the
+  page changes, and reports failure rather than guessing when it is gone.
+- `octobrowse/frecency.py`: bucketed visit-count/recency ranking for address
+  suggestions, with a stable tie-break.
 - `octobrowse/ai_context.py`: source chunking, deterministic relevance
   selection, bounded broad-page sampling, citations, and untrusted-content
   prompt boundaries.
