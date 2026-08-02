@@ -104,6 +104,29 @@ quote was taken — use a verified snapshot for that.
 Native extension execution remains disabled. Python plugins remain trusted
 local automation, off by default behind Developer Mode.
 
+## Windows artifacts
+
+Built with PyInstaller 6.20 on Python 3.13.14, target `win-amd64:64`. Both
+binaries pass the frozen-app smoke test.
+
+| Artifact | Size | SHA-256 |
+| --- | --- | --- |
+| `OctoBrowse-3.6-Setup.exe` (installer, per-user) | 136 MB | `7D153CF75A61CF5216F0277A0433B2E1D74F3A16D473BC813DBD02DE6DA74E9D` |
+| `OctoBrowse-3.6.exe` (portable, single file) | 188 MB | `1C38176759E1E69C901A0ED2A318C00E8B0008A3471519D93850CB643FC89BA7` |
+
+Verify a download before running it:
+
+```powershell
+Get-FileHash .\OctoBrowse-3.6-Setup.exe -Algorithm SHA256
+```
+
+Both artifacts are **unsigned** — Windows SmartScreen will warn on first run
+until a code-signing certificate is added to the packaging process.
+
+`release/SHA256SUMS.txt` and `release/build-manifest.json` carry the same
+values alongside the build's Python version, file counts, and Authenticode
+status.
+
 ## For source users
 
 OctoBrowse 3.6 requires Python 3.10+ and PyQt6/PyQt6-WebEngine 6.8 or newer.
