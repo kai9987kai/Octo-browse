@@ -43,6 +43,8 @@ CONTEXT_CHARS = 48
 #: paragraph is not more identifying than its first sentence, and storing it
 #: twice bloats every note.
 MAX_EXACT_CHARS = 512
+# Stored research selections can be longer than the default summary anchor.
+MAX_STORED_EXACT_CHARS = 8_000
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -72,16 +74,16 @@ class QuoteAnchor:
         if not isinstance(data, dict):
             return None
         exact = data.get("exact")
-        if not isinstance(exact, str) or not exact.strip():
+        if not isinstance(exact, str) or not exact.strip() or len(exact) > MAX_STORED_EXACT_CHARS:
             return None
         prefix = data.get("prefix")
         suffix = data.get("suffix")
         hint = data.get("offset_hint")
         return cls(
             exact=exact,
-            prefix=prefix if isinstance(prefix, str) else "",
-            suffix=suffix if isinstance(suffix, str) else "",
-            offset_hint=hint if isinstance(hint, int) and hint >= 0 else -1,
+            prefix=prefix[-CONTEXT_CHARS:] if isinstance(prefix, str) else "",
+            suffix=suffix[:CONTEXT_CHARS] if isinstance(suffix, str) else "",
+            offset_hint=hint if type(hint) is int and 0 <= hint <= 120_000 else -1,
         )
 
 

@@ -47,11 +47,13 @@ from octobrowse.extensions import (
     inspect_extension_source,
 )
 from octobrowse.blockstats import BlockStats
+from octobrowse.evidence import capture_quote_anchor, check_quote, same_source_url
 from octobrowse.library_index import LibraryIndex
 from octobrowse.local_summary import LocalSummary, summarize
 from octobrowse.quote_anchor import QuoteAnchor, build_anchor
 from octobrowse import optional_deps
 from octobrowse.research import (
+    MAX_NOTE_QUOTE_CHARS,
     make_research_note,
     normalize_research_notes,
     research_note_to_markdown,
@@ -2041,6 +2043,10 @@ class OctoBrowse(QMainWindow):
             "Ctrl+Alt+N",
         )
         self._add_menu_action(data_menu, "Add Task", "Add a todo item", self.add_todo_item)
+        self._add_menu_action(
+            data_menu, "Check Saved Quotes", "Recheck saved quotations against this page",
+            self.check_saved_quotes,
+        )
         self._add_menu_action(data_menu, "Research Workspaces", "Save, restore, and export tab workspaces", self.open_workspace_manager)
         self._add_menu_action(data_menu, "Save Tabs as Workspace", "Capture ordinary tabs", self.save_current_workspace)
         self._add_menu_action(data_menu, "Downloads", "Show download panel", lambda: self.toggle_panel(self.downloads_sidebar))
@@ -2327,6 +2333,7 @@ class OctoBrowse(QMainWindow):
             BrowserCommand("Show bookmarks", "panel", self.toggle_bookmarks),
             BrowserCommand("Show history", "panel", lambda: self.toggle_panel(self.history_sidebar)),
             BrowserCommand("Show notes", "panel", lambda: self.toggle_panel(self.notes_sidebar)),
+            BrowserCommand("Check saved quotes", "research evidence source text presence", self.check_saved_quotes),
             BrowserCommand("Show todos", "panel", lambda: self.toggle_panel(self.todo_sidebar)),
             BrowserCommand("Show news", "panel", lambda: self.toggle_panel(self.news_sidebar)),
             BrowserCommand("Show downloads", "panel Ctrl+J", lambda: self.toggle_panel(self.downloads_sidebar)),
@@ -3275,6 +3282,7 @@ code, pre {{
             self.request_interceptor.filter_rules = None
             if self.private_request_interceptor is not None:
                 self.private_request_interceptor.filter_rules = None
+            self.refresh_cosmetic_filters()
             return
         worker = FilterParseWorker(texts, self)
         worker.parsed.connect(self.handle_filter_rules_parsed)
@@ -3292,6 +3300,7 @@ code, pre {{
         self.request_interceptor.filter_rules = rules
         if self.private_request_interceptor is not None:
             self.private_request_interceptor.filter_rules = rules
+        self.refresh_cosmetic_filters()
         self.set_status(
             f"Filter lists loaded: {rules.rule_count} rules "
             f"({len(rules.blocked_domains)} domains, {rules.skipped_count} unsupported skipped)"
@@ -4263,6 +4272,7 @@ p {{ margin: 0 0 20px; }}
         self._history_items.clear()
         self.history_sidebar.clear()
         self.history_db.clear()
+        self.rebuild_library_index()
         self.refresh_address_suggestions()
         QMessageBox.information(self, "History Cleared", "Browsing history has been cleared.")
 
@@ -4283,6 +4293,7 @@ p {{ margin: 0 0 20px; }}
         self._history_items.clear()
         self.history_sidebar.clear()
         self.history_db.clear()
+        self.rebuild_library_index()
         profiles = [self.profile]
         if self.private_profile is not None:
             profiles.append(self.private_profile)
@@ -4366,30 +4377,36 @@ p {{ margin: 0 0 20px; }}
 
     def inject_cosmetic_filters(self, browser: QWebEngineView) -> None:
         """Apply element-hiding rules from loaded filter lists to the page."""
-        if not self.ad_block_enabled:
-            return
         rules = self.request_interceptor.filter_rules
-        if rules is None or (not rules.generic_selectors and not rules.domain_selectors):
-            return
         url = browser.url()
         if self.is_internal_url(url.toString()):
             return
-        css = rules.cosmetic_css_for(url.host().lower())
-        if not css:
-            return
+        css = rules.cosmetic_css_for(url.host().lower()) if self.ad_block_enabled and rules else ""
         script = f"""
 (() => {{
   const id = "octo-cosmetic-style";
   let style = document.getElementById(id);
+  const css = {json.dumps(css)};
+  if (!css) {{
+    if (style) style.remove();
+    return;
+  }}
   if (!style) {{
     style = document.createElement("style");
     style.id = id;
     (document.head || document.documentElement).appendChild(style);
   }}
-  style.textContent = {json.dumps(css)};
+  style.textContent = css;
 }})();
 """
-        browser.page().runJavaScript(script)
+        browser.page().runJavaScript(script, QWebEngineScript.ScriptWorldId.ApplicationWorld.value)
+
+    def refresh_cosmetic_filters(self) -> None:
+        """Apply subscription changes and exceptions to already loaded tabs."""
+        for index in range(self.tabs.count()):
+            browser = self.tabs.widget(index)
+            if isinstance(browser, QWebEngineView):
+                self.inject_cosmetic_filters(browser)
 
     def toggle_dark_mode(self) -> None:
         self.set_theme("default" if self.dark_mode else "dark")
@@ -4617,6 +4634,7 @@ p {{ margin: 0 0 20px; }}
     def toggle_ad_block(self) -> None:
         self.ad_block_enabled = not self.ad_block_enabled
         self.apply_privacy_settings()
+        self.refresh_cosmetic_filters()
         status = "enabled" if self.ad_block_enabled else "disabled"
         self.update_status_badges()
         self.save_settings()
@@ -4701,7 +4719,9 @@ p {{ margin: 0 0 20px; }}
     ) -> QuoteAnchor | None:
         """Return the anchor whose quote contains the text cursor, if any."""
         try:
-            position = output.textCursor().position()
+            # QTextCursor counts UTF-16 code units; Python indexes code points.
+            units = output.textCursor().position()
+            position = len(rendered.encode("utf-16-le")[:units * 2].decode("utf-16-le", errors="ignore"))
         except Exception:
             return None
         for anchor in anchors:
@@ -4712,29 +4732,103 @@ p {{ margin: 0 0 20px; }}
                 start = rendered.find(anchor.exact, start + 1)
         return None
 
-    def locate_quote_in_page(self, anchor: QuoteAnchor) -> None:
-        """Scroll the active page to a quote captured from it earlier.
-
-        Relocation is done by the anchor's own text rather than by a stored
-        offset, so it still works after the page has changed. Qt's find-in-page
-        does the highlighting, which keeps this to one code path.
-        """
+    def locate_quote_in_page(
+        self, anchor: QuoteAnchor, source_url: str = "", *, source_private: bool = False,
+    ) -> None:
+        """Recheck the full quote in its source before offering text search."""
         browser = self.current_browser()
         if browser is None:
             return
-        needle = anchor.exact.strip()
-        if not needle:
-            self.set_status("That quote is empty.")
+        if (
+            bool(browser.property("private")) != source_private
+            or not same_source_url(browser.url().toString(), source_url)
+            or self.is_internal_url(source_url)
+        ):
+            self.set_status("Switch to the original source tab to check this quote.")
             return
-        # findText matches a contiguous run; a long quote spanning re-wrapped
-        # markup will not match, so search its opening clause instead.
-        if len(needle) > 120:
-            needle = needle[:120].rsplit(" ", 1)[0] or needle[:120]
-        self.find_bar.setText(needle)
-        if not self.find_bar.isVisible():
-            self.toggle_find_bar()
-        self.find_in_page()
-        self.set_status(f"Locating: {needle[:60]}...")
+
+        def show(readable: ReadablePage) -> None:
+            if self.current_browser() is browser:
+                self.show_quote_check_report(readable, [("Selected summary quote", anchor.exact, anchor)])
+
+        self.extract_readable_page(browser, show)
+
+    def check_saved_quotes(self, _checked: bool = False, *, note_id: str | None = None) -> None:
+        """Check saved evidence only against the currently loaded standard source."""
+        browser = self.current_browser()
+        if browser is None:
+            return
+        source_url = browser.url().toString()
+        if browser.property("private") or self.is_internal_url(source_url):
+            self.set_status("Open the saved source in a standard tab to check research notes.")
+            return
+        items: list[tuple[str, str, QuoteAnchor | None]] = []
+        for note in self.notes:
+            if note_id is not None and str(note.get("id")) != note_id:
+                continue
+            if not same_source_url(str(note.get("url", "")), source_url):
+                continue
+            title = str(note.get("title") or "Research note")
+            anchors = [
+                anchor for value in note.get("anchors", [])
+                if (anchor := QuoteAnchor.from_dict(value)) is not None
+            ]
+            quote = str(note.get("quote", ""))
+            if quote:
+                anchor = next((item for item in anchors if item.exact == quote), None)
+                items.append((title, quote, anchor))
+            else:
+                items.extend((title, anchor.exact, anchor) for anchor in anchors)
+        if not items:
+            QMessageBox.information(
+                self, "Quote Check",
+                "No saved quotes match this page. Open a note's source, then choose Data > Check Saved Quotes. "
+                "Page notes and older summaries without saved quotations cannot be checked.",
+            )
+            return
+        self.set_status("Checking saved quotes against this page's readable text...")
+
+        def show(readable: ReadablePage) -> None:
+            if self.current_browser() is browser:
+                self.show_quote_check_report(readable, items)
+
+        self.extract_readable_page(browser, show)
+
+    def show_quote_check_report(
+        self, readable: ReadablePage, items: list[tuple[str, str, QuoteAnchor | None]],
+    ) -> None:
+        """Display an ephemeral, document-bound text-presence report."""
+        lines = [
+            readable.title, readable.url,
+            f"Checked {time.strftime('%Y-%m-%d %H:%M:%S')} against {len(readable.text):,} extracted characters.",
+            "Text presence only: this does not establish factual accuracy or authenticate a source.",
+            "Missing text may have changed, be unloaded, or fall outside the readable extraction.", "",
+        ]
+        for index, (title, quote, anchor) in enumerate(items[:100], 1):
+            result = check_quote(readable.text, quote, anchor)
+            lines.extend([f"{index}. {title} — {result.status.upper()}", result.message, f"Saved quote: {quote}"])
+            if result.excerpt:
+                lines.append(f"Current context: {result.excerpt}")
+            lines.append("")
+        if len(items) > 100:
+            lines.append(f"Showing the first 100 of {len(items)} quotes. Open an individual note to check the rest.")
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Quote Check")
+        dialog.resize(800, 620)
+        layout = QVBoxLayout(dialog)
+        output = QPlainTextEdit("\n".join(lines))
+        output.setReadOnly(True)
+        layout.addWidget(output)
+        buttons = QHBoxLayout()
+        copy_button = QPushButton("Copy Report")
+        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(output.toPlainText()))
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        buttons.addWidget(copy_button)
+        buttons.addStretch(1)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        dialog.exec()
 
     def summarize_page_offline(self) -> None:
         """Summarize the active page entirely on-device — no key, no network."""
@@ -5035,9 +5129,9 @@ p {{ margin: 0 0 20px; }}
         copy_button.clicked.connect(lambda: QApplication.clipboard().setText(text))
 
         if anchors:
-            locate_button = QPushButton("Find in Page")
+            locate_button = QPushButton("Check Quote")
             locate_button.setToolTip(
-                "Put the cursor on a quoted line, then find it in the page."
+                "Put the cursor on a quoted line to check its full text and current context."
             )
 
             def locate() -> None:
@@ -5046,7 +5140,7 @@ p {{ margin: 0 0 20px; }}
                     self.set_status("Put the cursor on a quoted line first.")
                     return
                 dialog.accept()
-                self.locate_quote_in_page(anchor)
+                self.locate_quote_in_page(anchor, source_url, source_private=source_private)
 
             locate_button.clicked.connect(locate)
             buttons.addWidget(locate_button)
@@ -5069,6 +5163,7 @@ p {{ margin: 0 0 20px; }}
                 body=text,
                 kind=note_kind,
                 source_private=source_private,
+                anchors=[anchor.to_dict() for anchor in anchors] if anchors else None,
             )
             if saved is not None:
                 dialog.accept()
@@ -6887,6 +6982,7 @@ p {{ margin: 0 0 20px; }}
         kind: str = "page",
         source_private: bool = False,
         note_id: str | None = None,
+        anchors: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         """Central persistence path for manual, AI, and plugin research notes."""
         if not self.research_source_is_persistable(
@@ -6901,6 +6997,7 @@ p {{ margin: 0 0 20px; }}
                 body,
                 kind=kind,
                 note_id=note_id,
+                anchors=anchors,
             )
         except ValueError as exc:
             QMessageBox.information(self, "Research Notes", str(exc))
@@ -6926,6 +7023,7 @@ p {{ margin: 0 0 20px; }}
         self.notes = normalize_research_notes(self.notes)
         self.refresh_notes_sidebar(str(note["id"]))
         self.save_settings()
+        self.rebuild_library_index()
         self.set_status(status)
         return self.research_note_by_id(str(note["id"]))
 
@@ -6939,8 +7037,24 @@ p {{ margin: 0 0 20px; }}
         browser = self.current_browser()
         if not browser:
             return
-        quote = browser.page().selectedText().strip()
-        self.open_research_capture_dialog(browser, quote=quote)
+        quote = browser.page().selectedText().strip()[:MAX_NOTE_QUOTE_CHARS]
+        if not self.research_source_is_persistable(
+            browser.url().toString(), source_private=bool(browser.property("private")),
+        ):
+            return
+        if not quote:
+            self.open_research_capture_dialog(browser, quote="")
+            return
+
+        def capture(readable: ReadablePage) -> None:
+            if self.current_browser() is not browser:
+                return
+            anchor = capture_quote_anchor(readable.text, quote)
+            self.open_research_capture_dialog(
+                browser, quote=quote, anchors=[anchor.to_dict()] if anchor else None,
+            )
+
+        self.extract_readable_page(browser, capture)
 
     def open_research_capture_dialog(
         self,
@@ -6948,6 +7062,7 @@ p {{ margin: 0 0 20px; }}
         *,
         quote: str,
         existing_note: dict[str, Any] | None = None,
+        anchors: list[dict[str, Any]] | None = None,
     ) -> None:
         editing = existing_note is not None
         if editing:
@@ -6956,6 +7071,7 @@ p {{ margin: 0 0 20px; }}
             source_private = False
             quote = str(existing_note.get("quote", ""))
             body_text = str(existing_note.get("body", ""))
+            anchors = existing_note.get("anchors")
         else:
             if browser is None:
                 return
@@ -7008,6 +7124,7 @@ p {{ margin: 0 0 20px; }}
                 kind=str(existing_note.get("kind", "page")) if editing else "selection" if quote else "page",
                 source_private=source_private,
                 note_id=str(existing_note.get("id", "")) if editing else None,
+                anchors=anchors,
             )
             if saved is not None:
                 dialog.accept()
@@ -7053,6 +7170,9 @@ p {{ margin: 0 0 20px; }}
         layout.addWidget(content)
         buttons = QHBoxLayout()
         open_button = QPushButton("Open Source")
+        check_button = QPushButton("Check Quotes")
+        check_button.setEnabled(bool(source and (note.get("quote") or note.get("anchors"))))
+        check_button.setToolTip("Open the source in a standard tab, then check saved quotes against its current text.")
         edit_button = QPushButton("Edit")
         copy_button = QPushButton("Copy Markdown")
         delete_button = QPushButton("Delete")
@@ -7061,6 +7181,12 @@ p {{ margin: 0 0 20px; }}
         open_button.clicked.connect(
             lambda: self.add_tab(QUrl(source), "Research Source", private=False)
         )
+
+        def check_note() -> None:
+            dialog.accept()
+            self.check_saved_quotes(note_id=note_id)
+
+        check_button.clicked.connect(check_note)
 
         def edit_note() -> None:
             dialog.accept()
@@ -7081,6 +7207,7 @@ p {{ margin: 0 0 20px; }}
         close_button.clicked.connect(dialog.accept)
         for button in (
             open_button,
+            check_button,
             edit_button,
             copy_button,
             delete_button,

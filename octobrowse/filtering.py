@@ -8,6 +8,7 @@ third-party rules must never silently degrade into unconditional blocks.
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 from collections.abc import Iterable
 from typing import Any
@@ -130,6 +131,61 @@ def is_third_party_request(request_host: str, first_party_host: str) -> bool | N
     return _site_key(request_host) != _site_key(first_party_host)
 
 
+def _normalize_rule_domain(host: str) -> str:
+    """Canonicalize DNS names without accepting URL paths or wildcard scopes."""
+    try:
+        host = host.strip().lower().rstrip(".").encode("idna").decode("ascii")
+    except UnicodeError:
+        return ""
+    if len(host) > 253 or not all(
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        for label in host.split(".")
+    ):
+        return ""
+    return host
+
+
+@dataclass(frozen=True)
+class DomainScope:
+    """Document-domain restrictions; the closest matching domain wins."""
+
+    included: frozenset[str] = frozenset()
+    excluded: frozenset[str] = frozenset()
+
+    def matches(self, host: str) -> bool:
+        if not self.included and not self.excluded:
+            return True
+        host = _normalize_rule_domain(host)
+        while host:
+            if host in self.excluded:
+                return False
+            if host in self.included:
+                return True
+            host = host.partition(".")[2]
+        return not self.included
+
+    @classmethod
+    def parse(cls, text: str, separator: str) -> DomainScope | None:
+        included: set[str] = set()
+        excluded: set[str] = set()
+        for entry in text.split(separator):
+            entry = entry.strip()
+            negated = entry.startswith("~")
+            host = _normalize_rule_domain(entry[1:] if negated else entry)
+            if not host:
+                return None
+            (excluded if negated else included).add(host)
+        if included & excluded:
+            return None
+        return cls(frozenset(included), frozenset(excluded))
+
+
+@dataclass(frozen=True)
+class CosmeticRule:
+    selector: str
+    domains: DomainScope
+
+
 @dataclass(frozen=True)
 class NetworkRule:
     """Compiled network rule plus the ABP request constraints it carries."""
@@ -138,13 +194,23 @@ class NetworkRule:
     include_types: frozenset[str] = frozenset()
     exclude_types: frozenset[str] = frozenset()
     third_party: bool | None = None
+    domains: DomainScope = DomainScope()
 
-    def matches(self, url: str, resource_type: str, third_party: bool | None) -> bool:
+    def matches(
+        self,
+        url: str,
+        resource_type: str,
+        third_party: bool | None,
+        first_party_host: str = "",
+        document_host: str | None = None,
+    ) -> bool:
         if self.include_types and resource_type not in self.include_types:
             return False
         if resource_type in self.exclude_types:
             return False
         if self.third_party is not None and third_party is not self.third_party:
+            return False
+        if not self.domains.matches(first_party_host if document_host is None else document_host):
             return False
         return self.pattern.search(url) is not None
 
@@ -154,6 +220,7 @@ class FilterRuleSet:
 
     GENERIC_CAP = 200
     GENERIC_SELECTOR_CAP = 5000
+    CSS_CACHE_CAP = 128
     _CSS_CHUNK = 100
     _TOKEN_RE = re.compile(r"[a-z0-9]{4,}")
     _HOSTS_RE = re.compile(r"^(?:0\.0\.0\.0|127\.0\.0\.1)\s+([a-z0-9.-]+)$", re.IGNORECASE)
@@ -169,18 +236,26 @@ class FilterRuleSet:
         self.generic_exceptions: list[NetworkRule] = []
         self.generic_selectors: list[str] = []
         self.domain_selectors: dict[str, list[str]] = {}
+        self._scoped_selectors: dict[str, list[CosmeticRule]] = {}
+        self._cosmetic_exceptions: dict[str, list[CosmeticRule]] = {}
+        self._generic_scoped_count = 0
         self.rule_count = 0
         self.cosmetic_count = 0
         self.skipped_count = 0
-        self._generic_css: str | None = None
+        self._cosmetic_css_cache: OrderedDict[str, str] = OrderedDict()
 
     def parse_text(self, text: str) -> None:
+        # Filter subscriptions are parsed incrementally into the same rule set.
+        self._cosmetic_css_cache.clear()
         for raw_line in text.splitlines():
             line = raw_line.strip()
             if not line or line.startswith(("!", "[")):
                 continue
-            if "#@#" in line or "#?#" in line or "#$#" in line:
+            if "#?#" in line or "#$#" in line:
                 self.skipped_count += 1
+                continue
+            if "#@#" in line:
+                self._parse_cosmetic(line, exception=True)
                 continue
             if "##" in line:
                 self._parse_cosmetic(line)
@@ -216,8 +291,8 @@ class FilterRuleSet:
             if pattern is None:
                 self.skipped_count += 1
                 continue
-            include_types, exclude_types, third_party = constraints
-            rule = NetworkRule(pattern, include_types, exclude_types, third_party)
+            include_types, exclude_types, third_party, domains = constraints
+            rule = NetworkRule(pattern, include_types, exclude_types, third_party, domains)
             token = self._pick_token(body)
             if exception:
                 buckets, generic = self.exception_token_buckets, self.generic_exceptions
@@ -235,14 +310,25 @@ class FilterRuleSet:
     @classmethod
     def _parse_options(
         cls, options: str
-    ) -> tuple[frozenset[str], frozenset[str], bool | None] | None:
+    ) -> tuple[frozenset[str], frozenset[str], bool | None, DomainScope] | None:
         include_types: set[str] = set()
         exclude_types: set[str] = set()
         third_party: bool | None = None
+        domains = DomainScope()
+        has_domain_option = False
         if not options:
-            return frozenset(), frozenset(), None
+            return frozenset(), frozenset(), None, domains
         for raw_option in options.split(","):
             option = raw_option.strip().lower()
+            if option.startswith("domain="):
+                if has_domain_option:
+                    return None
+                scope = DomainScope.parse(option.partition("=")[2], "|")
+                if scope is None:
+                    return None
+                domains = scope
+                has_domain_option = True
+                continue
             negated = option.startswith("~")
             if negated:
                 option = option[1:]
@@ -259,35 +345,43 @@ class FilterRuleSet:
                 include_types.add(option)
         if include_types & exclude_types:
             return None
-        return frozenset(include_types), frozenset(exclude_types), third_party
+        return frozenset(include_types), frozenset(exclude_types), third_party, domains
 
-    def _parse_cosmetic(self, line: str) -> None:
-        domains_part, _, selector = line.partition("##")
+    def _parse_cosmetic(self, line: str, exception: bool = False) -> None:
+        domains_part, _, selector = line.partition("#@#" if exception else "##")
         selector = selector.strip()
         if not selector or "{" in selector or "}" in selector:
             self.skipped_count += 1
             return
         domains_part = domains_part.strip().lower()
-        if not domains_part:
-            if len(self.generic_selectors) < self.GENERIC_SELECTOR_CAP:
-                self.generic_selectors.append(selector)
-                self.cosmetic_count += 1
-            else:
-                self.skipped_count += 1
-            return
-        if "~" in domains_part:
+        scope = DomainScope.parse(domains_part, ",") if domains_part else DomainScope()
+        if scope is None:
             self.skipped_count += 1
             return
-        added = False
-        for domain in domains_part.split(","):
-            domain = domain.strip()
-            if domain:
-                self.domain_selectors.setdefault(domain, []).append(selector)
-                added = True
-        if added:
+        if exception:
+            rule = CosmeticRule(selector, scope)
+            for domain in sorted(scope.included) or [""]:
+                self._cosmetic_exceptions.setdefault(domain, []).append(rule)
             self.cosmetic_count += 1
-        else:
+            return
+        if not scope.included and len(self.generic_selectors) + self._generic_scoped_count >= self.GENERIC_SELECTOR_CAP:
             self.skipped_count += 1
+            return
+        if not domains_part:
+            self.generic_selectors.append(selector)
+            self.cosmetic_count += 1
+            return
+        if scope.excluded:
+            rule = CosmeticRule(selector, scope)
+            for domain in sorted(scope.included) or [""]:
+                self._scoped_selectors.setdefault(domain, []).append(rule)
+            if not scope.included:
+                self._generic_scoped_count += 1
+            self.cosmetic_count += 1
+            return
+        for domain in sorted(scope.included):
+            self.domain_selectors.setdefault(domain, []).append(selector)
+        self.cosmetic_count += 1
 
     @classmethod
     def _css_block(cls, selectors: list[str]) -> str:
@@ -297,16 +391,38 @@ class FilterRuleSet:
             blocks.append(", ".join(chunk) + " { display: none !important; }")
         return "\n".join(blocks)
 
+    def cosmetic_selectors_for(self, host: str) -> list[str]:
+        """Return active selectors after exact-selector exceptions and deduplication."""
+        host = _normalize_rule_domain(host)
+        parts = host.split(".") if host else []
+        suffixes = [".".join(parts[index:]) for index in range(len(parts))] + [""]
+        exceptions = {
+            rule.selector
+            for domain in suffixes
+            for rule in self._cosmetic_exceptions.get(domain, ())
+            if rule.domains.matches(host)
+        }
+        selectors = list(self.generic_selectors)
+        for domain in suffixes:
+            selectors.extend(self.domain_selectors.get(domain, ()))
+            selectors.extend(
+                rule.selector
+                for rule in self._scoped_selectors.get(domain, ())
+                if rule.domains.matches(host)
+            )
+        return list(dict.fromkeys(selector for selector in selectors if selector not in exceptions))
+
     def cosmetic_css_for(self, host: str) -> str:
-        if self._generic_css is None:
-            self._generic_css = self._css_block(self.generic_selectors)
-        site_selectors: list[str] = []
-        if host:
-            parts = host.lower().strip(".").split(".")
-            for index in range(len(parts)):
-                site_selectors.extend(self.domain_selectors.get(".".join(parts[index:]), ()))
-        site_css = self._css_block(site_selectors) if site_selectors else ""
-        return "\n".join(part for part in (site_css, self._generic_css) if part)
+        host = _normalize_rule_domain(host)
+        cached = self._cosmetic_css_cache.get(host)
+        if cached is not None:
+            self._cosmetic_css_cache.move_to_end(host)
+            return cached
+        css = self._css_block(self.cosmetic_selectors_for(host))
+        self._cosmetic_css_cache[host] = css
+        if len(self._cosmetic_css_cache) > self.CSS_CACHE_CAP:
+            self._cosmetic_css_cache.popitem(last=False)
+        return css
 
     @staticmethod
     def _compile_pattern(body: str) -> re.Pattern[str] | None:
@@ -367,12 +483,19 @@ class FilterRuleSet:
         host: str,
         resource_type: str = "other",
         first_party_host: str = "",
+        document_host: str | None = None,
     ) -> bool:
+        """Match exceptions, optionally scoping ``domain=`` to the requesting frame.
+
+        ABP domain restrictions refer to the loading document, including iframes:
+        https://help.adblockplus.org/adblock-plus-help-center/how-to-write-filters
+        Omitting ``document_host`` preserves the top-level-host API behavior.
+        """
         if domain_suffix_match(host, self.exception_domains) is not None:
             return True
         third_party = is_third_party_request(host, first_party_host)
         return any(
-            rule.matches(url_text, resource_type, third_party)
+            rule.matches(url_text, resource_type, third_party, first_party_host, document_host)
             for rule in self._matching_rules(
                 url_text, self.exception_token_buckets, self.generic_exceptions
             )
@@ -388,14 +511,15 @@ class FilterRuleSet:
         host: str,
         resource_type: str = "other",
         first_party_host: str = "",
+        document_host: str | None = None,
     ) -> bool:
-        if self.allows_request(url_text, host, resource_type, first_party_host):
+        """Match rules using the page for party checks and the document for scopes."""
+        if self.allows_request(url_text, host, resource_type, first_party_host, document_host):
             return False
         if domain_suffix_match(host, self.blocked_domains) is not None:
             return True
         third_party = is_third_party_request(host, first_party_host)
         return any(
-            rule.matches(url_text, resource_type, third_party)
+            rule.matches(url_text, resource_type, third_party, first_party_host, document_host)
             for rule in self._matching_rules(url_text, self.token_buckets, self.generic_patterns)
         )
-

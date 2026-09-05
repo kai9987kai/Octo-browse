@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from .quote_anchor import QuoteAnchor
+
 
 RESEARCH_NOTE_VERSION = 1
 MAX_RESEARCH_NOTES = 500
@@ -22,6 +24,7 @@ MAX_NOTE_QUOTE_CHARS = 8_000
 MAX_NOTE_BODY_CHARS = 12_000
 MAX_NOTE_CONTENT_CHARS = 16_000
 MAX_NOTE_KIND_CHARS = 32
+MAX_NOTE_ANCHORS = 12
 MAX_WORKSPACE_TABS = 50
 MAX_TIMESTAMP = 253_402_300_799.0
 
@@ -104,6 +107,7 @@ def _make_record(
     updated_at: float,
     note_id: Any,
     id_salt: str = "",
+    anchors: Any = None,
 ) -> dict[str, Any]:
     clean_url = _single_line(url, MAX_NOTE_URL_CHARS)
     clean_title = _single_line(title, MAX_NOTE_TITLE_CHARS)
@@ -125,7 +129,7 @@ def _make_record(
         created_at=created_at,
         salt=id_salt,
     )
-    return {
+    record = {
         "version": RESEARCH_NOTE_VERSION,
         "id": identifier,
         "url": clean_url,
@@ -136,6 +140,25 @@ def _make_record(
         "created_at": created_at,
         "updated_at": max(created_at, updated_at),
     }
+    # Optional v1 extension: legacy notes remain readable. Selectors are local
+    # text references, never evidence that the quoted statement is true.
+    clean_anchors: list[dict[str, Any]] = []
+    if isinstance(anchors, (list, tuple)):
+        quote_text = " ".join(clean_quote.split())
+        body_text = " ".join(clean_body.split())
+        seen: set[str] = set()
+        for value in anchors[:MAX_NOTE_ANCHORS]:
+            anchor = QuoteAnchor.from_dict(value)
+            if anchor is None:
+                continue
+            exact = " ".join(anchor.exact.split())
+            if exact in seen or not (exact == quote_text or exact in body_text):
+                continue
+            seen.add(exact)
+            clean_anchors.append(anchor.to_dict())
+    if clean_anchors:
+        record["anchors"] = clean_anchors
+    return record
 
 
 def make_research_note(
@@ -146,6 +169,8 @@ def make_research_note(
     kind: str = "page",
     now: float | None = None,
     note_id: str | None = None,
+    *,
+    anchors: Any = None,
 ) -> dict[str, Any]:
     """Create one bounded v1 research note."""
     timestamp = _requested_now(now)
@@ -158,6 +183,7 @@ def make_research_note(
         created_at=timestamp,
         updated_at=timestamp,
         note_id=note_id,
+        anchors=anchors,
     )
 
 
@@ -203,6 +229,7 @@ def normalize_research_notes(
                 updated_at=updated_at,
                 note_id=note_id,
                 id_salt=str(source_index),
+                anchors=value.get("anchors") if isinstance(value, Mapping) else None,
             )
         except ValueError:
             continue
