@@ -7,15 +7,13 @@ import faulthandler
 import tempfile
 import time
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 from PyQt6.QtCore import QStandardPaths, QTimer, QUrl
 from PyQt6.QtWidgets import QApplication, QDialog, QPlainTextEdit, QPushButton
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from main import OCTO_BROWSER_NAME, OCTO_BROWSER_VERSION, OctoBrowse, SettingsStore
+from main import OCTO_BROWSER_NAME, OCTO_BROWSER_VERSION, IsolatedSettingsStore, OctoBrowse
 from octobrowse.evidence import capture_quote_anchor
 from octobrowse.filtering import FilterRuleSet
 from octobrowse.readability import MAX_READABLE_CHARS, ReadablePage
@@ -33,13 +31,7 @@ def main() -> int:
     # A live test must not restore earlier test tabs, use the real credential
     # vault, or issue optional API requests using the user's saved keys.
     test_state = tempfile.TemporaryDirectory(prefix="octobrowse-live-", ignore_cleanup_errors=True)
-    store = SettingsStore.__new__(SettingsStore)
-    store.directory = Path(test_state.name)
-    store.path = store.directory / "settings.json"
-    store.legacy_path = store.directory / "legacy.json"
-    store.credentials = SimpleNamespace(get=lambda _name: "", set=lambda _name, _value: True)
-    with patch("main.SettingsStore", return_value=store):
-        browser = OctoBrowse()
+    browser = OctoBrowse(settings_store=IsolatedSettingsStore(test_state.name))
     try:
         return _run_checks(app, browser)
     finally:

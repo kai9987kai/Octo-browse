@@ -595,6 +595,37 @@ class SettingsStore:
         return normalize_research_notes(values)
 
 
+class _IsolatedCredentials(CredentialStore):
+    """Discard test secrets without touching the OS credential vault."""
+
+    def get(self, name: str) -> str:
+        return ""
+
+    def set(self, name: str, value: str) -> bool:
+        # Success prevents SettingsStore's plaintext compatibility fallback.
+        return True
+
+
+class IsolatedSettingsStore(SettingsStore):
+    """Temporary smoke-test state with no legacy, environment, or vault secrets."""
+
+    def __init__(self, directory: str | Path) -> None:
+        self.directory = Path(directory)
+        self.path = self.directory / "settings.json"
+        self.legacy_path = self.path
+        self.credentials = _IsolatedCredentials()
+
+    def _load_secret(
+        self,
+        data: dict[str, Any],
+        key: str,
+        environment_name: str,
+        *,
+        legacy_key: str | None = None,
+    ) -> str:
+        return ""
+
+
 class HistoryDatabase:
     """SQLite-backed browsing history (Firefox places-style schema).
 
@@ -1546,7 +1577,7 @@ class LibrarySearchDialog(QDialog):
 
 
 class OctoBrowse(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, *, settings_store: SettingsStore | None = None) -> None:
         super().__init__()
         self.shutting_down = False
         self.setWindowTitle(f"{OCTO_BROWSER_NAME} {OCTO_BROWSER_VERSION}")
@@ -1555,7 +1586,7 @@ class OctoBrowse(QMainWindow):
             self.setWindowIcon(QIcon(str(icon_path)))
         self.setGeometry(100, 100, 1200, 800)
 
-        self.store = SettingsStore()
+        self.store = settings_store if settings_store is not None else SettingsStore()
         (
             self.settings,
             legacy_history,
@@ -7592,13 +7623,30 @@ def main() -> int:
     icon_path = resource_path("assets/octobrowse.png")
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
-    browser = OctoBrowse()
-    browser.show()
-    if smoke_test:
-        # Exercise both profile constructors in the release smoke path.
-        browser.profile_for_tab(True)
-        QTimer.singleShot(3_000, browser.close)
-    return app.exec()
+    smoke_state = (
+        tempfile.TemporaryDirectory(prefix="octobrowse-smoke-", ignore_cleanup_errors=True)
+        if smoke_test else None
+    )
+    browser: OctoBrowse | None = None
+    try:
+        store = IsolatedSettingsStore(smoke_state.name) if smoke_state is not None else None
+        browser = OctoBrowse(settings_store=store)
+        browser.show()
+        if smoke_test:
+            # Exercise both profile constructors without opening the user's
+            # settings, credential vault, or optional cloud API integrations.
+            browser.profile_for_tab(True)
+            QTimer.singleShot(3_000, browser.close)
+        return app.exec()
+    finally:
+        if smoke_state is not None:
+            if browser is not None:
+                # The event loop returns after closeEvent has quiesced pages
+                # and closed databases. Destroy profiles before removing their
+                # temporary storage, which may otherwise remain locked on Windows.
+                browser.deleteLater()
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            smoke_state.cleanup()
 
 
 if __name__ == "__main__":

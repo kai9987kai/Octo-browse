@@ -26,6 +26,8 @@ The Windows build pipeline compiles and tests the source, builds the onedir
 application and standalone portable executable, creates an Inno Setup
 installer, checks embedded versions and Qt resources, and checks both frozen
 Python archives for the application modules, including the new evidence module.
+Release smoke tests use temporary settings and profiles, with credential-vault,
+environment-key, and legacy-settings access disabled.
 
 Artifact validation and startup smoke outcomes are recorded in
 `release/build-manifest.json`; `release/SHA256SUMS.txt` records artifact hashes.
