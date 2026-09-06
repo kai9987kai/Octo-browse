@@ -40,5 +40,16 @@ The portable file is `OctoBrowse-3.7.exe`; the per-user installer is
 reports a valid Authenticode signature. Existing installations use the same
 installer AppId for upgrades.
 
+Build completed 6 September 2026: 300 regression tests passed, all embedded
+version/module/resource checks passed, and native Windows startup/shutdown
+checks passed three times for the onedir application and once for the portable
+EXE. An earlier offscreen startup attempt timed out; that attempt is retained
+in the build manifest alongside the successful native Windows results.
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `OctoBrowse-3.7.exe` | 197646013 | `A97D552C2DB9E0B12BA888F200D365F67C70C1DEF36C4BA015D738861AA510FE` |
+| `OctoBrowse-3.7-Setup.exe` | 142631652 | `6A4CBED8ACB3C4BD055A09C52BA21B0EA6218085A39CE998E0D8C3EC49507B32` |
+
 See [research rationale and usage](docs/research-advance.md) for sources,
 limits, and regression coverage.
