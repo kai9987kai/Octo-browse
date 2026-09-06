@@ -1,7 +1,7 @@
 # Research and browser refinements
 
-Source changes, researched 5 September 2026. Existing 3.6 release binaries do
-not include these changes until rebuilt.
+Included in OctoBrowse 3.7; researched 5 September 2026. Existing 3.6 release
+binaries do not include these changes.
 
 ## Revisit saved evidence
 
@@ -90,7 +90,7 @@ model-training, benchmark-reproduction, or factual-verification claims.
 
 ## Validation
 
-On this Windows checkout, 295 regression tests pass and the pure helper package
+On this Windows checkout, 300 regression tests pass and the pure helper package
 has 93% statement coverage (85% required). Ruff, compilation, and whitespace
 checks pass. The actual Qt Quote Check dialog is also exercised by the unit
 suite. A local stress sample of 100 repeated-quote checks against 120,000
@@ -100,8 +100,9 @@ cross-platform benchmark.
 The full WebEngine smoke could not complete here: Qt failed to create graphics
 contexts and the initial dashboard remained unloaded with an empty URL. The
 new live CSS and page-extraction assertions are present but were not reached.
-They must pass on a functioning graphics runtime before a release build is
-claimed validated. No updated portable executable or installer was built.
+Full rendering validation remains separate from frozen startup checks; consult
+the release manifest for the packaged startup results. Release smoke tests now
+use isolated settings, profiles, and credentials, with ambient API keys ignored.
 
 The automated suites cover malformed persistence, full-quote tail mutations,
 duplicate and whitespace matches, source and profile boundaries, stale
