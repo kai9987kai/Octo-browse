@@ -3,28 +3,56 @@
 from __future__ import annotations
 
 import sys
+import faulthandler
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from PyQt6.QtCore import QStandardPaths, QTimer, QUrl
 from PyQt6.QtWidgets import QApplication, QDialog, QPlainTextEdit, QPushButton
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from main import OCTO_BROWSER_NAME, OCTO_BROWSER_VERSION, OctoBrowse
+from main import OCTO_BROWSER_NAME, OCTO_BROWSER_VERSION, OctoBrowse, SettingsStore
+from octobrowse.evidence import capture_quote_anchor
+from octobrowse.filtering import FilterRuleSet
 from octobrowse.readability import MAX_READABLE_CHARS, ReadablePage
 from octobrowse.snapshots import manifest_path_for_archive, verify_snapshot_bundle
 
 
 def main() -> int:
+    faulthandler.dump_traceback_later(45)
     QStandardPaths.setTestModeEnabled(True)
     app = QApplication(sys.argv)
     app.setApplicationName(OCTO_BROWSER_NAME)
     app.setApplicationDisplayName(OCTO_BROWSER_NAME)
     app.setApplicationVersion(OCTO_BROWSER_VERSION)
     app.setOrganizationName("OctoBrowse")
-    browser = OctoBrowse()
+    # A live test must not restore earlier test tabs, use the real credential
+    # vault, or issue optional API requests using the user's saved keys.
+    test_state = tempfile.TemporaryDirectory(prefix="octobrowse-live-", ignore_cleanup_errors=True)
+    store = SettingsStore.__new__(SettingsStore)
+    store.directory = Path(test_state.name)
+    store.path = store.directory / "settings.json"
+    store.legacy_path = store.directory / "legacy.json"
+    store.credentials = SimpleNamespace(get=lambda _name: "", set=lambda _name, _value: True)
+    with patch("main.SettingsStore", return_value=store):
+        browser = OctoBrowse()
+    try:
+        return _run_checks(app, browser)
+    finally:
+        # Failed assertions must also stop WebEngine and workers before Python
+        # tears down Qt, otherwise a failed smoke can leave a process running.
+        browser.close()
+        app.processEvents()
+        test_state.cleanup()
+        faulthandler.cancel_dump_traceback_later()
+
+
+def _run_checks(app: QApplication, browser: OctoBrowse) -> int:
+    print("Live smoke: window created", flush=True)
     state: dict[str, str] = {}
 
     def inspect_sample() -> None:
@@ -52,6 +80,7 @@ def main() -> int:
     browser.open_extension_inspector()
 
     report = state.get("report", "")
+    print("Live smoke: extension inspector complete", flush=True)
     expected = (
         "Permission review for OctoBrowse MV3 Hello 1.0.0",
         "Site access: none declared.",
@@ -76,10 +105,14 @@ def main() -> int:
             and dashboard.url().host() == "octobrowse.local"
         ):
             break
+        time.sleep(0.01)
     internal_url = QUrl("https://octobrowse.local/")
     if browser.security_badge.text() != "Octo":
         raise AssertionError(
-            "Generated dashboard did not retain app identity after its real load."
+            "Generated dashboard did not retain app identity after its real load: "
+            f"url={dashboard.url().toString()}, generated={dashboard.property('generated_page')}, "
+            f"loading={dashboard.property('loading')}, pending={dashboard.property('generated_navigation_pending')}, "
+            f"load_ok={dashboard.property('load_ok')}, badge={browser.security_badge.text()}"
         )
     dashboard.setProperty("generated_page", False)
     browser.update_security_badge(internal_url, dashboard)
@@ -99,6 +132,7 @@ def main() -> int:
     original_note_ids = {
         str(note.get("id", "")) for note in browser.notes
     }
+    print("Live smoke: dashboard and lifecycle complete", flush=True)
     note = browser.save_research_note(
         url="https://example.test/research",
         title="Live smoke research",
@@ -202,6 +236,105 @@ def main() -> int:
         raise AssertionError(
             f"Readable-page extraction chose an unexpected root: {readable.method}"
         )
+    print("Live smoke: article extraction complete", flush=True)
+
+    quote = "distinctive article evidence"
+    anchor = capture_quote_anchor(readable.text, quote)
+    if anchor is None:
+        raise AssertionError("Evidence capture did not produce a full quote anchor.")
+
+    def save_summary_note() -> None:
+        dialog = app.activeModalWidget()
+        if not isinstance(dialog, QDialog):
+            state["error"] = "Summary dialog did not open."
+            return
+        for button in dialog.findChildren(QPushButton):
+            if button.text() == "Save as Note":
+                button.click()
+                return
+        state["error"] = "Summary save button is missing."
+        dialog.reject()
+
+    QTimer.singleShot(100, save_summary_note)
+    browser.show_ai_summary(
+        f"Saved evidence: {quote}", readable.url, "Anchored smoke summary",
+        note_kind="local-summary", anchors=[anchor],
+    )
+    print("Live smoke: summary note saved", flush=True)
+    if state.get("error"):
+        raise AssertionError(state["error"])
+    stored_summary = next(note for note in browser.store.load()[3] if note["title"] == "Anchored smoke summary")
+    if stored_summary.get("anchors") != [anchor.to_dict()]:
+        raise AssertionError("Saving a summary dropped its quote anchors on disk.")
+    browser.save_research_note(
+        url=readable.url, title="Missing quote smoke", quote="This quotation was removed from the article.",
+    )
+    report_state: dict[str, str] = {}
+    report_deadline = time.monotonic() + 10
+
+    def inspect_quote_report() -> None:
+        dialog = app.activeModalWidget()
+        if isinstance(dialog, QDialog) and dialog.windowTitle() == "Quote Check":
+            output = dialog.findChild(QPlainTextEdit)
+            report_state["text"] = output.toPlainText() if output else ""
+            capture_path = Path(__file__).resolve().parents[1] / "build" / "qa" / "quote-check.png"
+            capture_path.parent.mkdir(parents=True, exist_ok=True)
+            dialog.grab().save(str(capture_path))
+            dialog.accept()
+        elif time.monotonic() < report_deadline:
+            QTimer.singleShot(20, inspect_quote_report)
+
+    QTimer.singleShot(20, inspect_quote_report)
+    browser.check_saved_quotes()
+    while time.monotonic() < report_deadline and "text" not in report_state:
+        app.processEvents()
+        time.sleep(0.01)
+    report_text = report_state.get("text", "")
+    print("Live smoke: quote report complete", flush=True)
+    if not all(expected in report_text for expected in ("EXACT", "MISSING", readable.url, "Text presence only")):
+        raise AssertionError(f"Quote report did not display correct outcomes: {report_text}")
+
+    # Check real rendered CSS, including restoring visibility after exceptions
+    # arrive and after the blocker is disabled on an already-loaded document.
+    def cosmetic_display() -> str:
+        result: dict[str, str] = {}
+        article_tab.page().runJavaScript(
+            "getComputedStyle(document.querySelector('h1')).display",
+            1,  # Isolated world avoids the page's deliberate getComputedStyle override.
+            lambda value: result.setdefault("display", str(value)),
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and "display" not in result:
+            app.processEvents()
+            time.sleep(0.01)
+        return result.get("display", "")
+
+    old_rules = browser.request_interceptor.filter_rules
+    old_enabled = browser.ad_block_enabled
+    rules = FilterRuleSet()
+    rules.parse_text("~other.test##h1")
+    browser.ad_block_enabled = True
+    browser.handle_filter_rules_parsed(rules)
+    if cosmetic_display() != "none":
+        raise AssertionError("Negated-domain cosmetic rule did not hide its target.")
+    rules.parse_text("example.test#@#h1")
+    browser.handle_filter_rules_parsed(rules)
+    if cosmetic_display() != "block":
+        raise AssertionError("New cosmetic exception left stale injected CSS behind.")
+    rules = FilterRuleSet()
+    rules.parse_text("##h1")
+    browser.handle_filter_rules_parsed(rules)
+    if cosmetic_display() != "none":
+        raise AssertionError("Generic cosmetic rule did not hide its target.")
+    browser.ad_block_enabled = False
+    browser.refresh_cosmetic_filters()
+    if cosmetic_display() != "block":
+        raise AssertionError("Disabling cosmetic blocking left stale injected CSS.")
+    browser.ad_block_enabled = old_enabled
+    browser.request_interceptor.filter_rules = old_rules
+    if browser.private_request_interceptor is not None:
+        browser.private_request_interceptor.filter_rules = old_rules
+    browser.refresh_cosmetic_filters()
     browser.close_tab(browser.tabs.indexOf(article_tab))
     browser.tabs.setCurrentWidget(dashboard)
 
@@ -335,11 +468,10 @@ def main() -> int:
     browser.refresh_notes_sidebar()
     browser.save_settings()
 
-    browser.close()
-    app.processEvents()
     print(
         "Live profile, internal trust, tab lifecycle, bounded article/Reader "
-        "extraction, research index, concurrent profile-safe snapshots, and "
+        "extraction, quote persistence/checking, live cosmetic exceptions, research index, "
+        "concurrent profile-safe snapshots, and "
         "MV3 inspector smoke passed."
     )
     return 0

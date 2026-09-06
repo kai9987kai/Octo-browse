@@ -1,7 +1,7 @@
 ; Inno Setup script for OctoBrowse. build_inno.ps1 supplies MyAppVersion.
 
 #ifndef MyAppVersion
-  #define MyAppVersion "3.6"
+  #define MyAppVersion "3.7"
 #endif
 #define MyAppName "OctoBrowse"
 #define MyAppPublisher "OctoBrowse"

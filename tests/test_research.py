@@ -11,9 +11,57 @@ from octobrowse.research import (
     research_note_to_markdown,
     workspace_research_to_markdown,
 )
+from octobrowse.quote_anchor import QuoteAnchor
 
 
 class ResearchNoteTests(unittest.TestCase):
+    def test_quote_anchors_survive_normalization_and_json_roundtrip(self) -> None:
+        import json
+
+        quote = "Long evidence " + "word " * 160 + "ending."
+        anchor = QuoteAnchor(quote, "before ", " after", 12).to_dict()
+        note = make_research_note("https://example.test/", "Evidence", quote, "Commentary", anchors=[anchor])
+        restored = normalize_research_notes(json.loads(json.dumps([note])))[0]
+        self.assertEqual(restored["anchors"], [anchor])
+        self.assertEqual(len(restored["anchors"][0]["exact"]), len(quote))
+
+    def test_summary_anchors_must_reference_retained_content(self) -> None:
+        note = make_research_note(
+            "https://example.test/", "Summary", "", "First quote.\nSecond quote.",
+            anchors=[
+                QuoteAnchor("First quote.").to_dict(),
+                QuoteAnchor("Second quote.").to_dict(),
+                QuoteAnchor("Not in summary.").to_dict(),
+                QuoteAnchor("First quote.").to_dict(),
+            ],
+        )
+        self.assertEqual([item["exact"] for item in note["anchors"]], ["First quote.", "Second quote."])
+        note["body"] = "Rewritten commentary."
+        self.assertNotIn("anchors", normalize_research_notes([note])[0])
+
+    def test_malformed_anchors_cannot_bloat_a_note_or_certify_a_prefix(self) -> None:
+        note = make_research_note(
+            "https://example.test/", "Selection", "Full quote with changed tail.", "",
+            anchors=[None, {"exact": "Full quote"}, {"exact": "x" * 8001}],
+        )
+        self.assertNotIn("anchors", note)
+        note = make_research_note(
+            "https://example.test/", "Quote", "Evidence", "",
+            anchors=[QuoteAnchor("Evidence", "a" * 200, "b" * 200, True).to_dict()],
+        )
+        stored = note["anchors"][0]
+        self.assertEqual(len(stored["prefix"]), 48)
+        self.assertEqual(len(stored["suffix"]), 48)
+        self.assertEqual(stored["offset_hint"], -1)
+
+    def test_anchor_count_is_bounded(self) -> None:
+        quotes = [f"Quote {index}." for index in range(20)]
+        note = make_research_note(
+            "https://example.test/", "Summary", "", "\n".join(quotes),
+            anchors=[QuoteAnchor(quote).to_dict() for quote in quotes],
+        )
+        self.assertEqual(len(note["anchors"]), 12)
+
     def test_make_note_produces_stable_versioned_schema(self) -> None:
         first = make_research_note(
             " https://example.test/paper ",

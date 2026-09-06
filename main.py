@@ -47,10 +47,10 @@ from octobrowse.extensions import (
     inspect_extension_source,
 )
 from octobrowse.blockstats import BlockStats
-from octobrowse.evidence import capture_quote_anchor, check_quote, same_source_url
+from octobrowse.evidence import capture_quote_anchor, check_quotes, same_source_url
 from octobrowse.library_index import LibraryIndex
 from octobrowse.local_summary import LocalSummary, summarize
-from octobrowse.quote_anchor import QuoteAnchor, build_anchor
+from octobrowse.quote_anchor import QuoteAnchor
 from octobrowse import optional_deps
 from octobrowse.research import (
     MAX_NOTE_QUOTE_CHARS,
@@ -926,8 +926,15 @@ class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
             rules = self.filter_rules
             request_type = resource_type_name(info.resourceType())
             first_party_host = info.firstPartyUrl().host().lower()
+            # The top-level URL owns telemetry; domain= filters use the frame
+            # that initiated a request. Qt supplies an empty URL for browser-
+            # initiated navigation and an opaque "null" origin for some frames.
+            initiator = info.initiator() if hasattr(info, "initiator") else QUrl()
+            document_host = first_party_host if initiator.isEmpty() else initiator.host().lower()
             excepted = (
-                rules.allows_request(url.toString(), host, request_type, first_party_host)
+                rules.allows_request(
+                    url.toString(), host, request_type, first_party_host, document_host=document_host,
+                )
                 if rules is not None
                 else False
             )
@@ -938,7 +945,7 @@ class OctoRequestInterceptor(QWebEngineUrlRequestInterceptor):
                     info.block(True)
                     return
                 if rules is not None and rules.should_block(
-                    url.toString(), host, request_type, first_party_host
+                    url.toString(), host, request_type, first_party_host, document_host=document_host,
                 ):
                     self.stats.record(first_party_host, host or "pattern-rule")
                     info.block(True)
@@ -4735,9 +4742,12 @@ p {{ margin: 0 0 20px; }}
     def locate_quote_in_page(
         self, anchor: QuoteAnchor, source_url: str = "", *, source_private: bool = False,
     ) -> None:
-        """Recheck the full quote in its source before offering text search."""
+        """Recheck a full summary quote on its source page."""
         browser = self.current_browser()
         if browser is None:
+            return
+        if browser.property("loading"):
+            self.set_status("Wait for the source page to finish loading, then check the quote again.")
             return
         if (
             bool(browser.property("private")) != source_private
@@ -4759,6 +4769,9 @@ p {{ margin: 0 0 20px; }}
         if browser is None:
             return
         source_url = browser.url().toString()
+        if browser.property("loading"):
+            self.set_status("Wait for the source page to finish loading, then check saved quotes again.")
+            return
         if browser.property("private") or self.is_internal_url(source_url):
             self.set_status("Open the saved source in a standard tab to check research notes.")
             return
@@ -4775,7 +4788,7 @@ p {{ margin: 0 0 20px; }}
             ]
             quote = str(note.get("quote", ""))
             if quote:
-                anchor = next((item for item in anchors if item.exact == quote), None)
+                anchor = next((item for item in anchors if " ".join(item.exact.split()) == " ".join(quote.split())), None)
                 items.append((title, quote, anchor))
             else:
                 items.extend((title, anchor.exact, anchor) for anchor in anchors)
@@ -4804,8 +4817,8 @@ p {{ margin: 0 0 20px; }}
             "Text presence only: this does not establish factual accuracy or authenticate a source.",
             "Missing text may have changed, be unloaded, or fall outside the readable extraction.", "",
         ]
-        for index, (title, quote, anchor) in enumerate(items[:100], 1):
-            result = check_quote(readable.text, quote, anchor)
+        results = check_quotes(readable.text, [(quote, anchor) for _, quote, anchor in items[:100]])
+        for index, ((title, quote, _anchor), result) in enumerate(zip(items[:100], results, strict=True), 1):
             lines.extend([f"{index}. {title} — {result.status.upper()}", result.message, f"Saved quote: {quote}"])
             if result.excerpt:
                 lines.append(f"Current context: {result.excerpt}")
@@ -4865,9 +4878,7 @@ p {{ margin: 0 0 20px; }}
                 anchors=[
                     anchor
                     for anchor in (
-                        build_anchor(
-                            summary.source_text, bullet.offset, len(bullet.text)
-                        )
+                        capture_quote_anchor(summary.source_text, bullet.text)
                         for bullet in summary.bullets
                     )
                     if anchor is not None
@@ -7242,6 +7253,7 @@ p {{ margin: 0 0 20px; }}
         ]
         self.refresh_notes_sidebar()
         self.save_settings()
+        self.rebuild_library_index()
         self.set_status("Deleted research note")
         return True
 

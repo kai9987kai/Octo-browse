@@ -223,6 +223,13 @@ class CursorMappingTests(unittest.TestCase):
         assert anchor is not None
         self.assertEqual(anchor.exact, "Second quoted line.")
 
+    def test_cursor_counts_utf16_units_after_emoji(self) -> None:
+        rendered = "🐙" * 20 + "\n• Saved evidence.\n"
+        codepoints = rendered.index("Saved evidence.") + 5
+        units = len(rendered[:codepoints].encode("utf-16-le")) // 2
+        anchor = QuoteAnchor("Saved evidence.")
+        self.assertEqual(self.resolve(rendered, self.FakeOutput(units), [anchor]), anchor)
+
     def test_cursor_outside_every_quote_selects_nothing(self) -> None:
         self.assertIsNone(
             self.resolve(self.rendered, self.FakeOutput(0), self.anchors)

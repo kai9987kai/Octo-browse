@@ -31,6 +31,13 @@ scratchpad, and opt-in trusted Python automation.
   copied as Markdown, deleted, and exported with a workspace. Private-tab and
   internal-page content is rejected by the shared persistence path used by the
   UI, AI summaries, and plugins.
+- Quote Check revisits saved selections and on-device summary sentences against
+  the currently loaded source (Data > Check Saved Quotes, the command palette,
+  or a note's Check Quotes button). It checks complete quotes and reports exact,
+  whitespace-normalized, ambiguous, or missing text with current context.
+  Anchors survive saving and editing notes; source/profile mismatches and
+  navigation during extraction cancel the action. Checks run locally and are
+  observations of text presence, not factual verification.
 - Verifiable Offline Snapshots (`Ctrl+Shift+S`) save the complete active page
   as one portable MHTML archive, then create an adjacent provenance sidecar
   with the source, capture time, runtime versions, byte size, and SHA-256.
@@ -97,8 +104,11 @@ scratchpad, and opt-in trusted Python automation.
   options, inverse types, and first/third-party constraints. Literal-token
   indexing keeps matching fast. Lists load from Tools > Update EasyList or an
   imported Adblock-format file and refresh weekly.
-- Cosmetic element-hiding rules (`##selector`, generic and per-domain) are
-  injected into pages as chunked CSS when ad blocking is on.
+- Network filters support `$domain=include.example|~exclude.example`, using the
+  initiating frame's origin where Qt exposes it. Cosmetic element-hiding rules
+  (`##selector`) support included/excluded domains and exact-selector `#@#`
+  exceptions. Subscription updates and toggling blocking refresh existing tabs,
+  including removing stale injected CSS when a page becomes excepted.
 - Trusted Python automation API: plugins are Python files with a `MANIFEST`
   and `activate(api)` entry point. Declared capabilities document intended API
   use, but arbitrary Python cannot be sandboxed in-process. Execution is off by
@@ -275,7 +285,7 @@ a secure vault on that system.
 - Read Aloud uses Google Text-to-Speech. Standard pages are sent when the action
   is invoked; private pages require an explicit confirmation every time.
 - The filter engine implements a practical subset of Adblock Plus syntax;
-  domain scoping and advanced procedural cosmetic rules are still skipped, so
+  advanced procedural cosmetic and scriptlet rules are still skipped, so
   coverage remains below a full uBlock Origin.
 
 ## Architecture map
@@ -297,6 +307,9 @@ a secure vault on that system.
 - `octobrowse/quote_anchor.py`: W3C-style relocatable quote anchors — exact
   text plus surrounding context, so a saved quote is still findable after the
   page changes, and reports failure rather than guessing when it is gone.
+- `octobrowse/evidence.py`: bounded full-quote presence checks with strict source
+  identity, whitespace-only normalization, complete-context disambiguation,
+  and one-time text preparation for batches. No external model or API is used.
 - `octobrowse/frecency.py`: bucketed visit-count/recency ranking for address
   suggestions, with a stable tie-break.
 - `octobrowse/ai_context.py`: source chunking, deterministic relevance
@@ -333,9 +346,12 @@ a secure vault on that system.
 - Optional full-page text capture with explicit storage controls; the current
   FTS5 index intentionally stores browser metadata and user-authored research
   text, not page bodies.
-- Procedural cosmetic filters (`#?#`) and cosmetic exceptions (`#@#`).
+- Procedural cosmetic filters (`#?#`) and scriptlet compatibility.
 - Revisit native extension execution after Qt/PyQt provides a stable Windows
   enablement path; retain provenance and permission review before activation.
+
+See [research and change notes](docs/research-advance.md) for the sources behind
+the current improvements, usage instructions, and validation scope.
 
 ## Tests
 
@@ -360,3 +376,5 @@ live smoke additionally constructs both profile types, exercises isolated
 semantic extraction and the encoded Reader View budget, saves overlapping
 standard/private verified snapshots, checks private-history isolation, and
 drives the real MV3 inspector against the bundled permission-free sample.
+It also saves and reloads summary anchors, inspects the rendered Quote Check
+dialog, and confirms that cosmetic exceptions restore previously hidden content.

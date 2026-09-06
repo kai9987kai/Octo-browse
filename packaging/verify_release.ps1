@@ -71,9 +71,16 @@ if (($portableListing -join "`n") -match '(?i)pocketsphinx-data') {
 }
 foreach ($module in @(
     "octobrowse.ai_context",
+    "octobrowse.blockstats",
+    "octobrowse.evidence",
     "octobrowse.extensions",
     "octobrowse.filtering",
+    "octobrowse.frecency",
     "octobrowse.library_index",
+    "octobrowse.local_summary",
+    "octobrowse.optional_deps",
+    "octobrowse.public_suffix",
+    "octobrowse.quote_anchor",
     "octobrowse.readability",
     "octobrowse.research",
     "octobrowse.session",
@@ -147,6 +154,12 @@ $manifest = [ordered]@{
     python = (& $Python --version 2>&1 | Out-String).Trim()
     architecture = $architecture
     generated_utc = [DateTime]::UtcNow.ToString("o")
+    validation = [ordered]@{
+        embedded_versions = "passed"
+        qt_resources = "passed"
+        python_archives = "passed"
+        startup_smoke_tests = if ($SkipSmokeTests) { "skipped" } else { "passed" }
+    }
     onedir = [ordered]@{
         files = $onedirFiles.Count
         bytes = ($onedirFiles | Measure-Object -Property Length -Sum).Sum
